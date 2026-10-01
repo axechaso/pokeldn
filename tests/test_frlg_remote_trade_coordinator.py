@@ -1,5 +1,6 @@
 import hashlib
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -194,6 +195,47 @@ def test_start_command_permit_is_durable_and_returned_at_most_once():
     assert coordinator.receive_release("A", release) is None
     assert coordinator.receive_release("B", release).command == "START_TRADE"
     assert coordinator.state == "START_RELEASED"
+
+
+def test_permit_consumption_and_execution_are_separately_durable_and_one_shot():
+    coordinator, journal = _coordinator()
+    trade_id, epoch = _select_both(coordinator)
+    permit = coordinator.issue_selection_permit("A")
+
+    assert permit.command == "SET_MONS_TO_TRADE"
+    assert permit.selection_side == "B"
+    assert permit.slot == 1
+    assert permit.slot_digest == coordinator.snapshot_summary("B")["slot_digests"][1]
+    assert journal.records[permit.issued_seq]["event"] == "command_permit_issued"
+    assert coordinator.consume_permit(permit) is True
+    assert coordinator.is_consumed(permit)
+    assert coordinator.consume_permit(permit) is False
+    assert coordinator.permit_status(permit) == "consumed"
+
+    coordinator.command_executed(permit, local_state="H_CONFIRM")
+    assert coordinator.permit_status(permit) == "executed"
+    assert journal.records[-1]["event"] == "command_executed"
+    assert coordinator.command_executed(permit, local_state="H_CONFIRM") is False
+    assert coordinator.command_observed(permit, engine_event="INIT_BLOCK") is True
+    assert coordinator.command_observed(permit, engine_event="INIT_BLOCK") is False
+    assert coordinator.permit_status(permit) == "observed"
+    with pytest.raises(ProtocolError, match="observation changed"):
+        coordinator.command_observed(permit, engine_event="READY_FINISH_TRADE")
+    with pytest.raises(TradeCoordinatorError, match="unknown, stale, or has been altered"):
+        coordinator.consume_permit(replace(permit, slot=0))
+    assert coordinator.trade_id == trade_id
+    assert coordinator.selection_epoch == epoch
+
+
+def test_unconsumed_selection_permit_is_revoked_on_cancel_and_cannot_be_replayed():
+    coordinator, journal = _coordinator()
+    trade_id, epoch = _select_both(coordinator)
+    permit = coordinator.issue_selection_permit("A")
+
+    coordinator.cancel("A", trade_id, epoch, reason="user_cancel")
+    assert coordinator.permit_status(permit) == "revoked"
+    assert journal.records[-1]["event"] == "command_permit_revoked"
+    assert coordinator.consume_permit(permit) is False
 
 
 def test_finish_release_needs_both_real_animation_events_and_durable_acks():

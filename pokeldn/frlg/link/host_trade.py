@@ -2,10 +2,12 @@
 feed_child_slot() consumes the child's reflected 14-byte row. The leader owns SET_MONS/START/CONFIRM
 and every cancel decision, so the follower engine in trade.py cannot be reused with mpid=0."""
 
+import hashlib
 from collections import Counter, deque
 from dataclasses import dataclass
 
 from pokeldn.frlg.link import battle_link as bl, cable_club, linkplayer, trade, uroom_battle, uroom_chat
+from pokeldn.frlg.remote.config import RemoteTradeMode
 from pokeldn.frlg.save import mon as monmod
 from pokeldn.gba import block, rfu, rfu_leader
 
@@ -135,9 +137,16 @@ class HostTradeEngine:
                  union_room=False, union_room_chat=False, chat_messages=None,
                  union_room_battle=False, battle_forfeit=True, battle_move_slot=0,
                  colosseum=False, card_flag_id=0, log=lambda *a: None,
-                 remote_policy=None):
+                 remote_policy=None, remote_mode=None):
         self.remote_policy = remote_policy
-        self.probe_only = remote_policy is not None
+        if remote_mode is not None and not isinstance(remote_mode, RemoteTradeMode):
+            raise ValueError("remote_mode must be a RemoteTradeMode")
+        if remote_policy is not None and remote_mode not in (None, RemoteTradeMode.PROBE):
+            raise ValueError("the P0 policy cannot be combined with formal mode")
+        self.remote_mode = (RemoteTradeMode.PROBE if remote_policy is not None
+                            else remote_mode)
+        self.probe_only = self.remote_mode is RemoteTradeMode.PROBE
+        self.formal_mode = self.remote_mode is RemoteTradeMode.FORMAL
         if self.probe_only:
             if party is not None:
                 raise ValueError("the remote probe does not accept a local or placeholder party")
@@ -221,6 +230,12 @@ class HostTradeEngine:
         self._p0_commit_attempts_refused = 0
         self._p0_animation_state_entries = 0
         self._p0_save_state_entries = 0
+        self.formal_adapter = None
+        self._formal_command_counts = Counter()
+        self._formal_waiting_set = False
+        self._formal_set_done = False
+        self._formal_waiting_start = False
+        self._formal_waiting_finish = False
         self.round = 0
         self.commits = 0
         self.received_mons = []
@@ -474,6 +489,16 @@ class HostTradeEngine:
             raise ValueError(f"unsupported remote block phase: {phase}")
 
     def _send_linkcmd(self, cmd, cursor=0):
+        formal_commands = {
+            trade.SET_MONS_TO_TRADE: "SET_MONS_TO_TRADE",
+            trade.START_TRADE: "START_TRADE",
+            trade.CONFIRM_FINISH_TRADE: "CONFIRM_FINISH_TRADE",
+        }
+        formal_name = formal_commands.get(cmd)
+        if self.formal_mode and formal_name is not None:
+            if (self.formal_adapter is None
+                    or not self.formal_adapter.is_applying_command(formal_name)):
+                raise RuntimeError("formal command requires its active one-shot permit")
         if self.probe_only:
             name = trade.LINKCMD_NAMES.get(cmd, f"0x{cmd:04x}")
             self._p0_linkcmd_attempt_counts[name] += 1
@@ -482,6 +507,72 @@ class HostTradeEngine:
                 raise RuntimeError("P0 probe invariant: START_TRADE is disabled")
             self._p0_linkcmd_counts[name] += 1
         self._queue_block(trade.linkcmd_block(cmd, cursor), trade.LINKCMD_NAMES[cmd])
+
+    def attach_formal_adapter(self, adapter):
+        if not self.formal_mode:
+            raise RuntimeError("formal adapter requires explicit formal mode")
+        if self.probe_only or self.remote_policy is not None:
+            raise RuntimeError("P0 probe cannot attach a formal trade adapter")
+        if self.formal_adapter is not None:
+            raise RuntimeError("formal adapter is already attached")
+        self.formal_adapter = adapter
+
+    def validate_formal_permit(self, permit):
+        if not self.formal_mode or self.formal_adapter is None:
+            raise RuntimeError("formal trade mode is not active")
+        if permit.trade_id is None or permit.selection_epoch < 0:
+            raise RuntimeError("permit is missing its trade binding")
+        if self._formal_command_counts[permit.command] >= 1:
+            raise RuntimeError("formal command was already executed for this engine")
+        if permit.command == "SET_MONS_TO_TRADE":
+            if self.state != H_CONFIRM or not self._formal_waiting_set:
+                raise RuntimeError("SET_MONS_TO_TRADE has no current local selection event")
+            if type(permit.slot) is not int or not 0 <= permit.slot < len(self.party):
+                raise RuntimeError("selected local party slot is out of range")
+            selected = self.party[permit.slot]
+            if selected.is_empty or permit.slot_digest is None:
+                raise RuntimeError("selected local Pokemon is empty or unbound")
+            if hashlib.sha256(selected.raw).hexdigest() != permit.slot_digest:
+                raise RuntimeError("selected Pokemon changed after its snapshot")
+        elif permit.command == "START_TRADE":
+            if self.state != H_CONFIRM or not self._formal_waiting_start or not self._formal_set_done:
+                raise RuntimeError("START_TRADE requires a selected slot and local Yes event")
+            if self.child_cursor is None:
+                raise RuntimeError("START_TRADE has no current child selection")
+        elif permit.command == "CONFIRM_FINISH_TRADE":
+            if self.state != H_ANIM or not self._formal_waiting_finish or not self._child_finish:
+                raise RuntimeError("finish permit requires the local animation-finished event")
+        else:
+            raise RuntimeError("unsupported formal command")
+        return True
+
+    def _check_formal_entry(self, permit, command):
+        self.validate_formal_permit(permit)
+        if not self.formal_adapter.is_applying(permit, command):
+            raise RuntimeError("formal engine entry is not applying this permit")
+
+    def authorize_set_mons(self, permit):
+        self._check_formal_entry(permit, "SET_MONS_TO_TRADE")
+        self.offered_slots = (permit.slot,)
+        self.round = 0
+        self._send_linkcmd(trade.SET_MONS_TO_TRADE, permit.slot)
+        self._formal_command_counts[permit.command] += 1
+        self._formal_waiting_set = False
+        self._formal_set_done = True
+
+    def authorize_start_trade(self, permit):
+        self._check_formal_entry(permit, "START_TRADE")
+        self._send_linkcmd(trade.START_TRADE)
+        self._formal_command_counts[permit.command] += 1
+        self._formal_waiting_start = False
+        self._set_state(H_ANIM)
+        self._anim_wait = self.anim_delay
+
+    def authorize_finish_trade(self, permit):
+        self._check_formal_entry(permit, "CONFIRM_FINISH_TRADE")
+        self._formal_waiting_finish = False
+        self._commit()
+        self._formal_command_counts[permit.command] += 1
 
     def p0_command_audit(self):
         """Return scalar-only evidence for the trade-disabled P0 execution."""
@@ -1041,6 +1132,8 @@ class HostTradeEngine:
             if self._save_last_count is None:
                 self._save_last_count = count
                 self._save_rounds = 1
+                if self.formal_mode:
+                    self.formal_adapter.record_engine_event("SAVE_STARTED", count=count)
             elif count == self._save_last_count:
                 pass
             elif count == ((self._save_last_count + 1) & 0xFFFF):
@@ -1092,6 +1185,37 @@ class HostTradeEngine:
             self.trace.append(("probe_unexpected_finish",))
             self.info("Unexpected finish event in the trade-disabled P0 probe; preserving evidence.")
             return
+        if self.formal_mode:
+            if cmd == trade.READY_TO_TRADE and self.state == H_SELECT:
+                if self.formal_adapter is None:
+                    raise RuntimeError("formal trade engine has no command adapter")
+                self._select_cancels = 0
+                self.child_cursor = cursor % 6
+                self._formal_waiting_set = True
+                self._formal_set_done = False
+                self._formal_waiting_start = False
+                self._formal_waiting_finish = False
+                self._set_state(H_CONFIRM)
+                self.formal_adapter.record_engine_event(
+                    "READY_TO_TRADE", slot=self.child_cursor)
+                return
+            if cmd == trade.INIT_BLOCK and self.state == H_CONFIRM:
+                if self.formal_adapter is None:
+                    raise RuntimeError("formal trade engine has no command adapter")
+                if not self._formal_set_done:
+                    self.trace.append(("formal_unexpected_init",))
+                    return
+                self._formal_waiting_start = True
+                self.formal_adapter.record_engine_event(
+                    "INIT_BLOCK", slot=self.child_cursor)
+                return
+            if cmd == trade.READY_FINISH_TRADE and self.state == H_ANIM:
+                if self.formal_adapter is None:
+                    raise RuntimeError("formal trade engine has no command adapter")
+                self._child_finish = True
+                self._formal_waiting_finish = True
+                self.formal_adapter.record_engine_event("READY_FINISH_TRADE")
+                return
         if cmd == trade.READY_TO_TRADE and self.state == H_SELECT:
             self._select_cancels = 0
             self.child_cursor = cursor % 6
@@ -1141,6 +1265,10 @@ class HostTradeEngine:
         if self.probe_only:
             self._p0_commit_attempts_refused += 1
             raise RuntimeError("P0 probe invariant: trade commit is disabled")
+        if (self.formal_mode and (self.formal_adapter is None
+                                  or not self.formal_adapter.is_applying_command(
+                                      "CONFIRM_FINISH_TRADE"))):
+            raise RuntimeError("formal save requires its active finish permit")
         host_slot = self.offered_slots[self.round]
         child_slot = self.child_cursor
         if child_slot is None:
@@ -1382,7 +1510,7 @@ class HostTradeEngine:
     def _tick_anim(self):
         if self._anim_wait > 0:
             self._anim_wait -= 1
-        elif self._child_finish:
+        elif self._child_finish and not self.formal_mode:
             self._commit()
 
     def _echo_owed(self):

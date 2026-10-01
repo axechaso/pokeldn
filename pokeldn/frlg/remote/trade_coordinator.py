@@ -84,12 +84,19 @@ class TradeRelease:
 class CommandPermit:
     """One-shot command authorization returned only after its journal record is durable."""
 
+    permit_id: str
     side: str
     run_id: str
     trade_id: str
     selection_epoch: int
     kind: str
     command: str
+    selection_side: str | None
+    slot: int | None
+    slot_digest: str | None
+    decision_hash: str
+    issued_seq: int
+    expires_before_state: str
     release_hash: str
 
 
@@ -126,6 +133,7 @@ class TradeCoordinator:
             raise ValueError("trade journal run_id does not match the coordinator")
         self.run_id = run_id.lower()
         self.journal = journal
+        self._journal_seq = 0
         self.state = "WAITING_SNAPSHOTS"
         self.selection_epoch = 0
         self.trade_id = None
@@ -139,6 +147,9 @@ class TradeCoordinator:
         self._decision_stored = {"start": set(), "finish": set()}
         self._releases = {}
         self._command_permits = {}
+        self._permit_objects = {}
+        self._permit_statuses = {}
+        self._permit_observations = {}
         self._animation_finished = {}
         self._save_progress = {"A": set(), "B": set()}
         self._post_trade_snapshots = {}
@@ -161,7 +172,9 @@ class TradeCoordinator:
     def _record(self, event, **fields):
         self._ensure_available()
         try:
-            return self.journal.append_durable(event, **fields)
+            result = self.journal.append_durable(event, **fields)
+            self._journal_seq += 1
+            return result
         except Exception as exc:
             self._fatal_error = f"durable trade journal failed: {exc}"
             self.state = "IN_DOUBT" if self._irreversible else "CANCELLED"
@@ -384,6 +397,7 @@ class TradeCoordinator:
             self.state = "RESETTING"
             self._cancel_reasons[side] = "game_rejected"
             self._exit_requested = False
+            self._revoke_selection_permits("game_rejected")
             return {"type": "CANCEL", "side": side, "trade_id": trade_id,
                     "selection_epoch": selection_epoch, "reason": "game_rejected",
                     "next_selection_epoch": selection_epoch + 1,
@@ -511,6 +525,186 @@ class TradeCoordinator:
         self.state = "START_RELEASED" if kind == "start" else "FINISH_RELEASED"
         return release
 
+    def _issue_command_permit(self, side, *, kind, command, selection_side=None,
+                              slot=None, slot_digest=None,
+                              decision_hash, release_hash, expires_before_state):
+        key = (kind, side)
+        if key in self._command_permits:
+            return self._command_permits[key]
+        permit_id = secrets.token_hex(16)
+        issued_seq = self._journal_seq
+        self._record("command_permit_issued", permit_id=permit_id, side=side,
+                     kind=kind, command=command, selection_side=selection_side,
+                     trade_id=self.trade_id,
+                     selection_epoch=self.selection_epoch, slot=slot,
+                     slot_digest=slot_digest, decision_hash=decision_hash,
+                     release_hash=release_hash, expires_before_state=expires_before_state)
+        permit = CommandPermit(
+            permit_id=permit_id, side=side, run_id=self.run_id,
+            trade_id=self.trade_id, selection_epoch=self.selection_epoch,
+            kind=kind, command=command, selection_side=selection_side,
+            slot=slot, slot_digest=slot_digest,
+            decision_hash=decision_hash, issued_seq=issued_seq,
+            expires_before_state=expires_before_state, release_hash=release_hash)
+        self._command_permits[key] = permit
+        self._permit_objects[permit_id] = permit
+        self._permit_statuses[permit_id] = "issued"
+        return permit
+
+    def issue_selection_permit(self, side):
+        """Durably authorize setting this side's selected party slot after both selections match."""
+        self._ensure_available()
+        side = self._peer(side)
+        if (self.state != "CONFIRMING" or self._selection_hash is None
+                or side not in self._selections):
+            raise TradeCoordinatorError("selection permit requires both current selections")
+        # This side's engine offers the peer's selected Pokemon to its attached Switch.
+        selection_side = "B" if side == "A" else "A"
+        selection = self._selections[selection_side]
+        return self._issue_command_permit(
+            side, kind="selection", command="SET_MONS_TO_TRADE",
+            selection_side=selection_side,
+            slot=selection["slot"], slot_digest=selection["slot_digest"],
+            decision_hash=self._selection_hash, release_hash=self._selection_hash,
+            expires_before_state="START_RELEASED")
+
+    def permit_status(self, permit_or_id):
+        permit_id = (permit_or_id.permit_id if isinstance(permit_or_id, CommandPermit)
+                     else permit_or_id)
+        return self._permit_statuses.get(permit_id)
+
+    def is_consumed(self, permit_or_id):
+        return self.permit_status(permit_or_id) in {
+            "consumed", "executed", "observed", "failed"}
+
+    def revoke_permit(self, permit, *, reason):
+        self._ensure_available()
+        if not isinstance(permit, CommandPermit):
+            raise ProtocolError("permit must be a CommandPermit")
+        if self._permit_objects.get(permit.permit_id) != permit:
+            raise TradeCoordinatorError("permit is unknown, stale, or has been altered")
+        if (permit.kind != "selection" or self._irreversible
+                or self.state not in ("RESETTING", "CANCELLED")):
+            raise TradeCoordinatorError("only a pre-release selection permit can be revoked")
+        if not isinstance(reason, str) or not reason or len(reason) > 80:
+            raise ProtocolError("permit revocation reason must be a short string")
+        if self._permit_statuses[permit.permit_id] != "issued":
+            return False
+        self._record("command_permit_revoked", permit_id=permit.permit_id,
+                     side=permit.side, kind=permit.kind, command=permit.command,
+                     selection_side=permit.selection_side,
+                     trade_id=permit.trade_id, selection_epoch=permit.selection_epoch,
+                     reason=reason)
+        self._permit_statuses[permit.permit_id] = "revoked"
+        return True
+
+    def _revoke_selection_permits(self, reason):
+        for (kind, _side), permit in tuple(self._command_permits.items()):
+            if (kind == "selection"
+                    and self._permit_statuses.get(permit.permit_id) == "issued"):
+                self.revoke_permit(permit, reason=reason)
+
+    def consume_permit(self, permit):
+        """Persist the one-shot consumption before a local engine command can be queued."""
+        self._ensure_available()
+        if not isinstance(permit, CommandPermit):
+            raise ProtocolError("permit must be a CommandPermit")
+        expected = self._permit_objects.get(permit.permit_id)
+        if expected is None or expected != permit:
+            raise TradeCoordinatorError("permit is unknown, stale, or has been altered")
+        if self._permit_statuses[permit.permit_id] != "issued":
+            return False
+        if (permit.run_id != self.run_id or permit.trade_id != self.trade_id
+                or permit.selection_epoch != self.selection_epoch):
+            raise TradeCoordinatorError("permit belongs to a stale trade selection")
+        if permit.kind == "selection":
+            expected_source = "B" if permit.side == "A" else "A"
+            selection = self._selections.get(permit.selection_side)
+            if (self.state not in ("CONFIRMING", "PREPARING", "START_DECISION_READY",
+                                   "START_DECIDED", "START_RELEASE_READY")
+                    or permit.selection_side != expected_source or selection is None
+                    or selection["slot"] != permit.slot
+                    or selection["slot_digest"] != permit.slot_digest
+                    or permit.decision_hash != self._selection_hash):
+                raise TradeCoordinatorError("selection permit expired or no longer matches")
+        elif permit.kind in ("start", "finish"):
+            if (self._command_permits.get((permit.kind, permit.side)) != permit
+                    or self._releases.get(permit.kind) is None
+                    or permit.release_hash != self._releases[permit.kind].release_hash):
+                raise TradeCoordinatorError("release permit does not match the current release")
+            allowed_states = ({"START_RELEASED", "ANIMATING"} if permit.kind == "start" else
+                              {"FINISH_RELEASED", "SAVING", "RESULT_PENDING"})
+            if self.state not in allowed_states:
+                raise TradeCoordinatorError("release permit expired in the current state")
+        else:
+            raise ProtocolError("unknown command permit kind")
+        self._record("command_permit_consumed", permit_id=permit.permit_id,
+                     side=permit.side, kind=permit.kind, command=permit.command,
+                     selection_side=permit.selection_side,
+                     trade_id=permit.trade_id, selection_epoch=permit.selection_epoch,
+                     decision_hash=permit.decision_hash, release_hash=permit.release_hash)
+        self._permit_statuses[permit.permit_id] = "consumed"
+        return True
+
+    def command_executed(self, permit, *, local_state):
+        self._ensure_available()
+        if self._permit_objects.get(getattr(permit, "permit_id", None)) != permit:
+            raise TradeCoordinatorError("command execution has no issued permit")
+        status = self._permit_statuses.get(permit.permit_id)
+        if status in ("executed", "observed"):
+            return False
+        if status != "consumed":
+            raise TradeCoordinatorError("command execution requires a consumed permit")
+        if not isinstance(local_state, str) or not local_state or len(local_state) > 80:
+            raise ProtocolError("local_state must be a short string")
+        self._record("command_executed", permit_id=permit.permit_id,
+                     side=permit.side, kind=permit.kind, command=permit.command,
+                     selection_side=permit.selection_side,
+                     trade_id=permit.trade_id, selection_epoch=permit.selection_epoch,
+                     decision_hash=permit.decision_hash, release_hash=permit.release_hash,
+                     local_state=local_state, execution_count=1)
+        self._permit_statuses[permit.permit_id] = "executed"
+        return True
+
+    def command_observed(self, permit, *, engine_event):
+        self._ensure_available()
+        if self._permit_objects.get(getattr(permit, "permit_id", None)) != permit:
+            raise TradeCoordinatorError("command observation has no issued permit")
+        status = self._permit_statuses.get(permit.permit_id)
+        if status == "observed":
+            if self._permit_observations[permit.permit_id] != engine_event:
+                raise ProtocolError("command observation changed for this permit")
+            return False
+        if status != "executed":
+            raise TradeCoordinatorError("command observation requires an executed permit")
+        if not isinstance(engine_event, str) or not engine_event or len(engine_event) > 80:
+            raise ProtocolError("engine_event must be a short string")
+        self._record("command_observed", permit_id=permit.permit_id,
+                     side=permit.side, kind=permit.kind, command=permit.command,
+                     selection_side=permit.selection_side,
+                     trade_id=permit.trade_id, selection_epoch=permit.selection_epoch,
+                     engine_event=engine_event, execution_count=1)
+        self._permit_statuses[permit.permit_id] = "observed"
+        self._permit_observations[permit.permit_id] = engine_event
+        return True
+
+    def command_failed(self, permit, *, error, local_state):
+        self._ensure_available()
+        if self._permit_objects.get(getattr(permit, "permit_id", None)) != permit:
+            raise TradeCoordinatorError("command failure has no issued permit")
+        if self._permit_statuses.get(permit.permit_id) != "consumed":
+            raise TradeCoordinatorError("command failure requires a consumed permit")
+        if not isinstance(error, str) or not error or len(error) > 240:
+            raise ProtocolError("command error must be a short string")
+        self._record("command_failed", permit_id=permit.permit_id,
+                     side=permit.side, kind=permit.kind, command=permit.command,
+                     selection_side=permit.selection_side,
+                     trade_id=permit.trade_id, selection_epoch=permit.selection_epoch,
+                     local_state=str(local_state)[:80], execution_count=0, error=error)
+        self._permit_statuses[permit.permit_id] = "failed"
+        self.state = "IN_DOUBT" if self._irreversible else "CANCELLED"
+        return self.state
+
     def receive_release(self, side, release):
         """Persist a received release before returning its one-shot game-command permit."""
         self._ensure_available()
@@ -534,15 +728,11 @@ class TradeCoordinator:
                          release_hash=release.release_hash)
             return None
         command = "START_TRADE" if release.kind == "start" else "CONFIRM_FINISH_TRADE"
-        self._record("command_permit_issued", side=side, kind=release.kind,
-                     command=command, trade_id=release.trade_id,
-                     selection_epoch=release.selection_epoch,
-                     decision_hash=release.decision_hash, release_hash=release.release_hash)
-        permit = CommandPermit(side, self.run_id, release.trade_id,
-                               release.selection_epoch, release.kind,
-                               command, release.release_hash)
-        self._command_permits[key] = permit
-        return permit
+        expires_before_state = "FINISH_RELEASED" if release.kind == "start" else "CLOSED"
+        return self._issue_command_permit(
+            side, kind=release.kind, command=command,
+            decision_hash=release.decision_hash, release_hash=release.release_hash,
+            expires_before_state=expires_before_state)
 
     def animation_finished(self, side, trade_id, selection_epoch, event_digest):
         self._ensure_available()
@@ -654,6 +844,7 @@ class TradeCoordinator:
         self._cancel_reasons[side] = reason
         self._exit_requested = self._exit_requested or exit_room or reason == "peer_exit"
         self.state = "RESETTING"
+        self._revoke_selection_permits(reason)
         return {"type": "CANCEL_ACK", "side": side, "trade_id": trade_id,
                 "selection_epoch": selection_epoch,
                 "reason": reason,

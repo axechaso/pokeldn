@@ -1,12 +1,18 @@
 """Configuration for the first, trade-disabled FRLG LAN probe."""
 
 from dataclasses import dataclass, field
+from enum import Enum
 import ipaddress
 import math
 
 
 DEFAULT_PORT = 24873
 PROBE_CAPABILITY = "frlg-direct-trade-probe-v1"
+
+
+class RemoteTradeMode(str, Enum):
+    PROBE = "probe"
+    FORMAL = "formal"
 
 
 @dataclass(frozen=True)
@@ -22,6 +28,7 @@ class RemoteTradeConfig:
     room_key: bytes = field(default=b"", repr=False, compare=False)
     connect_timeout: float = 30.0
     probe_only: bool = True
+    mode: RemoteTradeMode = RemoteTradeMode.PROBE
 
     def __post_init__(self):
         if self.role not in ("host", "join"):
@@ -48,8 +55,14 @@ class RemoteTradeConfig:
         if (type(self.connect_timeout) not in (int, float)
                 or not math.isfinite(self.connect_timeout) or self.connect_timeout <= 0):
             raise ValueError("connect_timeout must be positive")
-        if self.probe_only is not True:
-            raise ValueError("the initial LAN implementation is permanently probe-only")
+        if not isinstance(self.mode, RemoteTradeMode):
+            raise ValueError("mode must be a RemoteTradeMode")
+        if self.mode is not RemoteTradeMode.PROBE or self.probe_only is not True:
+            raise ValueError("formal LAN mode is blocked until its handshake and adapter ship")
+
+    @property
+    def is_formal(self):
+        return self.mode is RemoteTradeMode.FORMAL
 
 
 def _check_lan_address(value, label):
