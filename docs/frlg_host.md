@@ -11,6 +11,12 @@ LDN network, Pia establishes the peer session, and Reliable carries an emulated 
 ending in the leader-side trade state machine. `bin/frlg_mg_host.py` reuses everything below the
 activity.
 
+The experimental, trade-disabled two-PC data probe is documented in
+[FRLG LAN data probe (P0)](frlg_remote_trade_p0_zh.md).
+
+The proposed live two-player exchange protocol, start/finish release gates, and P1/P2
+implementation plan are documented in [FRLG remote LAN trade plan](frlg_remote_trade_lan_plan_zh.md).
+
 ## Components and ownership
 
 | component | owns |
