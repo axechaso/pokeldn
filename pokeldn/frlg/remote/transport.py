@@ -12,7 +12,8 @@ import hmac
 
 from pokeldn.frlg.remote.config import PROBE_CAPABILITY
 from pokeldn.frlg.remote.protocol import (
-    FrameDecoder, LanMessage, ProtocolError, PROTOCOL_VERSION, encode_frame,
+    FrameDecoder, LanMessage, ProtocolError, PROTOCOL_VERSION, TRADE_MESSAGE_TYPES,
+    encode_frame,
 )
 
 
@@ -247,6 +248,8 @@ class RemoteTransport:
             raise TransportError(self._error)
         if self._sock is None or self._stop.is_set():
             raise TransportError("transport is not connected")
+        if self.config.probe_only and message_type in TRADE_MESSAGE_TYPES:
+            raise TransportError("formal trade messages are disabled by the P0-only transport")
         if message_type in {"HELLO", "AUTH", "ROOM_READY", "ROOM_READY_ACK", "PING", "PONG"}:
             raise ValueError("message type is reserved for transport control")
         try:

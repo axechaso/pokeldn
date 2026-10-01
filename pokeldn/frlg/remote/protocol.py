@@ -15,6 +15,8 @@ from dataclasses import dataclass
 
 
 PROTOCOL_VERSION = 1
+_TRADE_DECISION_DOMAIN = b"pokeldn/frlg/remote/trade-decision/v1\0"
+_TRADE_RELEASE_DOMAIN = b"pokeldn/frlg/remote/trade-release/v1\0"
 MAX_FRAME_BYTES = 16 * 1024
 AUTH_TAG_BYTES = hashlib.sha256().digest_size
 MAX_BUFFER_BYTES = 4 * (MAX_FRAME_BYTES + 4 + AUTH_TAG_BYTES)
@@ -31,7 +33,23 @@ PHASE_ORDER = tuple(PHASE_SIZES)
 MESSAGE_TYPES = {
     "HELLO", "AUTH", "ROOM_READY", "ROOM_READY_ACK", "LOCAL_LINK_STATE",
     "PEER_BLOCK", "SNAPSHOT_READY", "PING", "PONG", "ERROR", "PROBE_STOP",
+    "PHASE_READY", "SELECT", "SELECT_ACK", "CONFIRM", "REJECT", "CANCEL",
+    "PREPARE", "PREPARED", "DECISION", "DECISION_STORED", "RELEASE",
+    "ANIMATION_FINISHED", "SAVE_PROGRESS", "POST_TRADE_SNAPSHOT", "RESULT",
+    "RESULT_ACK", "CLOSE_REQUEST", "CLOSE_RESULT", "SNAPSHOT_ACK",
+    "SNAPSHOT_ACK_ACK", "CONFIRM_ACK", "PREPARED_ACK", "DECISION_STORED_ACK",
+    "ANIMATION_FINISHED_ACK", "SAVE_PROGRESS_ACK", "POST_TRADE_SNAPSHOT_ACK",
+    "CANCEL_ACK", "MENU_READY", "MENU_READY_ACK",
 }
+TRADE_MESSAGE_TYPES = frozenset({
+    "PHASE_READY", "SELECT", "SELECT_ACK", "CONFIRM", "REJECT", "CANCEL",
+    "PREPARE", "PREPARED", "DECISION", "DECISION_STORED", "RELEASE",
+    "ANIMATION_FINISHED", "SAVE_PROGRESS", "POST_TRADE_SNAPSHOT", "RESULT",
+    "RESULT_ACK", "CLOSE_REQUEST", "CLOSE_RESULT", "SNAPSHOT_ACK",
+    "SNAPSHOT_ACK_ACK", "CONFIRM_ACK", "PREPARED_ACK", "DECISION_STORED_ACK",
+    "ANIMATION_FINISHED_ACK", "SAVE_PROGRESS_ACK", "POST_TRADE_SNAPSHOT_ACK",
+    "CANCEL_ACK", "MENU_READY", "MENU_READY_ACK",
+})
 LINK_STATES = {"waiting", "connected", "closing", "closed", "failed"}
 ERROR_CODES = {
     "protocol_mismatch", "room_mismatch", "phase_mismatch", "queue_full",
@@ -74,6 +92,28 @@ def _canonical_json(value):
                       separators=(",", ":"), allow_nan=False).encode("utf-8")
 
 
+def trade_decision_hash(run_id, trade_id, selection_epoch, kind, selection_hash,
+                        *, prepared_sides=(), finished_sides=(), event_digests=None):
+    facts = {"selection_hash": selection_hash}
+    if kind == "start":
+        facts["prepared_sides"] = list(prepared_sides)
+    elif kind == "finish":
+        facts["finished_sides"] = list(finished_sides)
+        facts["event_digests"] = dict(event_digests or {})
+    else:
+        raise ValueError("trade decision kind must be start or finish")
+    body = {"run_id": run_id, "trade_id": trade_id,
+            "selection_epoch": selection_epoch, "kind": kind, **facts}
+    return hashlib.sha256(_TRADE_DECISION_DOMAIN + _canonical_json(body)).hexdigest()
+
+
+def trade_release_hash(run_id, trade_id, selection_epoch, kind, decision_hash):
+    body = {"run_id": run_id, "trade_id": trade_id,
+            "selection_epoch": selection_epoch, "kind": kind,
+            "decision_hash": decision_hash}
+    return hashlib.sha256(_TRADE_RELEASE_DOMAIN + _canonical_json(body)).hexdigest()
+
+
 def _reject_duplicate_keys(pairs):
     result = {}
     for key, value in pairs:
@@ -91,6 +131,23 @@ def _is_hex(value, length):
 def _valid_bridge_name(value):
     return (isinstance(value, str) and 1 <= len(value) <= 7
             and value.isascii() and value.isprintable())
+
+
+def _valid_trade_base(payload, *, extra=()):
+    required = {"trade_id", "selection_epoch", *extra}
+    if set(payload) != required:
+        return False
+    return (_is_hex(payload["trade_id"], 32)
+            and type(payload["selection_epoch"]) is int
+            and 0 <= payload["selection_epoch"] <= 0x7FFFFFFF)
+
+
+def _valid_slot(value):
+    return type(value) is int and 0 <= value <= 5
+
+
+def _valid_hash(value):
+    return _is_hex(value, 64)
 
 
 def logical_bytes(phase, raw):
@@ -179,6 +236,11 @@ def validate_message(value):
                 or not _is_hex(payload["digest"], 64)
                 or payload["phases"] != list(PHASE_ORDER)):
             raise ProtocolError("invalid SNAPSHOT_READY payload")
+    elif message_type in ("SNAPSHOT_ACK", "SNAPSHOT_ACK_ACK"):
+        if (phase is not None or set(payload) != {"snapshot_id", "digest"}
+                or not _is_hex(payload["snapshot_id"], 32)
+                or not _valid_hash(payload["digest"])):
+            raise ProtocolError(f"invalid {message_type} payload")
     elif message_type in ("PING", "PONG"):
         if phase is not None or set(payload) != {"time_ns"} or type(payload["time_ns"]) is not int or payload["time_ns"] < 0:
             raise ProtocolError(f"invalid {message_type} payload")
@@ -192,6 +254,210 @@ def validate_message(value):
                 or not isinstance(payload["reason"], str) or payload["reason"] not in {
                     "cancelled", "completed", "in_doubt", "link_failed"}):
             raise ProtocolError("invalid PROBE_STOP payload")
+    elif message_type == "PHASE_READY":
+        if (phase not in PHASE_ORDER
+                or not _valid_trade_base(payload, extra={"digest"})
+                or not _valid_hash(payload["digest"])):
+            raise ProtocolError("invalid PHASE_READY payload")
+    elif message_type == "SELECT":
+        if (phase is not None
+                or not _valid_trade_base(payload, extra={"snapshot_id", "slot", "slot_digest"})
+                or not _is_hex(payload["snapshot_id"], 32)
+                or not _valid_slot(payload["slot"])
+                or not _valid_hash(payload["slot_digest"])):
+            raise ProtocolError("invalid SELECT payload")
+    elif message_type == "SELECT_ACK":
+        valid = (_valid_trade_base(payload)
+                 or _valid_trade_base(payload, extra={"selection_hash"}))
+        if (phase is not None or not valid
+                or ("selection_hash" in payload
+                    and not _valid_hash(payload["selection_hash"]))):
+            raise ProtocolError("invalid SELECT_ACK payload")
+    elif message_type == "CONFIRM":
+        if (phase is not None or not _valid_trade_base(payload, extra={"accepted"})
+                or type(payload["accepted"]) is not bool):
+            raise ProtocolError("invalid CONFIRM payload")
+    elif message_type == "CONFIRM_ACK":
+        if (phase is not None or not _valid_trade_base(payload, extra={"accepted"})
+                or type(payload["accepted"]) is not bool):
+            raise ProtocolError("invalid CONFIRM_ACK payload")
+    elif message_type == "REJECT":
+        if (phase is not None or not _valid_trade_base(payload, extra={"reason"})
+                or not isinstance(payload["reason"], str) or payload["reason"] not in {
+                    "empty_slot", "game_rejected", "unsupported_mon",
+                    "snapshot_mismatch", "user_cancel"}):
+            raise ProtocolError("invalid REJECT payload")
+    elif message_type == "CANCEL":
+        if (phase is not None
+                or not _valid_trade_base(payload, extra={"reason", "next_selection_epoch", "exit_room"})
+                or not isinstance(payload["reason"], str) or payload["reason"] not in {
+                    "user_cancel", "game_rejected", "selection_changed", "peer_exit"}
+                or type(payload["next_selection_epoch"]) is not int
+                or payload["next_selection_epoch"] != payload["selection_epoch"] + 1
+                or payload["next_selection_epoch"] > 0x7FFFFFFF
+                or type(payload["exit_room"]) is not bool):
+            raise ProtocolError("invalid CANCEL payload")
+    elif message_type in ("PREPARE", "PREPARED"):
+        if message_type == "PREPARED":
+            valid = (_valid_trade_base(payload, extra={"selection_hash"})
+                     and _valid_hash(payload["selection_hash"]))
+        else:
+            fields = {"selection_hash", "snapshot_a_id", "snapshot_a_digest",
+                      "snapshot_b_id", "snapshot_b_digest", "slot_a", "slot_a_digest",
+                      "slot_b", "slot_b_digest"}
+            valid = _valid_trade_base(payload, extra=fields)
+            if valid:
+                valid = (
+                    _valid_hash(payload["selection_hash"])
+                    and _is_hex(payload["snapshot_a_id"], 32)
+                    and _valid_hash(payload["snapshot_a_digest"])
+                    and _is_hex(payload["snapshot_b_id"], 32)
+                    and _valid_hash(payload["snapshot_b_digest"])
+                    and _valid_slot(payload["slot_a"])
+                    and _valid_hash(payload["slot_a_digest"])
+                    and _valid_slot(payload["slot_b"])
+                    and _valid_hash(payload["slot_b_digest"]))
+        if phase is not None or not valid:
+            raise ProtocolError(f"invalid {message_type} payload")
+    elif message_type == "PREPARED_ACK":
+        if (phase is not None
+                or not _valid_trade_base(payload, extra={"selection_hash"})
+                or not _valid_hash(payload["selection_hash"])):
+            raise ProtocolError("invalid PREPARED_ACK payload")
+    elif message_type in ("DECISION", "DECISION_STORED", "RELEASE"):
+        kind = payload.get("kind")
+        if not isinstance(kind, str) or kind not in ("start", "finish"):
+            raise ProtocolError(f"invalid {message_type} decision kind")
+        if message_type == "DECISION":
+            extra = {"kind", "decision_hash", "selection_hash"}
+            if kind == "start":
+                extra.add("prepared_sides")
+            else:
+                extra.update({"finished_sides", "event_digests"})
+            valid = _valid_trade_base(payload, extra=extra)
+            if valid:
+                valid = (_valid_hash(payload["decision_hash"])
+                         and _valid_hash(payload["selection_hash"]))
+                if kind == "start":
+                    valid = valid and payload["prepared_sides"] == ["A", "B"]
+                else:
+                    event_digests = payload["event_digests"]
+                    valid = (valid and payload["finished_sides"] == ["A", "B"]
+                             and isinstance(event_digests, dict)
+                             and set(event_digests) == {"A", "B"}
+                             and all(_valid_hash(item) for item in event_digests.values()))
+                if valid:
+                    expected_decision_hash = trade_decision_hash(
+                        value["run_id"], payload["trade_id"], payload["selection_epoch"],
+                        kind, payload["selection_hash"],
+                        prepared_sides=payload.get("prepared_sides", ()),
+                        finished_sides=payload.get("finished_sides", ()),
+                        event_digests=payload.get("event_digests"))
+                    valid = hmac.compare_digest(payload["decision_hash"],
+                                                expected_decision_hash)
+        elif message_type == "DECISION_STORED":
+            valid = (_valid_trade_base(payload, extra={"kind", "decision_hash"})
+                     and _valid_hash(payload["decision_hash"]))
+        else:
+            valid = (_valid_trade_base(payload, extra={"kind", "decision_hash", "release_hash"})
+                     and _valid_hash(payload["decision_hash"])
+                     and _valid_hash(payload["release_hash"]))
+            if valid:
+                expected_release_hash = trade_release_hash(
+                    value["run_id"], payload["trade_id"], payload["selection_epoch"],
+                    kind, payload["decision_hash"])
+                valid = hmac.compare_digest(payload["release_hash"], expected_release_hash)
+        if phase is not None or not valid:
+            raise ProtocolError(f"invalid {message_type} payload")
+    elif message_type == "DECISION_STORED_ACK":
+        if (phase is not None
+                or not _valid_trade_base(payload, extra={"kind", "decision_hash"})
+                or not isinstance(payload["kind"], str)
+                or payload["kind"] not in ("start", "finish")
+                or not _valid_hash(payload["decision_hash"])):
+            raise ProtocolError("invalid DECISION_STORED_ACK payload")
+    elif message_type == "ANIMATION_FINISHED":
+        if (phase is not None
+                or not _valid_trade_base(payload, extra={"event_digest"})
+                or not _valid_hash(payload["event_digest"])):
+            raise ProtocolError("invalid ANIMATION_FINISHED payload")
+    elif message_type == "ANIMATION_FINISHED_ACK":
+        if (phase is not None
+                or not _valid_trade_base(payload, extra={"event_digest"})
+                or not _valid_hash(payload["event_digest"])):
+            raise ProtocolError("invalid ANIMATION_FINISHED_ACK payload")
+    elif message_type == "SAVE_PROGRESS":
+        if (phase is not None
+                or not _valid_trade_base(payload, extra={"milestone", "progress_index"})
+                or not isinstance(payload["milestone"], str) or payload["milestone"] not in {
+                    "save_started", "barrier", "party_refresh_started", "save_complete"}
+                or type(payload["progress_index"]) is not int
+                or not 0 <= payload["progress_index"] <= 0x7FFFFFFF):
+            raise ProtocolError("invalid SAVE_PROGRESS payload")
+    elif message_type == "SAVE_PROGRESS_ACK":
+        if (phase is not None
+                or not _valid_trade_base(payload, extra={"milestone", "progress_index"})
+                or not isinstance(payload["milestone"], str)
+                or payload["milestone"] not in {
+                    "save_started", "barrier", "party_refresh_started", "save_complete"}
+                or type(payload["progress_index"]) is not int
+                or not 0 <= payload["progress_index"] <= 0x7FFFFFFF):
+            raise ProtocolError("invalid SAVE_PROGRESS_ACK payload")
+    elif message_type == "POST_TRADE_SNAPSHOT":
+        if (phase is not None
+                or not _valid_trade_base(payload, extra={"snapshot_id", "digest"})
+                or not _is_hex(payload["snapshot_id"], 32)
+                or not _valid_hash(payload["digest"])):
+            raise ProtocolError("invalid POST_TRADE_SNAPSHOT payload")
+    elif message_type == "POST_TRADE_SNAPSHOT_ACK":
+        if (phase is not None
+                or not _valid_trade_base(payload, extra={"snapshot_id", "digest"})
+                or not _is_hex(payload["snapshot_id"], 32)
+                or not _valid_hash(payload["digest"])):
+            raise ProtocolError("invalid POST_TRADE_SNAPSHOT_ACK payload")
+    elif message_type in ("RESULT", "RESULT_ACK"):
+        fields = {"result_id", "digest", "validator_version"}
+        if message_type == "RESULT_ACK":
+            fields = {"result_id", "digest"}
+        valid = _valid_trade_base(payload, extra=fields)
+        if valid:
+            valid = (_is_hex(payload["result_id"], 32)
+                     and _valid_hash(payload["digest"]))
+            if message_type == "RESULT":
+                valid = valid and type(payload["validator_version"]) is int \
+                    and 1 <= payload["validator_version"] <= 0x7FFFFFFF
+        if phase is not None or not valid:
+            raise ProtocolError(f"invalid {message_type} payload")
+    elif message_type == "CLOSE_REQUEST":
+        if (phase is not None
+                or not _valid_trade_base(payload, extra={"reason"})
+                or not isinstance(payload["reason"], str) or payload["reason"] not in {
+                    "completed", "cancelled", "in_doubt", "local_failure"}):
+            raise ProtocolError("invalid CLOSE_REQUEST payload")
+    elif message_type == "CLOSE_RESULT":
+        if (phase is not None
+                or not _valid_trade_base(payload, extra={"state", "close_confirmed"})
+                or not isinstance(payload["state"], str)
+                or payload["state"] not in {"closed", "failed", "in_doubt"}
+                or type(payload["close_confirmed"]) is not bool):
+            raise ProtocolError("invalid CLOSE_RESULT payload")
+    elif message_type == "CANCEL_ACK":
+        if (phase is not None
+                or not _valid_trade_base(payload, extra={"reason", "next_selection_epoch"})
+                or not isinstance(payload["reason"], str)
+                or payload["reason"] not in {
+                    "user_cancel", "game_rejected", "selection_changed", "peer_exit"}
+                or type(payload["next_selection_epoch"]) is not int
+                or payload["next_selection_epoch"] != payload["selection_epoch"] + 1
+                or payload["next_selection_epoch"] > 0x7FFFFFFF):
+            raise ProtocolError("invalid CANCEL_ACK payload")
+    elif message_type in ("MENU_READY", "MENU_READY_ACK"):
+        if (phase is not None
+                or not _valid_trade_base(payload, extra={"next_selection_epoch"})
+                or type(payload["next_selection_epoch"]) is not int
+                or payload["next_selection_epoch"] != payload["selection_epoch"] + 1
+                or payload["next_selection_epoch"] > 0x7FFFFFFF):
+            raise ProtocolError(f"invalid {message_type} payload")
     return LanMessage(**value)
 
 
