@@ -43,6 +43,7 @@ player's party. The RNG is closed end to end; a shiny encounter costs one A pres
 | [The random number generator](frlg_rng.md) | reading and predicting `gRngValue`, and the field stubs that aim an encounter |
 | [LeafGreen](frlg_leafgreen.md) | what the second cartridge shares, the measured offset map, and the English build as an instrument |
 | [Host implementation](frlg_host.md) | the component boundaries of the trade and Mystery Gift hosts |
+| [汉化运行时补丁工具](frlg_localization.md) | 离线补丁构建、ARM 分页传输模型及恢复；尚未完成实机汉化 |
 
 ## The two cartridges
 

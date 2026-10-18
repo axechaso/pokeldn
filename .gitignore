@@ -74,6 +74,11 @@ logs/
 /LDN/
 
 # Saves and ROM for testing wonder cards on emulation.
+*.gba
+*.sav
+# Localization recovery files contain full original ROM pages and stay on this machine.
+recovery.local.json
+*.frlgzh-recovery.json
 pokeldn/POKEMON_FIRE_BPRE01.gba
 pokeldn/POKEMON_FIRE_BPRE01.sav.gift.sav
 pokeldn/POKEMON_FIRE_BPRE01.sav
