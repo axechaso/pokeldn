@@ -29,12 +29,13 @@ class LocalizationProbeOperation(LocalizationGiftOperation):
     """The established English FireRed target, read-only, without an original ROM file."""
 
     def __init__(self, *, rom_size=0x1000000, dump_path=None, timeout=30.0,
-                 log=lambda *args: None):
+                 log=lambda *args: None, progress=lambda done, total: None):
         integer(rom_size, "probe ROM size", 0x1000, 0x1000000)
         if rom_size & (rom_size - 1):
             raise LocalizationError("probe ROM size must be a power of two")
         self.profile, self.operation = ProbeTarget(), "probe"
         self.rom_size, self.dump_path = rom_size, None if dump_path is None else Path(dump_path)
+        self.progress = progress
         if self.dump_path is not None and self.dump_path.exists():
             raise LocalizationError("probe dump output already exists")
         if self.dump_path is not None and not self.dump_path.parent.is_dir():
@@ -49,6 +50,7 @@ class LocalizationProbeOperation(LocalizationGiftOperation):
         if (header[0xAC:0xB0] != b"BPRE" or header[0xBC] != 0x0A):
             raise LocalizationError("ROM header conflicts with the BPRE 0x0A game-data handshake")
         digest = hashlib.sha256()
+        self.progress(0, self.rom_size)
         output = None
         try:
             if self.dump_path is not None:
@@ -59,6 +61,7 @@ class LocalizationProbeOperation(LocalizationGiftOperation):
                 digest.update(block)
                 if output is not None:
                     output.write(block)
+                self.progress(offset + len(block), self.rom_size)
         finally:
             # A partial capture is retained for diagnosis. A report is emitted only after
             # completion; it must never be mistaken for a verified original cartridge.

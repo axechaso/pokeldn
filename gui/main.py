@@ -61,7 +61,7 @@ if ANDROID or IOS:   # no Bluetooth controller and no self-update on a phone (ex
 
 def main(page: ft.Page) -> None:
     t.compact = bool(page.width) and page.width < t.COMPACT_WIDTH
-    page.title = "pokeldn"
+    page.title = os.environ.get("POKELDN_GUI_TITLE", "pokeldn")
     page.theme_mode = ft.ThemeMode.DARK
     page.theme = page.dark_theme = t.app_theme()
     page.bgcolor = t.BG
@@ -162,7 +162,8 @@ def main(page: ft.Page) -> None:
         window = t.backdrop(ft.Column([content, bar], spacing=8, expand=True))
         window.padding = ft.Padding(8, 8, 8, 8)
         page.add(window)
-        navigate("games")
+        navigate("games", game=os.environ.get("POKELDN_START_GAME", ""),
+                 tool=os.environ.get("POKELDN_START_TOOL", ""))
         compact_start(app)
         return
     side = t.panel(ft.Column([
@@ -178,7 +179,8 @@ def main(page: ft.Page) -> None:
     window = t.backdrop(ft.Column([window_header(page), body], spacing=0, expand=True))
     window.padding = ft.Padding(t.GAP, 0, t.GAP, t.GAP)
     page.add(window)
-    navigate("games")
+    navigate("games", game=os.environ.get("POKELDN_START_GAME", ""),
+             tool=os.environ.get("POKELDN_START_TOOL", ""))
     if not page.web:
         page.run_task(page.window.center)
     outcome = update.finish(update.install_root())

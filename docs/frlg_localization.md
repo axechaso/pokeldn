@@ -6,7 +6,7 @@ nav_exclude: true
 
 # 汉化运行时补丁工具
 
-2026-10-19 更新。已交付[汉化方案](pokeldn_localization_implementation_plan_zh.md)的软件基础：版本配置、差分包、ARM 页载荷、恢复日志，以及接入现有 PokeLDN RFU／Mystery Gift 主机的持续多步骤适配器。另有 26 字、两页对话的离线字库与排版预览。**目前不能让 Switch 游戏显示中文**，也没有经过本项目验证的零售版本配置。CLI 提供离线工具和直接经 PokeLDN 采集 ROM 的只读入口；实际写入适配器为库接口，保留独立观测的版本与写入门禁。
+2026-10-19 更新。已交付[汉化方案](pokeldn_localization_implementation_plan_zh.md)的软件基础：版本配置、差分包、ARM 页载荷、恢复日志，以及接入现有 PokeLDN RFU／Mystery Gift 主机的持续多步骤适配器。另有 26 字、两页对话的离线字库与排版预览。**目前不能让 Switch 游戏显示中文**，也没有经过本项目验证的零售版本配置。桌面客户端提供只读连接测试和完整运行时 ROM 采集，CLI 继续提供相同采集入口及离线工具；实际写入适配器为库接口，保留独立观测的版本与写入门禁。
 
 | 阶段 | 当前状态 |
 | --- | --- |
@@ -14,7 +14,7 @@ nav_exclude: true
 | P1 修改版 Ryubing 复现 | 未执行；Unicorn 软件模型不等于 Switch 包装器模拟器 |
 | P2 零售机单页验证 | 尚未完成实机验收；可先用下方只读入口直接取得运行时 ROM |
 | P3 中文编码、字库、渲染 | 有字库子集、Unicode IR、像素排版和离线预览；游戏编码及完整渲染链未接入 |
-| P4 内容、P5 插件 | 未实现；不得将此分支作为完整汉化版发布 |
+| P4 内容、P5 插件 | 客户端已有只读测试入口；正式内容及完整汉化插件未实现 |
 
 ## 上游与固件基线
 
@@ -35,7 +35,23 @@ nav_exclude: true
 同步保留了上游的 USB 断线／信用窗口处理、Mystery Gift／存档传输入口，以及可选板载屏幕支持。
 汉化主机改用共用的 `_build_engine` 扩展点，并提供不依赖 Wonder Card 的屏幕内容。
 
-## 直接用 PokeLDN 采集运行时 ROM
+## 在客户端测试
+
+这次开发版客户端的 **Games → FireRed & LeafGreen → Localization test** 提供按钮入口。
+沿用 Board 页的无线板和 Settings 中的密钥，不需要手动填写命令或输出路径。
+本机的 **PokeLDN 汉化测试** 桌面快捷方式会直接打开此页；源码中的对应启动入口为
+`gui/localization_test.py`。
+
+默认 **Quick connection test (4 KiB)** 先验证真实无线读取；点 Start 后，在英文火红选择
+**Mystery Gift → Wonder Cards → Friend → POKELDN**，等待 Session 显示
+**Quick connection test passed**。这份 4 KiB 样本只用于连接测试，不是完整 ROM。
+
+连接通过后，可改为 **Capture runtime ROM (16 MiB)** 取得完整运行时副本。Session 显示读取进度、
+完成状态、SHA-256 和 **Open output folder** 按钮。每次运行自动在 Received 下新建独立目录，
+保存 `report.json` 及 `runtime-sample.bin`（快速测试）或 `runtime.gba`（完整采集）。
+两次运行之间先在 Switch 退出搜索页面再进入。当前入口只读；游戏内中文显示仍未接通。
+
+## 命令行采集运行时 ROM
 
 不需要事先提供 ROM 文件。沿用 `config/host.toml`、可选本机配置和已有密钥位置，默认连接 `POKELDN_RADIO` 指定的无线板，未设置时使用 `esp32:auto`：
 
@@ -177,7 +193,7 @@ dotnet build -c Release services/pkhex -warnaserror
 
 自动回归覆盖错版本／保护区、清单篡改、跨页合并、控制符无损往返、乱序／重复／旧会话、缺块、暂存损坏、写入静默拒绝、应答丢失、部分写入续接、逆序恢复、邻页变化、重复加载、模型中的软复位／完整重启，以及已上传 THUMB 代码的取指执行。
 
-2026-10-19 上游同步后的本机验收环境为 Windows、Python 3.12.8、Unicorn 2.1.4、GNU Arm 12.2.Rel1、.NET SDK 10.0.400。全仓回归 **4404 项通过、349 项跳过**，使用 `-q -W error -p no:faulthandler -n 8 --dist worksteal`。汉化相关 97 项测试通过；buffer、field 和 resident 三类汇编产物检查通过；PKHeX Release 构建 0 警告、0 错误。三页模型的加载、重复加载及恢复通过，实际提交总数为 6。这些结果只验证软件和前述板载串口握手，不代替 Switch／Ryubing 验收。
+2026-10-19 上游同步和客户端入口完成后的本机验收环境为 Windows、Python 3.12.8、Unicorn 2.1.4、GNU Arm 12.2.Rel1、.NET SDK 10.0.400。全仓回归 **4420 项通过、349 项跳过**，使用 `-q -W error -p no:faulthandler -n 8 --dist worksteal`。buffer、field 和 resident 三类汇编产物检查通过；PKHeX Release 构建 0 警告、0 错误。三页模型的加载、重复加载及恢复通过，实际提交总数为 6。客户端测试页已通过本机浏览器渲染检查，原生桌面窗口正常启动；当前未检测到串口设备，尚未从客户端完成实际 Switch 采集。这些结果不代替 Switch／Ryubing 验收。
 
 回归包括完整客户端 VM／RFU 分块状态机下的加载和恢复、批量回读游标重置、身份拒绝、超时／短响应／断线取消、无需原始文件的 ROM 采集、主机初始化／清理、无 Wonder Card 的屏幕回调、字模往返、版权元数据、缺字、变量及像素溢出。另修复 field／resident 生成器的 Windows CRLF 源哈希差异，统一按 LF 计算（含 resident 的共享 include）；逐项重汇编确认机器码和符号偏移与已提交产物一致，无需修改这些机器码。
 

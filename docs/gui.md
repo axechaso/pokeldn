@@ -20,6 +20,13 @@ a `.pokegift` or, by its extension, a `.wc3` (FireRed/LeafGreen) or `.wc8` (Swor
 [Mystery Gift files](gifts.md#desktop-app) describes the forms, cartridge variants and native-format
 conversion.
 
+The development localization branch adds **FireRed & LeafGreen → Localization test**. Its default
+**Quick connection test (4 KiB)** checks read-only communication with English FireRed; **Capture runtime
+ROM (16 MiB)** saves the complete runtime capture. Session shows progress, the completed fingerprint,
+and an output-folder button. Files are saved automatically under Received. Follow the console steps
+in Session and leave the search screen before each new run. This tool does not install Chinese text.
+See [localization testing](frlg_localization.md#在客户端测试).
+
 ## First launch
 
 The checkerboard covers the whole window, the transparent header included; the navigation rail

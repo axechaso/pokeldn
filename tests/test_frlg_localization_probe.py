@@ -1,6 +1,7 @@
 """Read-only bootstrap obtains runtime material over PokeLDN, without a base ROM input."""
 
 from pathlib import Path
+import os
 import subprocess
 import sys
 
@@ -108,5 +109,5 @@ def test_probe_interrupt_exit_code_and_radio_environment_are_preserved(tmp_path,
     monkeypatch.setattr(localization_probe.LocalizationHostApplication, "run", interrupted)
     assert localization_probe.main(["--report", str(tmp_path / "report.json"),
                                     "--no-local-config", "--radio", "esp32:auto"]) == 130
-    assert localization_probe.os.environ["POKELDN_RADIO"] == "esp32:COM7"
+    assert os.environ["POKELDN_RADIO"] == "esp32:COM7"
     assert not (tmp_path / "report.json").exists()
