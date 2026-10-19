@@ -6,14 +6,14 @@ nav_exclude: true
 
 # 汉化运行时补丁工具
 
-2026-10-19 更新。已交付[汉化方案](pokeldn_localization_implementation_plan_zh.md)的软件基础：版本配置、差分包、ARM 页载荷、恢复日志，以及接入现有 PokeLDN RFU／Mystery Gift 主机的持续多步骤适配器。另有 26 字、两页对话的离线字库与排版预览。**目前不能让 Switch 游戏显示中文**，也没有经过本项目验证的零售版本配置。桌面客户端提供只读连接测试和完整运行时 ROM 采集，CLI 继续提供相同采集入口及离线工具；实际写入适配器为库接口，保留独立观测的版本与写入门禁。
+2026-10-19 更新。已交付[汉化方案](pokeldn_localization_implementation_plan_zh.md)的软件基础：版本配置、差分包、ARM 页载荷、恢复日志，以及接入现有 PokeLDN RFU／Mystery Gift 主机的持续多步骤适配器。另有字库、排版预览，以及已在 mGBA 中运行的两页中文开场对话源码原型。**目前不能让 Switch 游戏显示中文**，也没有经过本项目验证的零售版本配置。桌面客户端提供只读连接测试和完整运行时 ROM 采集，CLI 继续提供相同采集入口及离线工具；实际写入适配器为库接口，保留独立观测的版本与写入门禁。
 
 | 阶段 | 当前状态 |
 | --- | --- |
 | P0 离线核心 | 已实现并有自动回归；真实 ROM／包装器及暂存区证据尚待补齐 |
-| P1 修改版 Ryubing 复现 | 未执行；下一步先准备离线构建与模拟器，Unicorn 软件模型不等于 Switch 包装器模拟器 |
+| P1 修改版 Ryubing 复现 | 未执行；已构建匹配原版并用 mGBA 验证源码渲染原型，仍未验证 Switch 包装器 |
 | P2 零售机单页验证 | 4 KiB 实机只读采集及正常断开已通过；页写入、恢复与取指尚待验收 |
-| P3 中文编码、字库、渲染 | 有字库子集、Unicode IR、像素排版和离线预览；游戏编码及完整渲染链未接入 |
+| P3 中文编码、字库、渲染 | 已有 mGBA 两页中文对话源码原型；正式编码、运行时挂钩和完整内容仍未交付 |
 | P4 内容、P5 插件 | 客户端已有只读测试入口；正式内容及完整汉化插件未实现 |
 
 ## 上游与固件基线
@@ -41,7 +41,7 @@ GBA 头校验和正确，保存文件 SHA-256 与报告一致（`a5c8d8f89e801d4
 从开始发送到主机进入 `MG_CLOSE` 恰好 30 秒，正文文件为 0 字节，没有成功报告。
 已将默认 RPC 批次和落盘批次改为 4 KiB，完整客户端脚本／载荷发送也计入进展；
 失败时先发关闭轮询再断开 RFU，主机直接报告工作线程错误并释放网络，不再等待正常礼物收尾。
-新报告记录 `read_batch_bytes=4096`。此修复仍需同一台实机重试 64 KiB；失败产物不覆盖先前有效的 4 KiB 样本。
+新报告记录 `read_batch_bytes=4096`。软件回归不证明同机 64 KiB 已通过；失败产物不覆盖先前有效的 4 KiB 样本。
 
 后续实机重试仍持续报错，没有取得有效正文。**目前停止要求用户继续重试采集。**
 4 KiB 成功只证明一次短读取，自动测试通过也不证明零售机的长会话稳定。
@@ -202,7 +202,37 @@ python tools/frlg/localization_text_build.py --output-dir scratchpad/zh-dialogue
 
 子集为 16×16、2bpp 行顺序位图，每字 64 字节；示例构建保留原拉丁字符回退后为 107 个字形、6,848 字节。`glyph_order` 给出 `font.bin` 内字形顺序。排版同时检查实际预览名和 7 字符、每字符最多 16 像素的最坏占位；默认示例最大行宽 168 像素，窗口限制 224 像素、每页两行。缺字、未知控制符、超长姓名、窗口溢出均失败，不丢字或静默换页。
 
-这份 IR 明确设置 `game_encoding_assigned=false`，字形索引没有被当成游戏内字符编码。PNG 标注 `OFFLINE PROTOTYPE`，是独立的软件预览，不是 Switch／Ryubing 游戏画面。尚不能直接把这些素材交给 ROM 加载器；下一步仍需目标构建的编码、字符串处理、字形绘制适配和完整入口证据。
+这份 IR 明确设置 `game_encoding_assigned=false`，字形索引没有被当成游戏内字符编码。PNG 标注 `OFFLINE PROTOTYPE`，是独立的软件预览，不是 Switch／Ryubing 游戏画面。下面的游戏源码实验另行生成限定编码，不能直接把 IR 或重建后的游戏映像交给运行时加载器。
+
+## 游戏文本引擎中的中文实验
+
+已从 [pret/pokefirered 固定源码](https://github.com/pret/pokefirered/tree/037335f4c725d7c9aecdac87066f2002b4bd7e14)
+构建 `FIRERED / GAME_REVISION=10 / MODERN=0`。原版 16 MiB 映像通过上游 SHA-1 校验
+`baa452d0b24629dd7782cfc07a8984085dde1311`；其前 4 KiB 的 SHA-256 与上述 NS 实机成功样本相同。
+这验证了源码与目标基础版本的对应关系，尚不确认整个运行时映像及包装器。
+
+`tools/frlg/localization_game_demo.py` 检查原版哈希和指定源码文件的 SHA-256，临时改动
+`src/text.c` 与开场文本，生成独立命名的游戏、ELF、map 和构建报告。编译失败时也会恢复原始源码与时间戳。
+需要提前按反编译项目说明构建原版、准备其构建工具；脚本不下载游戏或工具。这是开发入口：
+
+```powershell
+python tools/frlg/localization_game_demo.py --source-dir PATH_TO_DECOMP --output-dir scratchpad/zh-game-001
+python tools/frlg/localization_emulator_smoke.py --core PATH_TO_MGBA_LIBRETRO --rom scratchpad/zh-game-001/demo.gba --output-dir scratchpad/zh-emulator-001
+```
+
+实验复用游戏现有 `F9` 额外字形解码，限定国际版 normal／male 字体的 `40..CF` 选择符区间，
+现有 `00..17` 符号、`D0..FE` 表情和日文字体继续走原有分支。
+仅为这段对话分配 28 个字形；2bpp 字模转换成游戏需要的四块 8×8、4bpp 像素，使用游戏当前文字颜色，
+同时适配绘制与宽度查询。原有换行、按键清页、终止符沿用；姓名与联机字段未改变。
+这个小字库通道不作为完整汉化的通用编码。
+
+实测 mGBA `0.11-212-7a12d6d` 运行 2,640 帧，帧缓冲截图人工确认两页中文、按键清页，以及其后英文剧情继续。
+核心 SHA-256 为 `7a5430bdd0b323e28f180201d699f8caa490bbe6e9c3a8489454df8bb5dde760`，
+中文实验映像 SHA-256 为 `562f311ba20b172a9824c305b2310188d78e2aa0ee434336103af4ff75b9a911`。
+外部核心、游戏映像与截图留在本机忽略目录中。
+
+这是源码重编译的 GBA 实验，仍需整理适合零售运行时的局部挂钩和载荷，并在 Switch 包装器环境验证加载与恢复。
+桌面客户端当前没有安装这份实验的入口；`retail_write_eligible` 与 `switch_verified` 继续为 `false`。
 
 ## 验证与继续条件
 
@@ -222,9 +252,8 @@ dotnet build -c Release services/pkhex -warnaserror
 
 回归包括完整客户端 VM／RFU 分块状态机下的加载和恢复、批量回读游标重置、身份拒绝、超时／短响应／断线取消、无需原始文件的 ROM 采集、主机初始化／清理、无 Wonder Card 的屏幕回调、字模往返、版权元数据、缺字、变量及像素溢出。另修复 field／resident 生成器的 Windows CRLF 源哈希差异，统一按 LF 计算（含 resident 的共享 include）；逐项重汇编确认机器码和符号偏移与已提交产物一致，无需修改这些机器码。
 
-当前先回到离线阶段：以 `pret/pokefirered` 固定提交 `037335f4c725d7c9aecdac87066f2002b4bd7e14`
-的 `compare_firered_switch` 目标建立英文修订版 10 基线；其固定 SHA-1 为
-`baa452d0b24629dd7782cfc07a8984085dde1311`。文字、字宽、复制与控制符路径先从源码研究，
-再开发有限的模拟器中文原型。本机已保存相关源码及哈希清单，尚未完成此构建或模拟器验证。
+本轮离线游戏渲染实验已完成：以 `pret/pokefirered` 固定提交 `037335f4c725d7c9aecdac87066f2002b4bd7e14`
+建立通过原版 SHA-1 的英文修订版 10 基线，完成有限字库的源码绘制与字宽适配，
+并在 mGBA 验证两页中文及其后原有剧情。新增源码实验及文档检查与既有汉化模块分别通过本机回归。
 随后仍须复现同构建包装器的单页读取、写入、恢复与取指；零售机阶段独立核对完整 ROM、
 Switch 标题／更新／包装器、通信和暂存区证据。源码、离线原型和一次短读取都不代替这些关口。
