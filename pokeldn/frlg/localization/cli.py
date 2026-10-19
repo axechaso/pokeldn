@@ -36,7 +36,7 @@ def build_parser():
     parser.add_argument("--over-ip", nargs="?", const="auto")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--display-demo", action="store_true",
-                        help="show a short Chinese message on the NS for about 10 seconds; no ROM capture")
+                        help="show a temporary Chinese message on the NS; wait for the English result before pressing A")
     parser.add_argument("--rom-size", type=lambda x: int(x, 0), default=0x1000000)
     parser.add_argument("--dump-rom", type=Path, help="optional local runtime capture; never an original-ROM claim")
     output = parser.add_mutually_exclusive_group(required=True)

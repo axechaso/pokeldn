@@ -196,7 +196,7 @@ FRLG = Game("frlg", tr('catalog.firered_leafgreen_2b757f', 'FireRed & LeafGreen'
                 "{received}/frlg-dump-{stamp}.bin"), doc="frlg_gift.md"),
     Tool("frlg-localization-display", tr('catalog.localization_display', 'NS Chinese display test'),
          "bin/frlg_localization_probe.py",
-         tr('catalog.localization_display_summary', 'Show “你好！” on the Switch Mystery Gift screen for about 10 seconds. This tests temporary screen drawing; it does not install a game translation.'),
+         tr('catalog.localization_display_summary', 'Show “你好！” on the Switch Mystery Gift screen. Wait for the English result message before pressing A; timing depends on the connection. This does not install a game translation.'),
          (tr('catalog.localization_display_start', 'Press Start here, then use English FireRed on your Switch.'),
           tr('catalog.localization_menu', 'On English FireRed, choose Mystery Gift, Wonder Cards, Friend, then POKELDN.'),
           tr('catalog.localization_display_watch', 'Watch the lower message window for “你好！”. When the English result appears, press A to return.'),

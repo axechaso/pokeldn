@@ -999,7 +999,7 @@ class SessionPanel:
         self.received.visible = True
         self.received.content = t.section(
             tr('games.localization_display_done', 'NS display script completed'), ft.Column([
-                t.text(tr('games.localization_display_confirm', 'Check your Switch: did the message window show “你好！” for about 10 seconds?'),
+                t.text(tr('games.localization_display_confirm', 'Check your Switch: did the message window show “你好！”?'),
                        13, t.GREEN),
                 t.text(tr('games.localization_display_scope', 'This confirms the script reply. The visible text still needs your confirmation. No ROM translation was installed.'),
                        12, t.MUTED),

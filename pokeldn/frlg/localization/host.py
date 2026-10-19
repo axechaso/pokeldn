@@ -44,7 +44,8 @@ class LocalizationHostApplication(MysteryGiftHostApplication):
                       f"{self.operation.read_batch_size}-byte requests.")
         elif self.operation.operation == "display":
             self.info("NS Chinese screen demo: 808-byte payload, no ROM capture, no save or ROM writes. "
-                      "Look for Chinese text for about 10 seconds, then press A on the result message.")
+                      "Watch for Chinese text. Wait for the English result message, then press A; "
+                      "communication may extend the wait.")
         else:
             self.info("The connected console must match game data, wrapper observation and full ROM fingerprint.")
 
