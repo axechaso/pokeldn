@@ -1052,7 +1052,7 @@ class SessionPanel:
         self.capture_output = (args[args.index("--output-dir") + 1]
                                if tool.key == "frlg-localization" else None)
         self.display_output = (args[args.index("--output-dir") + 1]
-                               if tool.key == "frlg-zh-display" else None)
+                               if tool.key == "frlg-localization-display" else None)
         for folder in (SESSION / "captures", os.path.expanduser(s.received)):
             os.makedirs(folder, exist_ok=True)
         trace = f"captures/{tool.key}-{stamp}_esp32.trace" if s.board_trace else None

@@ -104,10 +104,10 @@ def test_arm_refuses_mismatch_or_buffer_outside_heap_before_any_window_write(kwa
 
 
 def test_desktop_ns_entry_sends_one_small_script_without_a_capture_mode(tmp_path):
-    tool = next(t for t in FRLG.tools if t.key == "frlg-zh-display")
+    tool = next(t for t in FRLG.tools if t.key == "frlg-localization-display")
     args = cli.build_parser().parse_args(build(tool, {}, {}, Settings(received=str(tmp_path)), stamp="test"))
     assert args.display_demo and args.dump_rom is None
-    assert not any(t.key == "frlg-zh-display" for t in RSE.tools)
+    assert not any(t.key == "frlg-localization-display" for t in RSE.tools)
     operation = LocalizationDisplayOperation()
     sent = []
     operation.transport = type("OneRun", (), {"_run_code": lambda self, code: sent.append(code) or DISPLAY_DONE})()

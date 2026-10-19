@@ -194,7 +194,7 @@ FRLG = Game("frlg", tr('catalog.firered_leafgreen_2b757f', 'FireRed & LeafGreen'
           Field("--channel", tr('catalog.channel_ce4683', 'Channel'), "choice", default="11", choices=CHANNELS, help=CHANNEL_HELP, hidden=True)),
          fixed=("--live", "--ot", "{ot}", "--id", "{tid}:{sid}", "--dump-file",
                 "{received}/frlg-dump-{stamp}.bin"), doc="frlg_gift.md"),
-    Tool("frlg-zh-display", tr('catalog.localization_display', 'NS Chinese display test'),
+    Tool("frlg-localization-display", tr('catalog.localization_display', 'NS Chinese display test'),
          "bin/frlg_localization_probe.py",
          tr('catalog.localization_display_summary', 'Show “你好！” on the Switch Mystery Gift screen for about 10 seconds. This tests temporary screen drawing; it does not install a game translation.'),
          (tr('catalog.localization_display_start', 'Press Start here, then use English FireRed on your Switch.'),
@@ -249,7 +249,7 @@ def rse_tool(tool: Tool) -> Tool:
 # Unreleased on the Switch: shown only while pokeldn.app.preview is enabled (docs/rse.md).
 RSE = Game("rse", tr('catalog.rse_name', 'Ruby, Sapphire & Emerald'), tr('catalog.rse_short', 'RSE'), "rse.md",
            tuple(rse_tool(tool) for tool in FRLG.tools
-                 if tool.key not in ("frlg-localization", "frlg-zh-display")))
+                 if tool.key not in ("frlg-localization", "frlg-localization-display")))
 
 LGPE_STEPS = tr('catalog.x_communicate_local_communication_trade_enter_the_same__d54e70', 'X, Communicate, Local Communication, Trade, enter the same link code, then search.')
 
