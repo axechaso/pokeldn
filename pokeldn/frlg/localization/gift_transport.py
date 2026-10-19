@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from queue import Empty, Queue
 from threading import Lock, Thread
 from time import monotonic
+from typing import Callable
 
 from pokeldn.frlg.gift import mg_script, mg_server
 from pokeldn.frlg.gift.host_mystery_gift import HostMysteryGiftEngine
@@ -31,6 +32,7 @@ class Request:
     arguments: tuple
     future: Future = field(default_factory=Future)
     progress_at: float = field(default_factory=monotonic)
+    on_chunk: Callable[[int, int], None] | None = None
 
 
 class GiftBridge:
@@ -44,14 +46,14 @@ class GiftBridge:
         self._closed = None
         self._sequence = 0
 
-    def exchange(self, kind, *arguments):
+    def exchange(self, kind, *arguments, on_chunk=None):
         with self._lock:
             if self._closed is not None:
                 raise self._closed
             if self._pending is not None:
                 raise LocalizationError("Mystery Gift RPC allows one outstanding request")
             self._sequence += 1
-            request = Request(self._sequence, kind, arguments)
+            request = Request(self._sequence, kind, arguments, on_chunk=on_chunk)
             self._pending = request
             self.requests.put_nowait(request)
         try:
@@ -111,24 +113,28 @@ class GiftTransport(BufferTransport):
         self.bridge, self.profile = bridge, profile
         super().__init__(lambda: bridge.exchange("observe"), self._read, self._run_code)
 
-    def _read(self, address, size):
+    def _read(self, address, size, *, on_chunk=None):
         code = bs.build_memory_dump(address, size, build=self.profile.identity.game_code)
-        return self.bridge.exchange("dump", code, size, 1)
+        return self.bridge.exchange("dump", code, size, 1, on_chunk=on_chunk)
 
-    def read_memory(self, address, size):
+    def read_memory(self, address, size, *, progress=lambda done, total: None):
         integer(size, "read size", 1)
         result = bytearray()
         while len(result) < size:
             at, remaining = address + len(result), size - len(result)
+
+            def report_chunk(done, total):
+                progress(len(result) + done, size)
+
             blocks = min(remaining // 1024, mg_script.MAX_DUMP_BLOCKS)
             if blocks > 1:
                 code = bs.build_memory_dump_multi(at, size=1024, blocks=blocks,
                                                   build=self.profile.identity.game_code)
-                chunk = self.bridge.exchange("dump", code, 1024, blocks)
+                chunk = self.bridge.exchange("dump", code, 1024, blocks, on_chunk=report_chunk)
                 count = blocks * 1024
             else:
                 count = min(remaining, 1024)
-                chunk = self._read(at, count)
+                chunk = self._read(at, count, on_chunk=report_chunk)
             if not isinstance(chunk, bytes) or len(chunk) != count:
                 raise LocalizationError("short/invalid batched memory response")
             result.extend(chunk)
@@ -247,6 +253,14 @@ class LocalizationGiftServer(mg_server.MysteryGiftServer):
             self._finish()
             return
         self._response_chunks.append(bytes(self._received))
+        if request.on_chunk is not None:
+            try:
+                request.on_chunk(len(self._response_chunks) * self._response_size,
+                                 self._response_blocks * self._response_size)
+            except Exception as exc:
+                self.abort(exc)
+                self._finish()
+                return
         self.trace.append(("localization_block", request.sequence, len(self._response_chunks),
                            len(self._received)))
         if len(self._response_chunks) < self._response_blocks:

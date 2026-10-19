@@ -967,12 +967,21 @@ class SessionPanel:
         async def copy_fingerprint(e):
             await self.app.copy(result.sha256)
 
-        title = (tr('games.localization_full_done', 'Runtime ROM captured') if result.full_rom else
-                 tr('games.localization_quick_done', 'Quick connection test passed'))
+        if result.full_rom:
+            title = tr('games.localization_full_done', 'Runtime ROM captured')
+        elif result.text_engine:
+            title = tr('games.localization_text_done', 'Text engine captured')
+        elif result.size == 4096:
+            title = tr('games.localization_quick_done', 'Quick connection test passed')
+        else:
+            title = tr('games.localization_sample_done', 'Runtime sample captured')
         self.received.visible = True
         self.received.content = t.section(title, ft.Column([
             t.text(tr('games.localization_result', 'Read-only test completed. {value0} KiB read from English FireRed.',
                       value0=result.size // 1024), 12, t.GREEN),
+            t.text(tr('games.localization_duration', 'Reading took {value0} seconds.',
+                      value0=f'{result.elapsed:.1f}'), 12, t.MUTED, visible=result.elapsed is not None)
+            if result.elapsed is not None else ft.Container(),
             t.text('SHA-256', 11, t.MUTED),
             t.text(result.sha256, 11, font_family=t.MONO, selectable=True),
             t.text(f'{result.runtime.name} · {result.report.name}', 12, t.MUTED, selectable=True),

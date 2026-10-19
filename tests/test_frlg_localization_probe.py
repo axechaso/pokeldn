@@ -37,6 +37,14 @@ def test_probe_captures_runtime_rom_without_a_base_input(model, tmp_path):
     assert result["state"] == "READ_ONLY_CAPTURED" and result["read_only"]
     assert not result["write_eligible"] and not result["wrapper_identity_verified"]
     assert not result["original_rom_verified"] and not model.machine.rom_writes
+    assert result["capture_elapsed_seconds"] >= 0
+    text = result["text_engine"]
+    assert text["size"] == 65536 and not text["symbol_addresses_verified"]
+    assert not text["game_encoding_assigned"] and not text["write_eligible"]
+    renderer = next(window for window in text["windows"] if window["name"] == "RenderText")
+    assert renderer["address"] == "0x08009128"
+    offset, size = renderer["offset"], renderer["window_size"]
+    assert renderer["sha256"] == sha256(expected[offset:offset + size])
 
 
 def test_probe_rejects_conflicting_memory_header(model, tmp_path):

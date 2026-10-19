@@ -12,6 +12,7 @@ from pokeldn.app.command import build
 from pokeldn.app.introspect import parser_of
 from pokeldn.app.settings import Settings
 from pokeldn.frlg.localization import cli
+from pokeldn.frlg.localization.gift_transport import GiftConnectionClosed
 from pokeldn.frlg.localization.probe import LocalizationProbeOperation
 from test_frlg_localization_gift import PersistentConsole, drive
 from test_frlg_localization_probe import model  # noqa: F401
@@ -40,13 +41,16 @@ def test_client_uses_the_shared_probe_and_settings_without_paths_to_fill(tmp_pat
     assert config.profile.name == "ASH" and (config.profile.tid, config.profile.sid) == (12, 34)
     assert config.console_build == "BPRE"
     assert not any("localization" in t.key for t in RSE.tools)
+    mode = next(field for field in tool.fields if field.flag == "--rom-size")
+    assert {value for value, label in mode.choices} == {"0x1000", "0x10000", "0x1000000"}
 
 
-@pytest.mark.parametrize("size", [4096, 0x1000000])
+@pytest.mark.parametrize("size", [4096, 0x10000, 0x1000000])
 def test_result_distinguishes_a_runtime_sample_from_a_complete_rom(tmp_path, size):
     expected = capture(tmp_path / "output", size)
     result = localization.read_capture(str(tmp_path / "output"))
     assert result.full_rom == (size == 0x1000000)
+    assert result.text_engine == (size == 0x10000)
     assert result.size == size and result.sha256 == expected["runtime_sha256"]
     assert result.runtime.is_file() and result.report.is_file()
 
@@ -66,6 +70,14 @@ def test_client_refuses_a_truncated_binary_even_with_a_complete_report(tmp_path)
     capture(folder)
     (folder / "runtime-sample.bin").write_bytes(b"partial")
     with pytest.raises(ValueError, match="incomplete"):
+        localization.read_capture(str(folder))
+
+
+def test_client_checks_the_actual_binary_fingerprint(tmp_path):
+    folder = tmp_path / "output"
+    capture(folder)
+    (folder / "runtime-sample.bin").write_bytes(b'x' * 4096)
+    with pytest.raises(ValueError, match="fingerprint"):
         localization.read_capture(str(folder))
 
 
@@ -95,10 +107,26 @@ def test_probe_reports_progress_and_reads_only_the_quick_sample(model, tmp_path)
                                            progress=lambda done, total: shown.append((done, total)))
     drive(operation, PersistentConsole(model))
     assert operation.result.result()["rom_size"] == 4096
-    assert shown == [(0, 4096), (4096, 4096)] and not model.machine.rom_writes
+    assert shown == [(done, 4096) for done in range(0, 4097, 1024)]
+    assert not model.machine.rom_writes
 
 
-def test_session_card_shows_the_quick_result_and_keeps_its_files_accessible(tmp_path, monkeypatch):
+def test_progress_callback_failure_closes_the_pending_read(model, tmp_path):
+    def fail_on_chunk(done, total):
+        if done:
+            raise RuntimeError("progress display failed")
+
+    operation = LocalizationProbeOperation(rom_size=4096, dump_path=tmp_path / "sample.bin",
+                                           progress=fail_on_chunk)
+    drive(operation, PersistentConsole(model))
+    with pytest.raises(GiftConnectionClosed, match="progress display failed"):
+        operation.result.result()
+    assert operation.bridge.closed and not model.machine.rom_writes
+
+
+@pytest.mark.parametrize("size,title", [(4096, "Quick connection test passed"),
+                                       (65536, "Text engine captured")])
+def test_session_card_shows_the_result_and_keeps_its_files_accessible(tmp_path, monkeypatch, size, title):
     pytest.importorskip("flet")
     import flet as ft
     from dataclasses import fields
@@ -106,7 +134,9 @@ def test_session_card_shows_the_quick_result_and_keeps_its_files_accessible(tmp_
     from gui.views import games
 
     folder = tmp_path / "output"
-    capture(folder)
+    result = capture(folder, size)
+    result["capture_elapsed_seconds"] = 42.5
+    (folder / "report.json").write_text(json.dumps(result), encoding="utf-8")
     panel = SessionPanel.__new__(SessionPanel)
     panel.app = SimpleNamespace(copy=lambda value: None)
     panel.capture_output, panel.received = str(folder), ft.Container()
@@ -125,7 +155,8 @@ def test_session_card_shows_the_quick_result_and_keeps_its_files_accessible(tmp_
 
     shown = list(controls(panel.received))
     assert panel.received.visible
-    assert any(isinstance(c, ft.Text) and c.value == "Quick connection test passed" for c in shown)
+    assert any(isinstance(c, ft.Text) and c.value == title for c in shown)
+    assert any(isinstance(c, ft.Text) and c.value == "Reading took 42.5 seconds." for c in shown)
     opened = []
     monkeypatch.setattr(games, "open_folder", opened.append)
     button = next(c for c in shown if isinstance(c, ft.TextButton) and c.content == "Open output folder")

@@ -196,22 +196,33 @@ def test_engine_server_injection_rejects_mixed_distribution(example, tmp_path):
     operation.close()
 
 
-def test_batched_dump_progress_extends_inactivity_deadline():
-    bridge, result = GiftBridge(timeout=0.15), Future()
-    def ask():
-        try:
-            result.set_result(bridge.exchange("dump", b"code", 1024, 8))
-        except Exception as exc:
-            result.set_exception(exc)
-    worker = Thread(target=ask)
-    worker.start()
-    request = bridge.requests.get(timeout=1)
-    for _ in range(5):
-        time.sleep(0.04)
-        assert bridge.progress(request)
-    assert bridge.complete(request, b"done")
-    worker.join(timeout=1)
-    assert result.result() == b"done"
+def test_batched_dump_progress_extends_inactivity_deadline(monkeypatch):
+    from concurrent.futures import TimeoutError as FutureTimeout
+    from pokeldn.frlg.localization import gift_transport
+
+    # Simulate a block arriving during each wait. Real sleeps made this test depend on
+    # a loaded CI worker being scheduled within 150 ms.
+    bridge, clock, waits = GiftBridge(timeout=0.15), [100.0], []
+    request_type = gift_transport.Request
+
+    class ReceivingFuture(Future):
+        def result(self, timeout=None):
+            waits.append(timeout)
+            request = bridge._pending
+            if len(waits) == 6:
+                assert bridge.complete(request, b"done")
+                return super().result(timeout=0)
+            clock[0] += timeout * 0.75
+            assert bridge.progress(request)
+            clock[0] += timeout * 0.25
+            raise FutureTimeout
+
+    monkeypatch.setattr(gift_transport, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(gift_transport, "Request", lambda *args, **kwargs:
+                        request_type(*args, **kwargs, future=ReceivingFuture(), progress_at=clock[0]))
+    assert bridge.exchange("dump", b"code", 1024, 8) == b"done"
+    assert clock[0] - 100.0 > bridge.timeout * 4
+    assert all(0 < wait <= bridge.timeout for wait in waits)
 
 
 def test_short_dump_response_poisoning_wakes_the_waiting_worker(example, tmp_path):

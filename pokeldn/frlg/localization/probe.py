@@ -8,9 +8,11 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 import hashlib
 from pathlib import Path
+from time import monotonic
 
 from . import LocalizationError, ROM_BASE, integer
 from .gift_transport import GiftBridge, GiftTransport, LocalizationGiftOperation, LocalizationGiftServer
+from .renderer import TEXT_ENGINE_SIZE, inspect_prefix
 
 
 @dataclass(frozen=True)
@@ -50,6 +52,8 @@ class LocalizationProbeOperation(LocalizationGiftOperation):
         if (header[0xAC:0xB0] != b"BPRE" or header[0xBC] != 0x0A):
             raise LocalizationError("ROM header conflicts with the BPRE 0x0A game-data handshake")
         digest = hashlib.sha256()
+        started = monotonic()
+        prefix = bytearray() if self.rom_size == TEXT_ENGINE_SIZE else None
         self.progress(0, self.rom_size)
         output = None
         try:
@@ -57,18 +61,25 @@ class LocalizationProbeOperation(LocalizationGiftOperation):
                 output = self.dump_path.open("xb")
             for offset in range(0, self.rom_size, 32 * 1024):
                 block = self.transport.read_memory(ROM_BASE + offset,
-                                                   min(32 * 1024, self.rom_size - offset))
+                                                   min(32 * 1024, self.rom_size - offset),
+                                                   progress=lambda done, total, offset=offset:
+                                                   self.progress(offset + done, self.rom_size))
                 digest.update(block)
+                if prefix is not None:
+                    prefix.extend(block)
                 if output is not None:
                     output.write(block)
-                self.progress(offset + len(block), self.rom_size)
         finally:
             # A partial capture is retained for diagnosis. A report is emitted only after
             # completion; it must never be mistaken for a verified original cartridge.
             if output is not None:
                 output.close()
-        return {"state": "READ_ONLY_CAPTURED", "read_only": True, "game_code": "BPRE",
-                "revision": 10, "rom_size": self.rom_size, "runtime_sha256": digest.hexdigest(),
-                "header_hex": header.hex(), "dump_path": str(self.dump_path) if self.dump_path else None,
-                "original_rom_verified": False, "wrapper_identity_verified": False,
-                "write_eligible": False}
+        result = {"state": "READ_ONLY_CAPTURED", "read_only": True, "game_code": "BPRE",
+                  "revision": 10, "rom_size": self.rom_size, "runtime_sha256": digest.hexdigest(),
+                  "capture_elapsed_seconds": monotonic() - started,
+                  "header_hex": header.hex(), "dump_path": str(self.dump_path) if self.dump_path else None,
+                  "original_rom_verified": False, "wrapper_identity_verified": False,
+                  "write_eligible": False}
+        if prefix is not None:
+            result["text_engine"] = inspect_prefix(prefix)
+        return result

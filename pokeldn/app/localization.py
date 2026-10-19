@@ -1,6 +1,8 @@
 """Completed read-only captures the desktop session can present to the player."""
 from dataclasses import dataclass
+import hashlib
 import json
+import math
 from pathlib import Path
 import re
 
@@ -11,10 +13,15 @@ class Capture:
     runtime: Path
     size: int
     sha256: str
+    elapsed: float | None = None
 
     @property
     def full_rom(self) -> bool:
         return self.size == 0x1000000
+
+    @property
+    def text_engine(self) -> bool:
+        return self.size == 0x10000
 
 
 def read_capture(folder: str) -> Capture:
@@ -31,4 +38,10 @@ def read_capture(folder: str) -> Capture:
     runtime = report.parent / ("runtime.gba" if size == 0x1000000 else "runtime-sample.bin")
     if runtime.stat().st_size != size:
         raise ValueError("The saved runtime capture is incomplete.")
-    return Capture(report, runtime, size, digest)
+    with runtime.open("rb") as handle:
+        if hashlib.file_digest(handle, "sha256").hexdigest() != digest:
+            raise ValueError("The saved runtime capture fingerprint does not match its report.")
+    elapsed = data.get("capture_elapsed_seconds")
+    if elapsed is not None and (type(elapsed) not in (int, float) or not math.isfinite(elapsed) or elapsed < 0):
+        raise ValueError("The capture report has an invalid duration.")
+    return Capture(report, runtime, size, digest, elapsed)

@@ -21,11 +21,13 @@ a `.pokegift` or, by its extension, a `.wc3` (FireRed/LeafGreen) or `.wc8` (Swor
 conversion.
 
 The development localization branch adds **FireRed & LeafGreen → Localization test**. Its default
-**Quick connection test (4 KiB)** checks read-only communication with English FireRed; **Capture runtime
-ROM (16 MiB)** saves the complete runtime capture. Session shows progress, the completed fingerprint,
+**Quick connection test (4 KiB)** checks read-only communication with English FireRed. Next, **Capture
+text engine (64 KiB)** reads the code needed to research decoding, glyph drawing, and string handling.
+**Capture runtime ROM (16 MiB)** saves the complete runtime capture and may take many hours on a slow
+link. Session updates progress per KiB and shows the duration, verified file fingerprint,
 and an output-folder button. Files are saved automatically under Received. Follow the console steps
 in Session and leave the search screen before each new run. This tool does not install Chinese text.
-See [localization testing](frlg_localization.md#在客户端测试).
+See [localization testing](frlg_localization.md).
 
 ## First launch
 
