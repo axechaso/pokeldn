@@ -99,11 +99,7 @@ class MysteryGiftHostApplication(HostApplication):
             overrides["ram_script_block_repeat"] = self.config.ram_script_block_repeat
         if overrides:
             timing = MysteryGiftTiming(**overrides)
-        engine = HostMysteryGiftEngine(
-            distribution=self.distribution, link_player=link_player,
-            trust_pia=self.config.trust_pia, timing=timing,
-            expect_console=getattr(self.config, "expect_console", None),
-            per_build=self.plan.per_build, log=self.log)
+        engine = self._make_engine(link_player, timing)
         self.session = host_session.HostSession(engine=engine, log=self.log)
         inactive, active = self._build_app_data()
         self.tracer = (ldntrace.Tracer(self.ldn.capture_path, log=self.log)
@@ -126,6 +122,13 @@ class MysteryGiftHostApplication(HostApplication):
             tracer=self.tracer, log=self.log)
         self._last_state = self.session.activity.state
         return link_player
+
+    def _make_engine(self, link_player, timing):
+        return HostMysteryGiftEngine(
+            distribution=self.distribution, link_player=link_player,
+            trust_pia=self.config.trust_pia, timing=timing,
+            expect_console=getattr(self.config, "expect_console", None),
+            per_build=self.plan.per_build, log=self.log)
 
     def _build_app_data(self):
         """Which of the console's menus lists this host: only the activity byte differs."""

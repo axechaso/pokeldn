@@ -1,0 +1,60 @@
+"""Use the normal PokeLDN radio/IP host runtime for a gated localization operation."""
+
+from pokeldn.frlg.gift.host_mg_app import MysteryGiftHostApplication
+from pokeldn.frlg.gift.stamp_rally import MysteryGiftDistribution
+from pokeldn.frlg.link.host_app import HostApplication
+from pokeldn.frlg.rom import buffer_script as bs
+from .gift_transport import GiftConnectionClosed
+
+
+class LocalizationHostApplication(MysteryGiftHostApplication):
+    """A library entry point sharing the existing host config, radio, beacon and Pia stack.
+
+    The operation's independently measured observer is required. There is deliberately
+    no CLI flag that fills wrapper identity from profile metadata to allow a device write.
+    """
+
+    ACTIVITY_NOUN = "localization"
+
+    def __init__(self, config, operation, **kwargs):
+        self.operation = operation
+        # The base host needs a payload descriptor for its beacon/build-plan setup. The
+        # custom server supplies every actual client script/payload; this descriptor is never sent.
+        descriptor = MysteryGiftDistribution(card=None, ram_script=None,
+                                             buffer_code=bs.payload(bs.TRAINER_ID_PROBE))
+        super().__init__(config, distribution=descriptor, **kwargs)
+
+    def _make_engine(self, link_player, timing):
+        return self.operation.make_engine(link_player=link_player, timing=timing,
+                                          trust_pia=self.config.trust_pia, log=self.log)
+
+    def _log_identity(self, link_player):
+        self.info(f"FRLG localization {self.operation.operation}: "
+                  f"profile={self.operation.profile.profile_id}, "
+                  f"game={self.operation.profile.identity.game_code}, "
+                  f"revision={self.operation.profile.identity.revision:#x}")
+        self.info("The connected console must match game data, wrapper observation and full ROM fingerprint.")
+
+    def _hosting_instructions(self):
+        return ("Hosting FRLG localization. On the Switch choose "
+                "Mystery Gift -> Wonder Cards -> Friend.")
+
+    def _log_activity_progress(self):
+        state = self.session.activity.state
+        if state != self._last_state:
+            self._last_state = state
+            self.info(f"Localization link: {state}")
+
+    def _activity_succeeded(self):
+        return self.operation.result.done() and self.operation.result.exception() is None
+
+    def run(self):
+        try:
+            joined = HostApplication.run(self)
+        finally:
+            self.operation.close()
+        if not self.operation.result.done():
+            raise GiftConnectionClosed("localization stopped before console identification")
+        self.operation_result = self.operation.result.result()
+        self.info(f"Localization: {self.operation_result['state']}")
+        return joined

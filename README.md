@@ -355,3 +355,6 @@ because Z-A's layout is Scarlet's. See [Legends Z-A](docs/za.md).
 ## License
 
 AGPLv3
+
+The prototype bitmap glyphs in [localization assets](pokeldn/frlg/localization/assets/README.md)
+are separately licensed under SIL OFL 1.1, with their source copyright and license included.

@@ -384,6 +384,9 @@ class HostApplication:
             self.interrupted = True
             self.log("[host] interrupted; shutting down")
         finally:
+            on_stop = getattr(getattr(self.session, "activity", None), "on_host_stop", None)
+            if on_stop is not None:
+                on_stop()
             if self.injector is not None:
                 self.injector.stop()
             if self.network is not None:
