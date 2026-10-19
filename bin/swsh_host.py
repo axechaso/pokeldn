@@ -13,6 +13,7 @@ import binascii
 import traceback
 import json
 import os
+import random
 import struct
 import sys
 import time
@@ -24,14 +25,19 @@ from pokeldn import pokemon as pokemon_service
 from pokeldn.host_support import write_file
 from pokeldn import config, gen8
 from pokeldn.host_support import resolve_keys, needs_root
-from pokeldn.ldn import host4, mesh_protocol as mesh, reliable4
+from pokeldn.ldn import host4, left_after_trade, mesh_protocol as mesh, reliable4
 from pokeldn.ldn.ldn_mitm_host import IpHostTransport
 from pokeldn.ldn.transport import HostTransport, board_radio, find_ap_phy
-from pokeldn.swsh import beacon, host_trade, league_card, pokemon as swsh_pokemon, trade_payload
+from pokeldn.swsh import beacon, host_trade, league_card, pokemon as swsh_pokemon, raid, raid_event, raid_host, trade_payload
 from pokeldn.ldn.pia5 import password_crc
 from pokeldn.swsh.session import COMM_ID, PASSPHRASE, session_keys
+from pokeldn.app import screen
+from pokeldn.online import session as online
 
 SCENE_ID = 60001  # a retail Sword's Link Trade network
+RAID_SCENE_ID = 60006  # a den lobby (docs/swsh_raid.md)
+RAID_PARTICIPANTS = 4
+RAID_UID_COPY = 0x55
 APP_VERSION = 7
 LDN_PROTOCOL = 1
 MAX_PARTICIPANTS = 2
@@ -45,7 +51,7 @@ STATION_PROFILE_OFF = 0x1F
 NETWORK_ID_HIGH = b"\xff\xff"
 
 
-def build_advert(template=None, network_id=None, session_param=None, code="", player_name="PkCamp"):
+def build_advert(template=None, network_id=None, session_param=None, code="", player_name="POKELDN"):
     """-> the 384 advertise bytes: rebuild the Pia header and use a station record at 0x18,
     either fresh or copied from a console (docs/swsh_session.md)."""
     if template is None:
@@ -89,7 +95,23 @@ def load_advert(path):
         return raw
 
 
-def prepare_snapshot(source, args, app_data):
+def offer_record(args, offer_file, renew, slot_record):
+    """-> the encrypted party record we offer: the file's, or the snapshot slot's."""
+    if offer_file:
+        raw = swsh_pokemon.encrypt(gen8.load(Path(offer_file).read_bytes()))
+    else:
+        raw = slot_record
+    if struct.unpack_from("<I", raw)[0] == 0:
+        raise ValueError(f"offer slot {args.offer_slot} is empty; pass --offer-file")
+    if args.fresh_pid or renew:
+        raw = swsh_pokemon.encrypt(gen8.fresh_identity(gen8.decrypt(raw)))
+    if getattr(args, "validate_offer", False):
+        raw = pokemon_service.prepare("swsh", raw)
+        raw = swsh_pokemon.encrypt(gen8.load(raw))
+    return raw
+
+
+def prepare_snapshot(source, args, app_data, offer_file=None, renew=False):
     """Build this host's trade payload from a saved or joining console's 0x84 snapshot."""
     snapshot = trade_payload.inflate_short(source)
     original = snapshot
@@ -108,17 +130,7 @@ def prepare_snapshot(source, args, app_data):
                                      **identity)
     snapshot = original[:swsh_pokemon.PARTY_BLOCK] + snapshot[swsh_pokemon.PARTY_BLOCK:]
     at = (args.offer_slot - 1) * swsh_pokemon.SIZE_PARTY
-    if args.offer_file:
-        raw = swsh_pokemon.encrypt(gen8.load(Path(args.offer_file).read_bytes()))
-    else:
-        raw = original[at:at + swsh_pokemon.SIZE_PARTY]
-    if struct.unpack_from("<I", raw)[0] == 0:
-        raise ValueError(f"offer slot {args.offer_slot} is empty; pass --offer-file")
-    if args.fresh_pid:
-        raw = swsh_pokemon.encrypt(gen8.fresh_identity(gen8.decrypt(raw)))
-    if getattr(args, "validate_offer", False):
-        raw = pokemon_service.prepare("swsh", raw)
-        raw = swsh_pokemon.encrypt(gen8.load(raw))
+    raw = offer_record(args, offer_file, renew, original[at:at + swsh_pokemon.SIZE_PARTY])
     snapshot = snapshot[:at] + raw + snapshot[at + swsh_pokemon.SIZE_PARTY:]
     if args.card_set:
         edits = {}
@@ -152,16 +164,18 @@ def build_parser():
     ap.add_argument("--advert", default=None,
                     help="optional Sword advertisement (hex, raw, or swsh_net_facts.json); "
                          "without one, build a fresh station record")
-    ap.add_argument("--player-name", default="PkCamp")
+    ap.add_argument("--player-name", default="POKELDN")
     ap.add_argument("--snapshot", default=None,
                     help="optional saved Sword 0x84 snapshot; otherwise use the joining console's "
                          "snapshot from this session")
-    ap.add_argument("--trainer-name", default="PkCamp")
+    ap.add_argument("--trainer-name", default="POKELDN")
     ap.add_argument("--trainer-tid", type=lambda s: int(s, 0), default=12345)
     ap.add_argument("--trainer-sid", type=lambda s: int(s, 0), default=54321)
     ap.add_argument("--offer-slot", type=int, default=1, help="the party slot we offer")
-    ap.add_argument("--offer-file", default=None,
-                    help="a PK8 to place in the offered party slot, encrypted or PKHeX export")
+    ap.add_argument("--offer-file", action="append", default=[],
+                    help="a PK8 to place in the offered party slot, encrypted or PKHeX export. "
+                         "Repeatable, one per trade: the player trades again from the box, or "
+                         "searches again; the last serves every later trade")
     ap.add_argument("--fresh-pid", action="store_true",
                     help="draw a new encryption constant and PID for the offered Pokemon")
     ap.add_argument("--card-set", action="append", default=[], metavar="FIELD=VALUE",
@@ -172,7 +186,15 @@ def build_parser():
     ap.add_argument("--migrate", action="store_true",
                     help="end with box command 3 and MIGRATION_START, as the retail Sword that "
                          "led our joiner did; by default the host keeps the session")
-    ap.add_argument("--received", default=None, help="write the joiner's Pokemon here")
+    ap.add_argument("--accept-first", action="store_true",
+                    help="accept without waiting for the joiner's acceptance, as a player would; "
+                         "for our own joiner, which accepts after its partner")
+    ap.add_argument("--lead", type=float, default=None, metavar="SECONDS",
+                    help="test only, for bin/swsh_connect.py: act as a console host's player: "
+                         "after a trade with another --offer-file queued, offer it from the box this "
+                         "many seconds after the ladder, without waiting for the joiner's offer")
+    ap.add_argument("--received", default=None,
+                    help="write the joiner's Pokemon here; trade N > 1 writes FILE-N")
     ap.add_argument("--code", default="",
                     help="the Link Code the player searches with, e.g. 12345678; none by default")
     ap.add_argument("--network-id", default=None,
@@ -180,14 +202,97 @@ def build_parser():
                          "own; default 0xFFFF and two random bytes")
     ap.add_argument("--seconds", type=float, default=300)
     ap.add_argument("--capture", default=None)
+    ap.add_argument("--raid-boss", default=None, metavar="PK8",
+                    help="host a Max Raid den lobby with this boss instead of a Link Trade "
+                         "(docs/swsh_raid.md)")
+    ap.add_argument("--raid-reward", action="append", default=[], metavar="ITEM:COUNT",
+                    help="a reward row, item id and count; up to 15; none gives an emulated den's rows")
+    ap.add_argument("--raid-seed", type=lambda s: int(s, 0), default=None,
+                    help="the BattleSeed value; random by default")
+    ap.add_argument("--raid-ready", type=float, default=3.0, metavar="SECONDS",
+                    help="our player readies this long after the guest's lobby opens")
+    ap.add_argument("--raid-event", default=None, metavar="FOLDER",
+                    help="host a Max Raid with a boss of this Wild Area Event delivery (an EventsGallery "
+                         "'Index NNN' folder) instead of --raid-boss; its rewards unless --raid-reward "
+                         "(docs/swsh_raid.md, Event raids)")
+    ap.add_argument("--raid-stars", type=int, default=None, metavar="N",
+                    help="with --raid-event: the star rank, 1 to 5")
+    ap.add_argument("--raid-event-boss", type=int, default=None, metavar="N",
+                    help="with --raid-event: the boss, numbered as the list printed without it")
+    ap.add_argument("--raid-version", choices=("sword", "shield"), default=None,
+                    help="with --raid-event: whose table the boss comes from; the advertisement's "
+                         "version by default")
+    ap.add_argument("--raid-area", choices=[a for _, a in raid_event.AREAS], default=raid_event.AREAS[0][1],
+                    help="with --raid-event: the den area whose table the boss comes from")
+    ap.add_argument("--raid-event-drops", choices=("roll", "all"), default="roll",
+                    help="with --raid-event: roll each drop's chance as a den does, or give every drop")
+    ap.add_argument("--raid-gigantamax", action="store_true",
+                    help="the --raid-boss boss is Gigantamax; a retail console accepts it where a base "
+                         "den holds that Gigantamax Pokemon (docs/swsh_raid.md)")
+    ap.add_argument("--raid-console-serves", action="store_true",
+                    help="put the console first in BattleStart and framework object 0, so it serves "
+                         "the battle and the board answers as a client (docs/swsh_raid.md)")
+    online.add_arguments(ap)
     return ap
 
 
-def main():
-    args = build_parser().parse_args()
-    if args.offer_file:
-        args.offer_file = pokemon_service.prepare_file("swsh", args.offer_file, fresh=args.fresh_pid)
-        args.fresh_pid = False
+def raid_advert(app_data, boss_pk8, player_name="POKELDN", rank=None):
+    """The den advertisement with the boss's species and encryption constant written in."""
+    out = bytearray(app_data)
+    # A guest's Y-Comm list leaves out a raid that carries its own account (docs/swsh_raid.md).
+    for at, n in ((trade_payload.TAIL_DEVICE_ID, trade_payload.DEVICE_ID_LENGTH),
+                  (trade_payload.TAIL_ACCOUNT_UID, trade_payload.ACCOUNT_UID_LENGTH)):
+        out[STATION_PROFILE_OFF + at:STATION_PROFILE_OFF + at + n] = os.urandom(n)
+    out[RAID_UID_COPY:RAID_UID_COPY + 10] = out[0x2D:0x37]   # the same 10 bytes, in both adverts read
+    name = player_name.encode("utf-16-le")[:trade_payload.TAIL_NAME_LENGTH - 2]
+    at = STATION_PROFILE_OFF + trade_payload.TAIL_NAME_OFFSET
+    out[at:at + trade_payload.TAIL_NAME_LENGTH] = name.ljust(trade_payload.TAIL_NAME_LENGTH, b"\0")
+    return raid.den_advert(bytes(out), boss_pk8, rank)
+
+
+def event_raid(args, app_data):
+    """-> (boss record, rank, reward rows) the --raid-event flags pick, or an error to print."""
+    if args.raid_boss:
+        return "--raid-event and --raid-boss each name the boss; pass one"
+    try:
+        event = raid_event.load(args.raid_event)
+    except (OSError, ValueError) as error:
+        return f"{args.raid_event}: {error}"
+    if args.raid_area not in event.areas():
+        return f"this event has no {args.raid_area} table; it has {', '.join(event.areas())}"
+    version = ({"sword": 1, "shield": 2}[args.raid_version] if args.raid_version
+               else 2 if app_data[raid.ADVERT_VERSION] & 2 else 1)
+    if args.raid_stars is None or not 1 <= args.raid_stars <= raid_event.RANKS:
+        ranks = sorted({r + 1 for b in event.bosses if b.version == version and b.area == args.raid_area
+                        for r in b.ranks})
+        return f"--raid-stars takes the star rank, 1 to 5; this event has {ranks}"
+    rank = args.raid_stars - 1
+    bosses = event.choices(version, rank, args.raid_area)
+    if not bosses:
+        return f"no {args.raid_stars}-star boss in {raid_event.VERSIONS[version]}'s {args.raid_area} table"
+    if args.raid_event_boss is None or not 1 <= args.raid_event_boss <= len(bosses):
+        lines = "\n".join(f"  {n}. {raid_event.describe(b, rank)}" for n, b in enumerate(bosses, 1))
+        return (f"--raid-event-boss picks one of the {args.raid_stars}-star bosses of "
+                f"{raid_event.VERSIONS[version]}'s {args.raid_area} table:\n{lines}")
+    boss = bosses[args.raid_event_boss - 1]
+    missing = raid_event.missing_rewards(event, boss)
+    if missing and not args.raid_reward:
+        print(f"[raid] no {' and '.join(missing)} reward table for this boss in the event or the game")
+    rewards = raid_event.rewards(event, boss, rank,
+                                 None if args.raid_event_drops == "all" else random.SystemRandom())
+    print(f"[raid] event index {event.index}: {raid_event.describe(boss, rank)}, {args.raid_stars} stars")
+    return raid_event.boss_pk8(boss), rank, rewards
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if args.online and args.offer_file:
+        print("[sw] --online offers the partner's Pokemon; --offer-file is ignored")
+        args.offer_file = []
+    args.offer_file = [pokemon_service.prepare_file("swsh", path, fresh=args.fresh_pid)
+                       for path in args.offer_file]
+    # A trade past the queue offers the last file again, under a new PID with --fresh-pid.
+    args.renew_offer, args.fresh_pid = args.fresh_pid, False
     if not args.ip_host and needs_root():
         print("[sw] hosting over the radio needs root, a board (POKELDN_RADIO), or --ip-host")
         return 1
@@ -196,13 +301,83 @@ def main():
         phy = find_ap_phy(log=print) if args.phy == "auto" else args.phy
     network_id = (bytes.fromhex(args.network_id) if args.network_id
                   else os.urandom(2) + NETWORK_ID_HIGH)       # little-endian: the high half last
+    event_only = [flag for flag, value in (("--raid-stars", args.raid_stars), ("--raid-event-boss", args.raid_event_boss),
+                                           ("--raid-version", args.raid_version)) if value is not None]
+    if event_only and not args.raid_event:
+        print(f"[raid] {', '.join(event_only)} pick from an event; pass --raid-event FOLDER")
+        return 1
+    raiding = bool(args.raid_boss or args.raid_event)
+    if raiding:
+        args.advert = args.advert or str(raid.DEN_ADVERT)
+        args.snapshot = args.snapshot or str(raid.DEN_SNAPSHOT)
     app_data = build_advert(load_advert(args.advert) if args.advert else None,
                             network_id=network_id, code=args.code, player_name=args.player_name)
+    boss_pk8 = None
+    if raiding:
+        rank, event_rewards = None, list(raid.DEN_REWARDS)
+        if args.raid_event:
+            picked = event_raid(args, app_data)
+            if isinstance(picked, str):
+                print(f"[raid] {picked}")
+                return 1
+            boss_pk8, rank, event_rewards = picked
+        else:
+            boss_file = pokemon_service.prepare_file("swsh", args.raid_boss)
+            plain = bytearray(gen8.load(Path(boss_file).read_bytes()))
+            if args.raid_gigantamax:
+                plain[raid.PK8_GIGANTAMAX] |= 0x10
+            boss_pk8 = raid.boss_record(swsh_pokemon.encrypt(bytes(plain)))
+        if os.environ.get("POKELDN_RAID_BOSS_EDIT"):
+            # Test only: OFFSET=HEX,... written into the plain boss record, to bisect a refusal.
+            plain = bytearray(gen8.decrypt(boss_pk8))
+            for edit in os.environ["POKELDN_RAID_BOSS_EDIT"].split(","):
+                at, value = edit.split("=")
+                data = bytes.fromhex(value)
+                plain[int(at, 0):int(at, 0) + len(data)] = data
+            boss_pk8 = swsh_pokemon.encrypt(bytes(plain))
+            print(f"[raid] boss edited: {os.environ['POKELDN_RAID_BOSS_EDIT']}")
+        app_data = raid_advert(app_data, boss_pk8, args.player_name, rank)
+        if app_data[raid.ADVERT_DEN:raid.ADVERT_DEN + 8] == bytes(8):
+            print("[raid] no den of this version holds the boss: a retail console lists the raid and "
+                  "leaves at Ready (docs/swsh_raid.md, The boss record)")
+        args.scene_id = RAID_SCENE_ID
+        rewards = [tuple(int(x, 0) for x in r.split(":")) for r in args.raid_reward] or event_rewards
+        if len(rewards) > raid.REWARD_SLOTS:
+            print(f"[raid] a Max Raid gives at most {raid.REWARD_SLOTS} rewards")
+            return 1
+        if any(not 1 <= count <= 999 for _, count in rewards):
+            print("[raid] a reward's count is 1 to 999")
+            return 1
+        if args.raid_reward:
+            bag = {entry["id"] for entry in pokemon_service.SERVICE.names("swsh", "bag")}
+            unknown = sorted({item for item, _ in rewards} - bag)
+            if unknown:
+                print(f"[raid] items {unknown} cannot go in a Sword/Shield bag")
+                return 1
+        # A guest leaves unless every reward fits its den slot's tables at the rank (0x01032570).
+        row, den_rank = raid.den_of(app_data)
+        if row is not None:
+            if args.raid_reward or args.raid_event:
+                rewards, refused = raid.fitting_rewards(row, den_rank, rewards)
+                if refused:
+                    print(f"[raid] left out, not in this den's rewards: {refused}")
+                rewards = rewards or raid.den_rewards(row, den_rank)[:raid.REWARD_SLOTS]
+            else:
+                rewards = raid.den_rewards(row, den_rank)[:raid.REWARD_SLOTS]
+            print(f"[raid] rewards {rewards}")
+        seed = args.raid_seed if args.raid_seed is not None else struct.unpack("<Q", os.urandom(8))[0]
     if not 1 <= args.offer_slot <= swsh_pokemon.PARTY_SLOTS:
         raise ValueError(f"offer slot must be 1..{swsh_pokemon.PARTY_SLOTS}")
-    snapshot = offer = None
-    if args.snapshot:
-        snapshot, offer = prepare_snapshot(Path(args.snapshot).read_bytes(), args, app_data)
+    def offer_file(n):
+        return args.offer_file[min(n, len(args.offer_file) - 1)] if args.offer_file else None
+
+    def build_snapshot(source, n):
+        # Online, the snapshot's slot keeps the console's own Pokemon: the offer goes on 20030.
+        snapshot, offer = prepare_snapshot(source, args, app_data, offer_file(n),
+                                           renew=args.renew_offer and n >= len(args.offer_file))
+        if partner is None:
+            screen.offer("swsh", offer)
+        return snapshot, offer
 
     class Net:
         application_data = app_data
@@ -219,7 +394,8 @@ def main():
     transport = factory(
         app_data=app_data, password=PASSPHRASE, nickname=args.player_name,
         keys_path=resolve_keys(args.keys), local_comm_id=args.comm_id, scene_id=args.scene_id,
-        app_version=args.app_version, max_participants=MAX_PARTICIPANTS, phyname=phy,
+        app_version=args.app_version,
+        max_participants=RAID_PARTICIPANTS if boss_pk8 else MAX_PARTICIPANTS, phyname=phy,
         channel=args.channel, protocol=args.protocol,
         **({"our_ip": args.our_ip} if args.ip_host and args.our_ip else {}),
         **({"mirror_comm_version": True} if args.ip_host else {}),
@@ -230,7 +406,10 @@ def main():
     record({"rec": "host", "comm_id": args.comm_id, "app_data": app_data.hex(),
             "session_key": keys.session_key.hex()})
 
+    partner = online.partner("swsh", args, code=args.code, name=args.trainer_name)
     trades = {}
+    completed = [0]     # trades that reached the end of the ladder, every session
+    seen = {}           # HostTrade -> trades counted from it
 
     def guarded(fn, *a):
         # A reader that raises stops the host mid-trade; the console calls that an interruption.
@@ -267,20 +446,52 @@ def main():
         def send_mesh(payload):
             host.send_data(st.ip, mesh.PROTOCOL, mesh.PORT_RELIABLE, payload)
 
+        n = completed[0]    # trade k of this session is trade n + k of the run
+
         def on_record(**row):
             kind = row.pop("rec", None)
             record({"rec": "trade", "kind": kind, **row})
             if kind == "peer_exchange" and args.received:
-                write_file(args.received, bytes.fromhex(row['pk8']))
-                print(f"[sw] the joiner's Pokemon written to {args.received}")
+                path = pokemon_service.trade_path(args.received, n + trades[st.ip].trades + 1)
+                write_file(path, bytes.fromhex(row['pk8']))
+                print(f"[sw] the joiner's Pokemon written to {path}")
 
+        def next_offer(k):
+            i = n + k - 1
+            print(f"[sw] {st.ip}: trade {i + 1} offers "
+                  f"{offer_file(i) or 'the snapshot slot again'}")
+            return offer_record(args, offer_file(i), args.renew_offer and i >= len(args.offer_file),
+                                trades[st.ip].offer_pk8)
+
+        snapshot = offer = None
+        if args.snapshot:
+            snapshot, offer = build_snapshot(Path(args.snapshot).read_bytes(), n)
+        if boss_pk8 is not None:
+            def send_lobby(protocol, port, payload, compress):
+                host.send_data(st.ip, protocol, port, payload, compress=compress)
+                record({"rec": "app_tx", "dst": st.ip, "protocol": protocol, "port": port,
+                        "payload": payload.hex()})
+
+            def on_battle(lobby):
+                print(f"[raid] {st.ip}: both sides started; the battle on 0x7C follows")
+            trades[st.ip] = raid_host.RaidHost(
+                host.constant, st.constant, snapshot, offer, boss_pk8, send_lobby, send_broadcast,
+                send_mesh, rewards=rewards, seed=seed, name=args.player_name,
+                ready_after=args.raid_ready, record=on_record,
+                snapshot_builder=(lambda peer: build_snapshot(peer, n)) if snapshot is None else None,
+                on_battle=on_battle, console_serves=args.raid_console_serves)
+            print(f"[raid] {st.ip}: lobby opens, seed {seed:#018x}")
+            return
         trades[st.ip] = host_trade.HostTrade(host.constant, st.constant, snapshot, offer, send,
                                              send_broadcast, send_mesh,
                                              end_delay=args.end_delay, record=on_record,
                                              migrate=args.migrate,
-                                             snapshot_builder=(lambda peer: prepare_snapshot(peer, args, app_data))
-                                             if snapshot is None else None)
-        print(f"[sw] {st.ip}: the trade starts")
+                                             snapshot_builder=(lambda peer: build_snapshot(peer, n))
+                                             if snapshot is None else None,
+                                             next_offer=next_offer, accept_first=args.accept_first,
+                                             lead=args.lead, queued=len(args.offer_file) - n,
+                                             partner=partner)
+        print(f"[sw] {st.ip}: trade {n + 1} starts")
 
     try:
         transport.start()
@@ -305,6 +516,9 @@ def main():
                 if ip not in present:
                     host.unseat(ip)
                     trades.pop(ip, None)
+            if left_after_trade(present):
+                print("[sw] the console left after the trade; closing")
+                break
             for payload, src_ip in transport.recv():
                 host.on_packet(payload, src_ip, now)
             host.tick(now)
@@ -313,11 +527,19 @@ def main():
                     start_trade(st)
             for tr in list(trades.values()):
                 guarded(tr.tick, now)
+                if tr.trades > seen.get(tr, 0):
+                    completed[0] += tr.trades - seen.get(tr, 0)
+                    seen[tr] = tr.trades
+                    left = len(args.offer_file) - completed[0]
+                    print(f"[sw] trade {completed[0]} complete"
+                          + (f"; {left} queued" if left > 0 else ""))
             transport.wait_readable(0.02)
     except KeyboardInterrupt:
         print("\n[sw] stopping")
     finally:
         transport.stop()
+        if partner:
+            partner.close()
         if cap:
             cap.close()
     return 0

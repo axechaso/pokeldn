@@ -9,6 +9,7 @@ from pokeldn.ldn import pia6, pia_connect, reliable5
 from pokeldn.ldn import channel_table
 from pokeldn.pla import data_exchange, game_channel, trade_box
 from pokeldn.ldn import show_done
+from pokeldn.app import screen
 
 PROTO_NET = 0x2C
 PROTO_RTT = 0x58
@@ -25,6 +26,7 @@ SESSION_JOIN_RESPONSE = 2
 SESSION_LEAVE = 3
 SESSION_UPDATE = 5
 SESSION_UPDATE_ACK = 6
+SESSION_HOST_MIGRATION = 7
 
 # The flags the retail joiner puts on its messages: 0x11 on the Net answers, 0x01 on the join
 # request. Everything else goes out under 0x01, as the host that traded with a console sends it.
@@ -54,8 +56,10 @@ class JoinerSession:
 
     def __init__(self, keys, our_ip, our_mac, offer, exchange, *, name=" ",
                  player_id=pia6.DEFAULT_PLAYER_ID, our_var=None, phase_waits=PHASE_WAITS,
-                 drive=False, net_answer=True, log=print, clock=time.monotonic):
+                 drive=False, net_answer=True, join_delay=0.0, log=print, clock=time.monotonic,
+                 next_offers=()):
         self.net_answer = net_answer   # False: no Net 0x12 (docs/pla.md, Unresolved)
+        self.join_delay = join_delay   # after the first Net 0x11 (docs/pla.md, Joining)
         self.keys, self.our_ip, self.offer, self.exchange = keys, our_ip, bytes(offer), exchange
         self.our_cid = pia_connect.ldn_constant_id(our_mac)
         self.name, self.player_id, self.phase_waits = name, player_id, tuple(phase_waits)
@@ -63,9 +67,10 @@ class JoinerSession:
             int.from_bytes(os.urandom(2), "big") % 0xFFF0 + 0x10)
         self.log, self.clock, self.drive = log, clock, drive
         self.host_var = self.host_cid = None
-        self.join_sent_at = None
+        self.join_sent_at = self.join_due = None
         self.accepted = self.seated = self.host_left = False
         self.migration_asked = None    # when the host first sent NetStartHostMigration
+        self.handed_at = None          # when the host first named us its successor (type 7)
         self.last_rtt = self.last_clock = self.last_stream_ack = 0.0
         self.clock_seq = 0
         self.stream_high = {}          # 0x81 port -> the host's highest sequence
@@ -84,18 +89,21 @@ class JoinerSession:
         self.received = None           # the record the host offered, the one a trade delivers
         self.phase_index = 0           # the next of PHASES to send
         self.phase_ready_at = None
-        self.host_phase = 0
+        self.host_phase = 0            # the highest phase the host answered with selector 2
         self.phase_closed = False
         self.traded = False
+        self.trades = []               # the record each completed trade delivered, in order
+        self.next_offers = [bytes(o) for o in next_offers]   # one per later trade on this seat
+        self.arriving = False          # the trade's animation is running on the console
         # With `drive` the joiner plays: it offers after the host shows, confirms after it offers,
         # and sends selector 7 after the game's 1.5 s stopwatch; without it the console leads.
-        self.host_showed = self.offered = self.confirmed = False
+        self.host_showed = self.host_offered = self.offered = self.confirmed = False
         self.host_confirmed_at = None
         self.sent_seven = False
 
-    def _packet(self, body, protocol, port=0, flags=FLAGS):
+    def _packet(self, body, protocol, port=0, flags=FLAGS, dst=None):
         msg = pia6.build_message(body, protocol=protocol, port=port, message_flags=flags)
-        dst, footer = self.host_var or 0, ()
+        dst, footer = (self.host_var or 0) if dst is None else dst, ()
         if protocol in MESH_ADDRESSED:
             dst, footer = MESH_DESTINATION, (self.host_var or 0,)
         return pia6.build_packet(self.keys.session_key, self.keys.network_id, self.our_ip, msg,
@@ -127,7 +135,9 @@ class JoinerSession:
                                        self.host_var, self.name, os.urandom(4),
                                        player_id=self.player_id)
         self.join_sent_at = self.clock()
-        return self._packet(body, PROTO_SESSION)
+        # Header destination 0, as a retail joiner sends it: the host's reader 0x744644 drops a
+        # packet addressed to it from a variable id it has not registered (docs/pla.md).
+        return self._packet(body, PROTO_SESSION, dst=0)
 
     def leave(self, sends=4):
         """-> the type-3 leave a console bursts when its player quits, `sends` times."""
@@ -155,6 +165,7 @@ class JoinerSession:
             # host creates the network (docs/pla.md, The Net Protocol). The message is 4 bytes.
             self.migration_asked = self.clock()
             self.log("[pla] the host asked for host migration")
+            self._arrived()
         if len(p) < 8:
             return []
         if p[1] == NET_CONN_REQUEST:
@@ -162,18 +173,22 @@ class JoinerSession:
             if req is None:
                 return []
             host_var, host_cid, seq = req
+            # Destination 0, as a retail joiner sends all 108 of its 0x12: the reader gate drops
+            # one addressed to the host's variable id (docs/pla.md, The Net Protocol).
             out = [self._packet(pia_connect.build_net_response(seq), PROTO_NET,
-                                flags=NET_ANSWER_FLAGS)] if self.net_answer else []
+                                flags=NET_ANSWER_FLAGS, dst=0)] if self.net_answer else []
             if self.host_var is None:
                 self.host_var, self.host_cid = host_var, host_cid
                 self.log(f"[pla] the host is var {host_var:#06x}, constant id {host_cid.hex()}; "
                          f"joining as var {self.our_var:#06x}")
-                out.append(self._join_request())
+                self.join_due = self.clock() + self.join_delay
+                if not self.join_delay:
+                    out.append(self._join_request())
             return out
         if p[1] == NET_PROPERTY:
             seq = int.from_bytes(p[4:8], "big")
             return [self._packet(pia_connect.build_net_property_ack(seq), PROTO_NET,
-                                 flags=NET_ANSWER_FLAGS)]
+                                 flags=NET_ANSWER_FLAGS, dst=0)]
         return []
 
     def _session(self, msg):
@@ -198,10 +213,24 @@ class JoinerSession:
                 out.append(self._reliable(data_exchange.build_stream_open(HOST_BITMAP, seq_id),
                                           PROTO_STREAM, data_exchange.HOST_PORT, seq_id))
             return out
+        elif p[0] == SESSION_HOST_MIGRATION:
+            # The host leaving names its successor and resends until a type 8 from it; answered,
+            # NetStartHostMigration follows at once instead of ~9 s later (docs/pla.md, Joining).
+            mig = pia_connect.parse_session_migration_v11(p)
+            if mig is None or mig["target_var"] != self.our_var:
+                return []
+            if self.handed_at is None:
+                self.handed_at = self.clock()
+                self.log("[pla] <- the host is leaving and hands us the host role (type 7); "
+                         "-> type 8")
+            return [self._packet(pia_connect.build_session_migration_ack_v11(
+                mig["target_constant_id"], mig["target_var"], mig["host_constant_id"],
+                mig["host_var"]), PROTO_SESSION)]
         elif p[0] == SESSION_LEAVE:
             if not self.host_left:
                 self.log("[pla] <- the host left the session (type 3)")
             self.host_left = True
+            self._arrived()
         return []
 
     def _rtt(self, msg):
@@ -348,10 +377,13 @@ class JoinerSession:
             return out + self._advance()
         offered = trade_box.read_payload(payload)
         if offered is not None:
+            # Its first after a trade: back on its box (docs/pla.md).
+            self._arrived()
             self.console_records.append((offered["selector"], offered["counter"],
                                          offered["record"]))
             if offered["selector"] == trade_box.SELECTOR_OFFERING:
                 self.received = offered["record"]
+                self.host_offered = True
             else:
                 self.host_showed = True
             self.log(f"[pla] <- the host is {trade_box.selector_name(offered['selector'])} "
@@ -384,11 +416,19 @@ class JoinerSession:
             return out + self._advance()
         phase = trade_box.read_phase(payload)
         if phase is not None:
-            self.host_phase = max(self.host_phase, phase[1])
+            # A console host announces each phase (selector 1) before ours arrives; only its
+            # selector 2 answers it (docs/pla.md, The phase protocol).
+            if phase[0] == trade_box.PHASE_SELECTOR_HOST:
+                self.host_phase = max(self.host_phase, phase[1])
             self.log(f"[pla] <- the host's phase, selector {phase[0]}, phase {phase[1]}")
             return out + self._advance()
         self.log(f"[pla] <- game channel port {port} key {key.hex()} body {body.hex()}")
         return out
+
+    def _arrived(self):
+        if self.arriving:
+            self.arriving = False
+            screen.arrived()
 
     def _advance(self):
         out = []
@@ -418,11 +458,29 @@ class JoinerSession:
                     self.log(f"[pla] -> our phase {phase}")
         elif self.host_phase >= PHASES[-1]:
             self.phase_closed = self.traded = True
+            self.trades.append(self.received)
             show_done()
+            screen.received("pla", self.received)
+            self.arriving = True
             out.append(self._announce(trade_box.PHASE_KEY, opened=False))
             self.log("[pla] *** the host answered every phase: the trade is carried out; "
                      "the phase key closed ***")
+            self._next_round()
         return out
+
+    def _next_round(self):
+        """Ready the seat for the console's next trade: it repeats the showing, the offer,
+        selectors 5 and 7 and the phases byte for byte (docs/pla.md, The phase protocol)."""
+        if self.next_offers:
+            self.offer = self.next_offers.pop(0)
+            screen.offer("pla", self.offer)
+            self.log(f"[pla] the next trade offers {trade_box.describe(self.offer)}")
+        self.answered = {a for a in self.answered if a[0] not in ("box", "ours", "step")}
+        self.phase_index, self.phase_ready_at, self.host_phase = 0, None, 0
+        self.phase_closed = False
+        self.host_showed = self.host_offered = self.offered = self.confirmed = False
+        self.sent_seven = False
+        self.host_confirmed_at = None
 
     def _drive(self, now):
         out = []
@@ -432,7 +490,7 @@ class JoinerSession:
             self.answered.add(("ours", trade_box.SELECTOR_OFFERING, 0))
             out.append(self._send_box(trade_box.SELECTOR_OFFERING, 0))
             self.log("[pla] -> offering ours (drive)")
-        if self.offered and self.received is not None and not self.confirmed:
+        if self.offered and self.host_offered and not self.confirmed:
             self.confirmed = True
             self.answered.add(("step", b"\x05\x00"))
             out.append(self._send_game(zero, b"\x05\x00"))
@@ -455,7 +513,10 @@ class JoinerSession:
         now = self.clock()
         if self.host_var is None:
             return out
-        if not self.accepted and not self.seated and now - self.join_sent_at >= JOIN_REPEAT:
+        if self.join_sent_at is None:
+            if now >= self.join_due:
+                out.append(self._join_request())
+        elif not self.accepted and not self.seated and now - self.join_sent_at >= JOIN_REPEAT:
             out.append(self._join_request())
         if not self.seated:
             return out

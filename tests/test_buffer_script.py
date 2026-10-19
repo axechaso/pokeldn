@@ -188,16 +188,16 @@ def test_the_identity_log_names_the_payload_and_the_expectation():
 
     lines = []
     payload = configmod.BufferScriptPayload()
+    player = linkplayer.LinkPlayer(name="EMU", version=linkplayer.VERSION_FIRE_RED)
     app = SimpleNamespace(
-        profile=SimpleNamespace(name="EMU", tid=0x1234, sid=0x5678),
+        profile=SimpleNamespace(name="EMU", tid=0x1234, sid=0x5678, to_link_player=lambda: player),
         session=SimpleNamespace(rfu=SimpleNamespace(host_session_id=b"\x01\x02")),
         config=SimpleNamespace(payload=payload),
         distribution=payload.build_distribution(),
         info=lines.append,
     )
 
-    BufferScriptHostApplication._log_identity(
-        app, linkplayer.LinkPlayer(name="EMU", version=linkplayer.VERSION_FIRE_RED))
+    BufferScriptHostApplication._log_identity(app, player)
 
     text = "\n".join(lines)
     assert buffer_script.TRAINER_ID_PROBE in text
@@ -213,11 +213,11 @@ def test_the_success_message_reads_the_status_off_the_running_engine():
 
     app = SimpleNamespace(
         session=SimpleNamespace(activity=SimpleNamespace(
-            server=SimpleNamespace(buffer_status=0xE5BBDF65))))
+            server=SimpleNamespace(buffer_status=0x0AE73039))))
 
     message = BufferScriptHostApplication._success_message(app, mg_server.SVR_MSG_GIFT_SENT_1)
 
-    assert "0xE5BBDF65" in message
+    assert "0x0AE73039" in message
     assert BufferScriptHostApplication._success_message(
         SimpleNamespace(session=None), mg_server.SVR_MSG_GIFT_SENT_1)
 
@@ -265,14 +265,13 @@ def test_the_trainer_id_probe_reports_the_secret_id():
         buffer_code=buffer_script.payload(buffer_script.TRAINER_ID_PROBE),
         buffer_expect=mg_server.BUFFER_EXPECT_TRAINER_ID,
         log=lines.append)
-    server.game_data = mg_script.parse_link_game_data(_game_data_with_trainer_id(0xE5BBDF65))
-    server._received = (0xE5BBDF65).to_bytes(4, "little")
+    server.game_data = mg_script.parse_link_game_data(_game_data_with_trainer_id(0x0AE73039))
+    server._received = (0x0AE73039).to_bytes(4, "little")
 
     server._do_svr_read_buffer_status()
 
     assert server.buffer_matched is True
-    assert "TID (public) 57189" in "\n".join(lines)
-    assert "SID (SECRET) 58811" in "\n".join(lines)
+    assert "Trainer ID 12345, Secret ID 2791" in "\n".join(lines)
 
 
 def _game_data_with_trainer_id(trainer_id):
@@ -384,7 +383,7 @@ def test_the_save_dump_reads_either_block_without_knowing_any_address():
     """The console hands the payload gSaveBlock2Ptr and gSaveBlock1Ptr; no address is needed."""
     sav2 = bytearray(0x1000)
     sav2[buffer_script.SAV2_PLAYER_TRAINER_ID:
-         buffer_script.SAV2_PLAYER_TRAINER_ID + 4] = (0xE5BBDF65).to_bytes(4, "little")
+         buffer_script.SAV2_PLAYER_TRAINER_ID + 4] = (0x0AE73039).to_bytes(4, "little")
     sav1 = bytearray(0x1000)
     sav1[0x290:0x294] = (0x1234ABCD).to_bytes(4, "little")   # SaveBlock1.money [global.h:774]
 
@@ -397,8 +396,50 @@ def test_the_save_dump_reads_either_block_without_knowing_any_address():
 
     assert int.from_bytes(
         from_sav2.pending_send[buffer_script.SAV2_PLAYER_TRAINER_ID:
-                               buffer_script.SAV2_PLAYER_TRAINER_ID + 4], "little") == 0xE5BBDF65
+                               buffer_script.SAV2_PLAYER_TRAINER_ID + 4], "little") == 0x0AE73039
     assert int.from_bytes(from_sav1.pending_send[:4], "little") == 0x1234ABCD
+
+
+@needs_unicorn
+def test_the_party_preset_logs_each_pokemon_s_nature_and_ivs():
+    """The app's party preset against a console holding the PKHeX-made WISHMKR Jirachi. PKHeX reads
+    it as a Lax level 5; its IVs are the BACD_R draws after seed 0x066C, which give its PID."""
+    from pokeldn.frlg.gift import builder
+    from pokeldn.frlg.gift.wonder_card_events import WISHMKR_JIRACHI_PK3
+    from pokeldn.frlg.save.mon import Mon
+    draws, seed = [], 0x066C
+    for _ in range(4):
+        seed = (seed * 0x41C64E6D + 0x6073) & 0xFFFFFFFF
+        draws.append(seed >> 16)
+    assert draws[0] << 16 | draws[1] == int.from_bytes(WISHMKR_JIRACHI_PK3[:4], "little")
+    hp, atk, df = (draws[2] >> s & 31 for s in (0, 5, 10))
+    spe, spa, spd = (draws[3] >> s & 31 for s in (0, 5, 10))
+    sav1 = bytearray(0x1000)
+    sav1[0x34] = 1
+    sav1[0x38:0x38 + 100] = Mon.from_pk3(WISHMKR_JIRACHI_PK3).party_bytes()
+    lines = []
+
+    run = _run_config(list(builder.PRESET["dump-sav1"].args))
+    engine, _frames = _drive(ConsoleClientModel(flag_id=0, sav1=bytes(sav1)),
+                             distribution=run.payload.build_distribution(), log=lines.append)
+
+    assert engine.server.buffer_matched is True
+    assert [line.strip() for line in lines[lines.index("  Party: 1 Pokemon"):][:4]] == [
+        "Party: 1 Pokemon",
+        "Slot 1: Jirachi, level 5, Lax nature",
+        f"IVs: HP {hp}, Attack {atk}, Defense {df}, Sp. Atk {spa}, Sp. Def {spd}, Speed {spe}",
+        "EVs: HP 0, Attack 0, Defense 0, Sp. Atk 0, Sp. Def 0, Speed 0"]
+
+
+@needs_unicorn
+@pytest.mark.parametrize("preset", ["trainer-id", "dump-sav2"])
+def test_the_trainer_presets_log_the_trainer_and_secret_id(preset):
+    from pokeldn.frlg.gift import builder
+    lines = []
+    run = _run_config(list(builder.PRESET[preset].args))
+    _drive(ConsoleClientModel(flag_id=0), distribution=run.payload.build_distribution(), log=lines.append)
+    assert (f"  Trainer ID {CONSOLE_TRAINER_ID & 0xFFFF}, Secret ID {CONSOLE_TRAINER_ID >> 16}"
+            in lines)
 
 
 def test_a_bad_save_dump_operand_is_refused():
@@ -1458,7 +1499,7 @@ def test_the_cli_refuses_a_gather_without_an_array_and_an_array_without_a_gather
 # back from where the console's prologue does.
 
 CREATE_MON_ADDRESS = rom_map.thumb(rom_map.CREATE_MON)
-CONSOLE_OT_ID = 0xE5BBDF65               # measured: TID 57189, SID 58811
+CONSOLE_OT_ID = 0x0AE73039               # measured: TID 12345, SID 2791
 
 
 def _create_mon_args(code, **kwargs):
@@ -1634,7 +1675,7 @@ def test_the_check_names_the_argument_that_disagreed():
 
 
 def test_a_shiny_personality_is_shiny_for_the_trainer_it_was_aimed_at():
-    personality = buffer_script.shiny_personality(57189, 58811)
+    personality = buffer_script.shiny_personality(12345, 2791)
 
     assert buffer_script.is_shiny(CONSOLE_OT_ID, personality)
     assert buffer_script.shiny_value(CONSOLE_OT_ID, personality) == 0

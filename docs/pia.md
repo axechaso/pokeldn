@@ -64,6 +64,26 @@ Sending 0 in both, as the console does, passes every path. The initializer `0x01
 `0x01774b60`, `0x01774d00` check `(byte & 0x7f) == 4` (BDSP: the same with 9). Below the header,
 version 4 shares version 9's session key and IV, and its framing plus one field.
 
+### Version 11: what a receiver drops (Scarlet 4.0.0)
+
+`0x6e9744` accepts or drops a whole packet before any protocol reads it; a dropped packet is lost
+to every protocol at once. With `st` the station at the source address, `V` the receiver's variable
+id, `D` the header destination and `S` the header source:
+
+| check | dropped when |
+|---|---|
+| sender | `st` flagged (`+0x78`) or in state 3 |
+| destination | `D >= 2` and `D != V` |
+| source id | `S != 0` names no station, when `D == V`, or when `D` is 0 or 1 with a footer |
+| packet id, `D == 1` | not newer than the last from `st` on the destination-1 counter (`st+0x60`, `0x6e9854`) |
+| packet id, other `D` | not newer than the last from `st` on the other counter (`st+0x48`, `0x6e98b4`) |
+
+The counter check `0x6f3ff4` passes packet id 0 and stores nothing; otherwise it needs
+`(int16)(id - last) >= 1`, so a resend under the same id is dropped. With no station at the source
+address, during a join, no packet id is checked. No check reads the footer's ids. A retail sender
+(`0x6b6b38`) numbers destination-1 packets from one counter (`0x696d04`) and packets to one
+variable id from a per-recipient counter (`0x696ce4`); both skip 0.
+
 ## Message framing
 
 A Pia payload carries one or more messages, each opening with a presence byte saying which header
@@ -118,8 +138,8 @@ stepped over unread; the packet tail is `0xFF`. `pia4.parse_packet()` resolves t
 ### Compression
 
 A payload may be a zlib stream, flagged per message in the message flags: 0x20 in 5.27-5.45, 0x10
-in version 4. The version-5 reliable header has its own zlib flag, 0x10; BDSP set it on one 23-byte
-game message, sent as a 20-byte stream with a 4 KB window ([BDSP's protocol](bdsp_protocol.md)).
+in version 4. The version-5 reliable header has its own zlib flag, 0x10; BDSP sets it on some game messages (a
+23-byte one went as a 20-byte stream with a 4 KB window) ([BDSP's protocol](bdsp_protocol.md)).
 
 BDSP switches compression on mid-session. Read raw, a compressed 31-byte message parses into a
 header claiming a payload of 0x6260. Over 2835 version-4 messages, `flags & 0x10` predicts
@@ -186,8 +206,8 @@ one AES block.
 
 ## The protocols
 
-Read off `GetProtocolId` (vfunc4 on every `nn::pia` protocol object, a two-word body) in one pass
-over the RTTI vtables.
+From `GetProtocolId` (vfunc4 on every `nn::pia` protocol object, a two-word body), read over the
+RTTI vtables.
 
 | id | class | notes |
 |---|---|---|
@@ -218,6 +238,26 @@ call `MeshStationProtocol`, so the ack is the eight-byte type-5 ack on 0x14, `05
 ack id big-endian. The ack id is the message's last four bytes whatever its
 length (`size - 4` with a borrow check; 0 under four bytes). `pokeldn/ldn/mesh_protocol.ack_for()`.
 A host acks a join request before sending the join response; the receiver acks every copy.
+
+### Leaving a session (Pia 6)
+
+`Session::LeaveAsync` starts `LeaveSessionJob`, whose first step, LeaveSessionJob::LeaveMesh, starts
+`LeaveMeshJob` on a station that is not the host (`LeaveMeshWithHostMigrationJob` on the host).
+`LeaveMeshJob`'s first step, SendLeaveRequest, sends the Session type-3 leave request and waits 500 ms
+for the host's type-4 response, four sends at most. No timer runs inside Pia between the call and the
+first type 3; a delay before it belongs to the game.
+
+| | Legends Arceus 1.1.1 | GBA app (Pia 6.39) |
+|---|---|---|
+| `Session::LeaveAsync` | `0x72a6dc` | `0xb1060` |
+| `LeaveSessionJob` startup, first step LeaveMesh | `0x72c5a4` -> `0x72c640` | `0xb460c` -> `0xb46f0` |
+| non-host branch to the `LeaveMeshJob` startup | `0x734f04` -> `0x734dd0` -> `0x73b820` | |
+| SendLeaveRequest | `0x73b898` | `0xcacf4` |
+
+The steps are named by strings the job stores beside each step pointer (`LeaveSessionJob::LeaveMesh`
+at `0x37a2eb9` in Arceus, `0x174e53` in the GBA app). Its other steps are WaitLeaveMesh,
+WaitLeaveMeshWithHostMigration, WaitHostMigrated, MeshCleanup and DisconnectNetwork, and in 6.39
+also WaitDisconnectNetwork, SendMonitoringData and CompleteProcess.
 
 ## The Local Protocol (0x24)
 
@@ -286,7 +326,7 @@ The result byte maps from internal errors at `0x0154f5e8`:
 | 0x6470 | 3 | too high |
 | 0xc24 | 4 | |
 | 0xc25 | 1 | |
-| 0x11c0f | 7 | parsed, every version matched, the second stage refused it; also "this variable id is already one of my stations" (cleared by re-entering the room or a fresh id) |
+| 0x11c0f | 7 | parsed, every version matched, the second stage refused it; also "this variable id is already one of my stations" (cleared when the station leaves, the player re-entering the room, or by a fresh id) |
 | 0x11c26 | *(none)* | protocol count mismatch: silence |
 
 The ids are never checked: nine `(0xFF, 0)` entries pass the negotiation.
@@ -317,7 +357,7 @@ the station location (one serializer call capped at 0x40 bytes), unchanged from 
 (deserializer `0x0185ee20`, same offsets, address size 2, 6 or 18), which makes [1] and [0x10] its
 nat flags and nat location.
 
-With [3] = 1, 96 requests drew nothing. With [3] = 0 the console answers with its own request: its
+With [3] = 1 the console does not answer (96 requests). With [3] = 0 the console answers with its own request: its
 location, constant id, the variable id the update session gave the joiner, a service variable id, a
 nat quad, then an ack id, a per-message counter `0x017d5750` reads at message size minus four.
 
@@ -334,14 +374,16 @@ The handshake, [3] cleared:
     ->   its own connection response, result 0, ~600 bytes, carrying the joiner's constant id,
          variable id and the player's name in plain ASCII, repeated until acknowledged
 
-The u32 in an ack is the acked message's trailing counter. A retail Sword needs no ack of its
-request; a Shield 1.3.2 under Ryujinx ignores the response without one and re-requests every 10 s
-(`--ack-request` on the bridge driver sends it).
+The u32 in an ack is the acked message's trailing counter. Send the type-5 ack of the console's
+request to stop its retransmission (`--ack-request` on the bridge driver sends it). The response
+handler reads no ack state: the type-5 handler (`0x017c6034`) only clears the id from the pending
+table (`0x017d5770`), and the console's connection job (`0x017afa70`) finishes on either the ack or
+the station reaching state 5. A retail Sword read 12 of 12 responses sent without the ack.
 
 ### What a connection response must satisfy to be read
 
-Both types reach handler `0x017c6e70` (`0x017c60c0` sets a flag for a request, the type-2 dispatch
-entry clears it). A response whose result is not 2 is checked field by field, each failure a silent
+Types 2 and 7 reach handler `0x017c6e70` (entries `0x017c5fb4` and `0x017c60c0`, table
+`0x02081804`; the type-7 entry passes w2 = 1). A response whose result is not 2 is checked field by field, each failure a silent
 drop:
 
 | the handler reads | it requires | a failure gives |
@@ -351,19 +393,44 @@ drop:
 | `[0xD]` a big-endian u32 | the receiver's own variable id | drop, `0x017c6f68` |
 | the sender's station location | resolves to a station it knows | drop, `0x017c6f04` |
 | `[0x37]` one byte, result 0 only | under 5 | drop, `0x017c6ff0` |
+| station state at +0x48 | 4, checked after the ack is sent (`0x017c71a4`) | return; 5 on acceptance (`0x017c7990`) |
+
+The console acks a response at `0x017c7134`, after the `[0x37]` check and before the state check: a
+response it never acks failed the ids, the location or `[0x37]`. A non-zero result, or `[0x37]` of 5
+or more, stores its result (2 for the gate) at byte +0x79 of the object at station +0xa0.
+
+That object is the station's mesh ConnectStationJob. Its step `0x017afa70` reads the byte
+(`0x017afc34`) while its deadline holds and the station is not in state 5: 0 keeps waiting, 1 is
+error `0xc25`, 2 is `0x646f`, `0x6470` or `0x11c26` by the sign of `+0x7c` (`response[2] - 9`), any
+other value `0xc24`. It hands the error to the waiting context (`0x01769720`), frees the pending ack
+id (`0x017d5770`) and moves the station from state 4 to 6 (`0x017afafc`).
+State 4 is written through a pointer to station +0x48 (`str w9, [x8]`) by
+`ProcessConnectionRequestJob::ConnectToRequesterStation` (`0x017c8e90`, store `0x017c8fd8`) for a
+type-1 request and `::WaitInverseConnection` (`0x017c9760`, store `0x017c98a8`) for a type-6
+message, both called from the request handler `0x017c62a0` (`0x017c6aac`, `0x017c6aa4`) after it
+stores the peer's id at +0x79, state 3 and its own id at +0x78. In state 3 with `request[3]` not 1,
+each starts the ConnectStationJob toward the peer (`0x017af520` or `0x017b0120`), writes state 4,
+sets a deadline and installs the step `0x017c9080`, which ends once the context holds an error
+(`0x017c90d4`). With `request[3]` 1 they return 0 and write nothing.
 
 A 17-byte response (`RESPONSE_SIZE`, the short-form allocation `mov w3, #0x11` at `0x017c6c30`)
-leaves `[0x37]` 38 bytes past its end, in stale buffer bytes: an emulated Shield accepted 3 of 22
-byte-identical responses, then 0 of 49 after a restart; a retail Sword accepted all. The console's
-own accepted response is 840 bytes with 1 at `[0x37]`;
+leaves `[0x37]` 38 bytes past its end, in stale buffer bytes, so whether it is read depends on
+memory the sender does not control: an emulated Shield 1.3.2 under ldn_mitm accepted 3 of 52, with
+or without the ack of its request; a retail Sword accepted 12 of 12. An emulated Shield accepted 23
+of 23 responses padded to 56 bytes with 1 at `[0x37]` and 0 of 4 with 5 there. Sent without the ack of
+its request, the padded form was accepted on its first send (`bin/swsh_connect.py --ip-join`). The console's own
+accepted response is 840 bytes with 1 at `[0x37]`;
 `station4.build_connection_response(..., min_size=ACCEPTED_RESPONSE_SIZE)` pads to 0x38 and writes 1.
+Acceptance at this layer does not start the game above it: Sword and Shield wait for the fields past
+0x37 ([Reaching the game layer](swsh_session.md#reaching-the-game-layer)).
 
 After the response: the console's connection response is acceptance; its request retransmitted every
-500 ms with the same trailing counter is rejection (a response carrying the joiner's own ids draws
-20 retransmits, then silence); silence alone is neither, and it re-requests 10 s later.
+500 ms with the same trailing counter is rejection (a response carrying the joiner's own ids drew
+20 retransmits, then silence); silence alone is neither. A request answered with the console's ids and never acked drew no
+retransmission in 44 s.
 
-The nat-flags byte at [1] of the console's request varies run to run with no joiner byte to explain
-it (26 attempts, both readings of every byte the joiner controls). What writes it is unknown; its
+The nat-flags byte at [1] of the console's request varies between connections and follows no byte
+the joiner controls (both readings of each tried over 26 connections). What writes it is unknown; its
 record is filled by the station-location parser `0x0185ee20`.
 
 ## The Mesh Protocol (0x18)
@@ -374,7 +441,7 @@ record is filled by the station-location parser `0x0185ee20`.
 
 The join request is six bytes: type 1, station index 253 ("not in a mesh yet"), an ack id. The
 version-4 handler (`0x017c1700`) checks [1] against 0xFD, takes the ack id with `0x017d5750` and
-acks on 0x14 (`0x017c6dd0`). Pia retransmits it for ten seconds.
+acks on 0x14 (`0x017c6dd0`). Pia retransmits it for about ten seconds.
 
 The join response header is sixteen bytes in both bands. The version-4 parser `0x017b4830` reads the
 refusal shape first (`[1] == 0`, `[2] == 0xFF`, `[3] == 0xFF`, reason at [4]), then the station count
@@ -397,8 +464,8 @@ as an empty mesh there. `parse_join_response(version4=True)` follows both paths.
 
 UPDATE_MESH (0x20), about once a second, is the host's list of who is in the mesh; in BDSP always
 the full 556 bytes with unused seats zeroed, so walk the `entries` byte
-(`mesh_protocol.parse_update_mesh()`). The 5.31-5.45 join order counts joins: after three
-successive connections from one machine it reads 0 for the host and 3 for the client at index 1.
+(`mesh_protocol.parse_update_mesh()`). The 5.31-5.45 join order counts joins since the mesh was created: after three
+successive connections from one machine it read 0 for the host and 3 for the client at index 1.
 
 ### Host migration
 
@@ -427,7 +494,7 @@ Responses go to the new host (`0x017c3250`, called by `0x017ca1a0`). That statio
 
 `pokeldn/ldn/mesh_protocol.py`: `parse_migration_start`, `build_migration_response`,
 `build_migration_finish`, `parse_migration_finish`. None of the four published Sword/Shield
-clients handles migration; between two consoles the second answers it.
+clients handles migration; between two consoles the named station answers it.
 
 ## The RTT protocol (0x58)
 
@@ -444,8 +511,10 @@ and ignores a thirteen-byte answer. Bytes 1..7 are zero in every request observe
 
 A station answers kind 1 with the timestamp echoed. The host puts `(now - echoed) / ticks per ms`
 into a nine-sample ring per station, whose median is the RTT once full; BDSP timestamps run at about
-31.36 MHz. A silent station is never dropped, only unsampled. Once every ring is full, BDSP's request
-period moves from 410 ms to 508 ms and its reliable retransmit interval collapses.
+31.36 MHz. In the BDSP sessions measured the RTT protocol dropped no silent station; it stopped
+sampling it. The update's request period has two branches behind `0x015ace54`, 410 ms and 500 ms:
+unanswered, BDSP requested every 410 ms; once every ring was full, every 508 ms, and the reliable
+retransmit interval followed the small measured RTT (about six rounds a second).
 
 BDSP addresses: id and version `0x015ada10`/`0x015ada18`, size (`mov w0, #0xd`) `0x015adab4`,
 serialise/parse `0x015ada24`/`0x015ad54c`, update `0x015acd90`, answer builder `0x015ad024`, target
@@ -480,8 +549,8 @@ A retail console's ack to sequences 0 and 1:
 
 No flags, stream 0, sequence id 0xFFFF (a control message has no sequence), then the lowest id the
 sender still waits on. `ack id` is one more than the highest sequence received.
-`pokeldn/ldn/reliable5.build_ack_message()` reproduces it byte for byte. Sweeping the sequence id of
-a data message measures the ack format: sequence 0 draws nothing, sequence 1 draws the ack.
+`pokeldn/ldn/reliable5.build_ack_message()` reproduces it byte for byte. A data message with sequence 0 draws
+no ack; sequence 1 draws the ack.
 
 ### What the receiver discards in silence
 
@@ -536,11 +605,9 @@ function `0x6efc2c` deserialises the header to `sp+0x18` before the window check
 
 A sender's own `lowest pending` therefore drives the peer's receive base. Declared above the
 sender's next sequence, it moves the base past messages not yet sent, which then arrive below it and
-are discarded at `0x6f03cc` with an ack. In an emulated Scarlet trade, a host whose acks on 0x7C
-declared one past the station's last sequence had its commit, sequence 7, discarded at a base of 8
-(`0x6f0540` never fired). In BDSP, bulk acks carrying the console's next id as lowest pending left
-the host's trainer record and Pokemon acked and never delivered (console acks `(7, 7)` and `(8, 8)`
-against sequences 5 and 6). An ack carries the sender's own lowest unacknowledged sequence, in the
+are discarded at `0x6f03cc` with an ack: an emulated Scarlet station discarded a host's commit
+(sequence 7) at a base of 8, and a BDSP console acked a host's sequences 5 and 6 as `(7, 7)` and
+`(8, 8)` and never delivered them. An ack carries the sender's own lowest unacknowledged sequence, in the
 header and in the entry's second halfword.
 
 ### Who a window sends to (Pia 6)
@@ -624,9 +691,9 @@ stream id must match the window's (`0x01859c1c`). `reliable4.build_ack_payload` 
 the same entry, correct under either reading.
 
 A Shield leaves the slots it does not use holding stale bytes under stream id 0 (`22284`, `16`,
-`57080`, `2517` in slots 1, 2, 4, 5 while slot 0 held 2). Taking the maximum entry overran the
-console's window (401 messages sent against a window at 97) and it stopped acking. Read the one
-entry for the acked stream.
+`57080`, `2517` in slots 1, 2, 4, 5 while slot 0 held 2). Read only the entry for the acked stream:
+the maximum over all slots is a stale value, and a sender following it overruns the console's
+window (401 messages sent against a window at 97), which then stops acking.
 
 Growing sequence ids over a fixed `lowest_pending` mean a growing backlog; measure `lowest_pending`
 per message and retransmits per sequence id.
@@ -703,9 +770,18 @@ sequence `+0xb8` acknowledged (`0x6e7128`, `0x6f54e4`), and to 0xC with no match
 | 0x21 | an ack carrying a contiguous base and a bitmask of what arrived early |
 | 0x28 | the answer to 0x19 |
 
-A receiver that never answers never sees the last three, and the sender retransmits indefinitely.
+A receiver that never answers never sees the last three, and the sender keeps retransmitting (no
+limit measured).
 `pokeldn/ldn/broadcast4.py`. A console sends its own transfer on port 0 and acks the peer's on port
 1.
+
+## Unresolved
+
+- What a retail Sword reads at `[0x37]` of a 17-byte connection response, 38 bytes past the message
+  in bytes the sender does not write: it passed the gate on 12 of 12, an emulated Shield 1.3.2 under
+  ldn_mitm on 3 of 52.
+- Which error code a live refusal hands to the waiting context (`0x01769720`); no reader of it past a zero test
+  was found.
 
 ## Credits
 

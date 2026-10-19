@@ -1,5 +1,10 @@
 """The Legends Arceus joiner against a scripted console host (`docs/pla.md`, Joining a console's network)."""
 
+import os
+import struct
+
+import pytest
+
 from pokeldn import pla
 from pokeldn.ldn import pia6, pia_connect, reliable5
 from pokeldn.pla import channel_table, data_exchange, game_channel, joiner, pokemon, trade_box
@@ -52,7 +57,7 @@ def _game(body, port, seq, flags=None):
 def _session():
     keys = pla.session_keys(SSID)
     clock = Clock()
-    exchange = data_exchange.build_record(player_id=bytes.fromhex("504b4c44"), name="PkCamp")
+    exchange = data_exchange.build_record(player_id=bytes.fromhex("504b4c44"), name="POKELDN")
     offer = trade_box.build_our_record(**data_exchange.read_record(exchange))
     s = joiner.JoinerSession(keys, OUR_IP, OUR_MAC, offer, exchange, our_var=0x687E,
                              log=lambda *a: None, clock=clock)
@@ -82,7 +87,9 @@ def test_the_joiner_answers_the_net_request_and_joins_as_the_retail_joiner_does(
     assert join[0] == 0x98 and join[2] == 0x01 and len(join[3]) == 115
     parsed = pia_connect.parse_session_join_v11(join[3])
     assert parsed["source_var"] == 0x687E and parsed["destination_var"] == HOST_VAR
-    assert join[4].src_var == 0x687E and join[4].dst_var == HOST_VAR
+    # A retail Arceus joining a host sends its join request to header destination 0; the host's
+    # reader 0x744644 drops one addressed to it from a variable id it has not registered.
+    assert join[4].src_var == 0x687E and join[4].dst_var == 0
     # Seated: the type 6 carries the update's sequence, then the 0x81 stream opens on port 0.
     ack = [m for m in sent if m[0] == 0x98 and m[3][0] == 6][0]
     assert ack[3] == bytes([6]) + pia_connect.ldn_constant_id(OUR_MAC) + bytes(4)
@@ -103,14 +110,90 @@ def test_the_stream_acknowledgement_is_the_retail_joiners():
     record = [m for m in sent if m[0] == 0x81 and m[1] == 1][0]
     rm = reliable5.parse(record[3])
     assert rm["flags"] == 0x1F and rm["sequence_id"] == 1 and rm["bitmap"] == [1]
-    assert data_exchange.read_record(data_exchange.decompress(rm["payload"]))["name"] == "PkCamp"
+    assert data_exchange.read_record(data_exchange.decompress(rm["payload"]))["name"] == "POKELDN"
     announce = _data(sent, 0x7C, 1)[0]
     assert announce["flags"] == 0x0F
     assert announce["payload"] == game_channel.JOINER_OPEN_PAYLOAD
 
 
-def test_a_whole_trade_against_a_scripted_console_host():
+def _console_trade(keys, clock, s, theirs, seq):
+    """One trade as a retail console host plays it, from its offer to its phase key closed.
+    `seq` holds the console's next sequence id per port. -> the phase key tables the joiner sent."""
+    zero = bytes(game_channel.KEY_SIZE)
+
+    def take(port):
+        seq[port] += 1
+        return seq[port] - 1
+
+    # The console's player offers; the joiner offers back under the same selector and counter.
+    offer = trade_box.build_message(theirs, sequence_id=take(0))
+    sent = _open(keys, s.receive([_msg(offer, 0x7C, 0)]))
+    back = trade_box.read_payload(_data(sent, 0x7C, 0)[0]["payload"])
+    assert back["selector"] == trade_box.SELECTOR_OFFERING and back["counter"] == 0
+    assert back["record"] == s.offer and s.received == theirs
+    assert not _data(_open(keys, s.receive([_msg(offer, 0x7C, 0)])), 0x7C, 0)
+
+    # Confirmation and selector 7 are mirrored; after 7 the phase key opens on port 1.
+    for body in (b"\x05\x00", b"\x07\x00"):
+        sent = _open(keys, s.receive([_game(zero + body, 0, take(0), flags=0x07)]))
+        assert _data(sent, 0x7C, 0)[0]["payload"] == zero + body
+    table = channel_table.parse(_data(sent, 0x7C, 1)[0]["payload"])
+    assert table == [(trade_box.PHASE_KEY, True)]
+
+    # The joiner walks its phases, each after the host's answer to the one before and the retail
+    # joiner's wait. The console host announces each phase first and answers ours with selector 2
+    # only while our phase key is open (pj16: a joiner that closed on the announced 0x0e left the
+    # console waiting for its own 02 0e, and the trade did not settle).
+    _open(keys, s.receive([_game(channel_table.build([(trade_box.PHASE_KEY, True)]), 1, take(1),
+                                 flags=0x07)]))
+    tables, ours, answered, closed, done = [], [], [], False, len(s.trades)
+    heard = set(range(s.seq[(joiner.PROTO_GAME, 1)]))     # what port 1 carried before
+
+    def note(sent):
+        nonlocal closed
+        for m in _data(sent, 0x7C, 1):
+            if m["sequence_id"] in heard:
+                continue                      # a resend
+            heard.add(m["sequence_id"])
+            tables.append(channel_table.parse(m["payload"]))
+            closed = closed or (trade_box.PHASE_KEY, False) in tables[-1]
+        return sent
+
+    def host(selector, phase):
+        note(_open(keys, s.receive([_msg(trade_box.build_phase(selector, phase, take(0)),
+                                         0x7C, 0)])))
+
+    host(trade_box.PHASE_SELECTOR_MINE, 3)
+    for _ in range(40):
+        clock.t += 0.5
+        for m in _data(note(_open(keys, s.poll())), 0x7C, 0):
+            phase = trade_box.read_phase(m["payload"])
+            if phase is None or phase in ours:
+                continue
+            ours.append(phase)
+            assert len(s.trades) == done
+            # The console's answer comes 30 to 150 ms later; the joiner polls meanwhile.
+            clock.t += 0.05
+            note(_open(keys, s.poll()))
+            if not closed:
+                answered.append(phase[1])
+                host(trade_box.PHASE_SELECTOR_HOST, phase[1])
+                if phase[1] < 14:
+                    host(trade_box.PHASE_SELECTOR_MINE, joiner.PHASES[len(ours)])
+        if closed:
+            break
+    assert ours == [(1, 3), (1, 6), (1, 11), (1, 14)]
+    assert answered == [3, 6, 11, 14]
+    assert s.trades[done:] == [theirs]
+    _open(keys, s.receive([_game(channel_table.build([(trade_box.PHASE_KEY, False)]), 1, take(1),
+                                 flags=0x07)]))
+    return tables
+
+
+def test_two_trades_on_one_seat_against_a_scripted_console_host():
     keys, clock, s = _session()
+    second = pokemon.encrypt(pokemon.write(pokemon.decrypt(s.offer), level=12))
+    s.next_offers = [second]
     _seat(keys, s)
     s.receive([_msg(data_exchange.build_content_message(data_exchange.REFERENCE_RECORD, 0x02),
                     joiner.PROTO_STREAM, port=0)])
@@ -129,40 +212,22 @@ def test_a_whole_trade_against_a_scripted_console_host():
     again = game_channel.build_open(game_channel.HOST_OPEN_PAYLOAD, sequence_id=2)
     assert not _data(_open(keys, s.receive([_msg(again, 0x7C, 0)])), 0x7C, 0)
 
-    # The console's player offers; the joiner offers back under the same selector and counter.
-    theirs = pokemon.encrypt(pokemon.write(pokemon.decrypt(trade_box.REFERENCE_RECORD), level=33))
-    sent = _open(keys, s.receive([_msg(trade_box.build_message(theirs, sequence_id=3), 0x7C, 0)]))
-    back = trade_box.read_payload(_data(sent, 0x7C, 0)[0]["payload"])
-    assert back["selector"] == trade_box.SELECTOR_OFFERING and back["counter"] == 0
-    assert s.received == theirs
-    sent = _open(keys, s.receive([_msg(trade_box.build_message(theirs, sequence_id=3), 0x7C, 0)]))
-    assert not _data(sent, 0x7C, 0)
+    first = s.offer
+    seq = {0: 3, 1: 2}
+    theirs = [pokemon.encrypt(pokemon.write(pokemon.decrypt(trade_box.REFERENCE_RECORD), level=n))
+              for n in (33, 34)]
+    assert _console_trade(keys, clock, s, theirs[0], seq) == [[(trade_box.PHASE_KEY, False)]]
+    assert s.offer == second != first
 
-    # Confirmation and selector 7 are mirrored; after 7 the phase key opens on port 1.
-    for seq, body in ((4, b"\x05\x00"), (5, b"\x07\x00")):
-        sent = _open(keys, s.receive([_game(zero + body, 0, seq, flags=0x07)]))
-        assert _data(sent, 0x7C, 0)[0]["payload"] == zero + body
-    table = channel_table.parse(_data(sent, 0x7C, 1)[0]["payload"])
-    assert table == [(trade_box.PHASE_KEY, True)]
-
-    # The joiner walks its phases, each after the host's answer to the one before and the retail
-    # joiner's wait.
-    sent = _open(keys, s.receive([_game(channel_table.build([(trade_box.PHASE_KEY, True)]),
-                                        1, 2, flags=0x07)]))
-    phases, host_seq, tables = [], 6, []
-    for _ in range(40):
-        clock.t += 0.5
-        for m in _data(_open(keys, s.poll()), 0x7C, 0):
-            phase = trade_box.read_phase(m["payload"])
-            if phase is not None and phase not in phases:
-                phases.append(phase)
-                answer = trade_box.build_phase(trade_box.PHASE_SELECTOR_HOST, phase[1], host_seq)
-                sent = _open(keys, s.receive([_msg(answer, 0x7C, 0)]))
-                tables += [channel_table.parse(m["payload"]) for m in _data(sent, 0x7C, 1)]
-                host_seq += 1
-    assert phases == [(1, 3), (1, 6), (1, 11), (1, 14)]
-    assert s.traded and s.phase_closed
-    assert tables == [[(trade_box.PHASE_KEY, False)]]
+    # Back on its box the console shows again; the next trade repeats every step byte for byte.
+    showing = trade_box.build_message(theirs[0], sequence_id=seq[0],
+                                      selector=trade_box.SELECTOR_SHOWING)
+    seq[0] += 1
+    back = trade_box.read_payload(_data(_open(keys, s.receive([_msg(showing, 0x7C, 0)])),
+                                        0x7C, 0)[0]["payload"])
+    assert back["selector"] == trade_box.SELECTOR_SHOWING and back["record"] == second
+    assert _console_trade(keys, clock, s, theirs[1], seq) == [[(trade_box.PHASE_KEY, False)]]
+    assert s.trades == theirs
 
 
 def test_unacknowledged_messages_are_sent_again_and_acknowledged_ones_are_not():
@@ -220,6 +285,72 @@ def test_driving_offers_once_and_confirms_after_the_host_offers():
     assert channel_table.parse(_data(sent, 0x7C, 1)[-1]["payload"]) == [(trade_box.PHASE_KEY, True)]
 
 
+MAIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                    "scratchpad", "pla", "main_111.bin")                 # Legends Arceus 1.1.1
+# An emulated console hosting its search, 0.04 s after seating our joiner (variable id 0xcf75):
+# Session type 7, naming us its successor, resent every second.
+CONSOLE_TYPE7 = bytes.fromhex("077f000200000200000000263c007f00000230397f000300000200000000cf750000")
+CONSOLE_CID, CONSOLE_VAR = bytes.fromhex("7f00020000020000"), 0x263C
+SUCCESSOR_CID, SUCCESSOR_VAR = bytes.fromhex("7f00030000020000"), 0xCF75
+
+
+def _type8s(keys, packets):
+    return [p for proto, _, _, p, _, _ in _open(keys, packets)
+            if proto == joiner.PROTO_SESSION and p[:1] == b"\x08"]
+
+
+def test_the_console_handing_us_the_host_role_is_answered_with_a_type_8():
+    """Every copy of the console's type 7 naming us draws a type 8; one naming another does not."""
+    keys, clock, s = _session()
+    s.our_var = SUCCESSOR_VAR
+    _seat(keys, s)
+    first = _type8s(keys, s.receive([_msg(CONSOLE_TYPE7, joiner.PROTO_SESSION)]))
+    assert first == [b"\x08" + SUCCESSOR_CID + b"\0\0" + SUCCESSOR_VAR.to_bytes(2, "big")
+                     + CONSOLE_CID + b"\0\0" + CONSOLE_VAR.to_bytes(2, "big")]
+    assert s.handed_at == clock.t and s.migration_asked is None
+    clock.t += 1.0
+    assert _type8s(keys, s.receive([_msg(CONSOLE_TYPE7, joiner.PROTO_SESSION)])) == first
+    assert s.handed_at == clock.t - 1.0
+    other = CONSOLE_TYPE7[:-4] + b"\x12\x34\0\0"
+    assert _type8s(keys, s.receive([_msg(other, joiner.PROTO_SESSION)])) == []
+
+
+@pytest.mark.skipif(not os.path.exists(MAIN), reason="needs the Legends Arceus 1.1.1 main")
+def test_the_consoles_own_handler_accepts_the_type_8():
+    """The type-8 handler `0x739b08` takes a 25-byte message whose second location id is the
+    console's own, and `0x73f0a8` sets the migration job's `+0xb0` when the first is its target."""
+    from nso_run import Runner, SCRATCH
+    keys, clock, s = _session()
+    s.our_var = SUCCESSOR_VAR
+    _seat(keys, s)
+    answer = _type8s(keys, s.receive([_msg(CONSOLE_TYPE7, joiner.PROTO_SESSION)]))[0]
+    runner = Runner(MAIN)
+    manager, reader, job, buf = (SCRATCH + 0x10000 + n * 0x1000 for n in range(4))
+
+    def accepted(message, target_var=SUCCESSOR_VAR, job_state=2):
+        runner.write(manager, bytes(0x400))
+        runner.write(reader, bytes(0x200))
+        runner.write(job, bytes(0x100))
+        runner.write(0x42a5590, struct.pack("<Q", manager))      # the global behind GOT `0x4277550`
+        runner.write(manager + 0x178 + 8, struct.pack("<Q", int.from_bytes(CONSOLE_CID, "big")))
+        runner.write(manager + 0x178 + 0x10, struct.pack("<H", CONSOLE_VAR))
+        runner.write(reader + 0x40, struct.pack("<Q", 1))         # the packet's station `0x747388`
+        runner.write(reader + 0x50, struct.pack("<Q", 1))         # the session's `0x7473ec`
+        runner.write(reader + 0xb8, struct.pack("<Q", job))
+        runner.write(job + 8, struct.pack("<I", job_state))       # running: `0x6e5f0c`
+        runner.write(job + 0x68 + 8, struct.pack("<Q", int.from_bytes(SUCCESSOR_CID, "big")))
+        runner.write(job + 0x68 + 0x10, struct.pack("<H", target_var))
+        runner.write(buf, message)
+        runner.call(0x739b08, (reader, buf, len(message)))
+        return runner.uc.mem_read(job + 0xb0, 1)[0] == 1
+
+    assert accepted(answer)
+    assert not accepted(answer, job_state=0)
+    assert not accepted(answer, target_var=0x1234)
+    assert not accepted(answer[:-1] + bytes([answer[-1] ^ 1]))   # not the console's own location
+    assert not accepted(answer + b"\0")
+
+
 def test_the_console_s_migration_request_is_noted_and_left_unanswered():
     """The console's migration request is noted once; only the Net request is answered."""
     keys, clock, s = _session()
@@ -235,6 +366,9 @@ def test_the_console_s_migration_request_is_noted_and_left_unanswered():
                                   _msg(bytes.fromhex("01400000"), joiner.PROTO_NET, flags=0x31)]))
     assert s.migration_asked == clock.t
     assert [m[0] for m in sent] == [0x2C]
+    # Every 0x12 to header destination 0, as a retail joiner's 108 of 108: one to the host's
+    # variable id is dropped, and the console resends its 0x11 for 4 s before migrating.
+    assert sent[0][3] == bytes.fromhex("0112000000000003") and sent[0][4].dst_var == 0
     clock.t += 0.5
     s.receive([_msg(bytes.fromhex("01400000"), joiner.PROTO_NET, flags=0x31)])
     assert s.migration_asked == clock.t - 0.5

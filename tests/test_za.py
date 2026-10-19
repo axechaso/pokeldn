@@ -84,13 +84,13 @@ def test_the_record_round_trips_through_an_offer():
     assert info["ot_name"] == "Player"
 
 
-@pytest.mark.parametrize("pid", [0x12345678, 0xE5BBDF65 ^ 0x0000FFFF])
+@pytest.mark.parametrize("pid", [0x12345678, 0x0AE73039 ^ 0x0000FFFF])
 def test_a_fresh_offer_changes_the_identity_and_nothing_else(pid):
     """A fresh offer changes PID and constant only; the species, names and shiny state survive."""
     from pokeldn.sv import pokemon as svp
     from pokeldn.za import pokemon as zp
 
-    plain = bytearray(svp.build(species=716, trainer_id=57189, secret_id=58811, pid=pid,
+    plain = bytearray(svp.build(species=716, trainer_id=12345, secret_id=2791, pid=pid,
                                 encryption_constant=0x9C96AA87))
     plain[zp.OFF_NICKNAME:zp.OFF_NICKNAME + 12] = "PKHOST".encode("utf-16-le")
     offer = zp.build_offer(bytes.fromhex("0101b90300bc815801"), bytes(plain), b"\x01")
@@ -146,3 +146,68 @@ def test_the_session_update_acknowledgement_is_the_reference_shape():
     assert za.build_session_update_ack(constant_id, 0).hex() == "067f00030000020000000000000001"
     assert za.build_session_update_ack(constant_id, 1).hex() == "067f00030000020000000000010001"
     assert za.session_update_sequence(bytes.fromhex("050001010000037f")) == 1
+
+
+def _za_tool(key):
+    from pokeldn.app.catalog import GAMES
+
+    return next(t for g in GAMES for t in g.tools if t.key == key)
+
+
+def _only_the_name_differs(sent, recorded, prefix=0):
+    at = za.reference.name_offset(recorded, prefix)
+    end = at + za.reference.NAME_SIZE
+    assert len(sent) == len(recorded) and sent[:at] == recorded[:at] and sent[end:] == recorded[end:]
+
+
+def test_the_host_identity_carries_the_apps_trainer_name():
+    """The recorded identity's player is Player; the console shows this name as its trade partner."""
+    import za_host
+    from pokeldn.app.command import build
+    from pokeldn.app.introspect import parser_of
+    from pokeldn.app.settings import Settings
+
+    tool = _za_tool("za-host")
+    args = parser_of(tool.script).parse_args(build(tool, {}, {}, Settings(ot="ASH"), stamp="t"))
+    identity, tail, *_ = za_host.load_payloads(args)
+    assert za.reference.player_name(identity) == "ASH"
+    _only_the_name_differs(identity, za.reference.load("identity10"))
+    # a 1403 that does not match the identity stalls a retail console before its 0100
+    assert tail == za.reference.sync_message(identity) != za.reference.load("identity11b")[4:]
+
+
+def test_the_joiner_identity_carries_the_apps_trainer_name():
+    import za_join
+    from pokeldn.app.command import build
+    from pokeldn.app.introspect import parser_of
+    from pokeldn.app.settings import Settings
+
+    tool = _za_tool("za-join")
+    args = parser_of(tool.script).parse_args(build(tool, {}, {}, Settings(ot="ASH"), stamp="t"))
+    sent = []
+    streams = za_join.GameStreams(args, lambda proto, body, **kw: sent.append(body),
+                                  lambda bundle, **kw: sent.extend(m for _, m, _ in bundle),
+                                  lambda **row: None)
+    streams.open(0)
+    for name, prefix in (("identity10", 0), ("identity11", za.streams.PREFIX_SIZE)):
+        recorded = za.reference.load(name)
+        named = za.reference.named(recorded, "ASH", prefix)
+        assert za.reference.player_name(named, prefix) == "ASH"
+        _only_the_name_differs(named, recorded, prefix)
+        assert any(named in body for body in sent), name
+        assert not any(recorded in body for body in sent), name
+    sync = za.reference.sync_message(za.reference.named(za.reference.load("identity11"), "ASH", 4), 4)
+    assert any(sync in body for body in sent)
+    assert not any(za.reference.load("identity11b")[4:] in body for body in sent)
+
+
+def test_the_sync_message_is_the_checksum_a_console_sent_for_its_identity():
+    """`identity11b` is the 1403 a Z-A station sent after the recorded identity (player Player)."""
+    assert za.reference.sync_message(za.reference.load("identity10")) == \
+        za.reference.load("identity11b")[4:] == bytes.fromhex("1403b9018269fb308f")
+
+
+@pytest.mark.parametrize("name", ["", "THIRTEENCHARS"])
+def test_a_name_the_identity_cannot_hold_is_refused(name):
+    with pytest.raises(ValueError):
+        za.reference.named(za.reference.load("identity10"), name)

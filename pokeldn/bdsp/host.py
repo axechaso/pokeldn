@@ -7,7 +7,7 @@ import zlib
 from dataclasses import dataclass, field
 
 from pokeldn.bdsp import room
-from pokeldn.bdsp.session import PIA_PORT, session_keys
+from pokeldn.bdsp.session import PIA_PORT, answer_departure, session_keys
 from pokeldn.ldn import local_protocol as lp
 from pokeldn.ldn import mesh_protocol as mp
 from pokeldn.ldn.pia5 import password_crc
@@ -19,6 +19,8 @@ from pokeldn.ldn.pia5 import (PiaHeader5, build_message, ciphertext, decrypt_pay
                               encrypt_payload, gcm_iv, is_pia5, ldn_nonce_crc, pad_payload,
                               parse_messages)
 from pokeldn.ldn import show_done
+from pokeldn import receiver_gift
+from pokeldn.app import screen
 
 SCENE_UNION_ROOM = 0x1100
 SCENE_UNION_ROOM_PASSWORD = 0x1400    # the room entered "avec un mot de passe"
@@ -166,6 +168,7 @@ class Joiner:
     join_ack: int = None
     next_join_response: float = 0.0
     join_acked: bool = False
+    leaving: bool = False
     # reliable, their direction
     rx_seqs: set = field(default_factory=set)
     rx_base: int = None
@@ -180,7 +183,7 @@ class HostSession:
     """A BDSP room hosted for one console. `receive` and `tick` return [(packet, ip)]; `on_game`
     returns game messages to send back reliably."""
 
-    def __init__(self, keys, adv, our_ip, our_mac, variable_id, name="PkCamp", language=3,
+    def __init__(self, keys, adv, our_ip, our_mac, variable_id, name="POKELDN", language=3,
                  join=None, on_game=None, on_tick=None, record=None, nonce_start=0):
         self.keys, self.adv = keys, adv
         self.our_ip, self.our_mac = our_ip, bytes(our_mac)
@@ -206,7 +209,8 @@ class HostSession:
         self.joiner = None
         self.out = []
         self.counters = {"rx": 0, "rx_bad": 0, "tx": 0, "game_rx": 0, "game_tx": 0,
-                         "rtt_answers": 0, "clock_answers": 0, "state_requests": 0}
+                         "rtt_answers": 0, "clock_answers": 0, "state_requests": 0,
+                         "leave_requests": 0, "disconnection_requests": 0}
         # the mesh clock a host hands out, in ms; any monotonic value
         self.clock_origin_ms = 1_000_000
 
@@ -320,8 +324,18 @@ class HostSession:
                 j.join_acked = True
                 self.record(rec="join_acked", t=now)
                 self._start_game(j, now)
+        elif kind == stp.DISCONNECTION_REQUEST:
+            # One byte back [0x0154ea60]; unanswered, a leaving console repeats it every 0.5 s
+            # until it deauthenticates (docs/bdsp_session.md, Leaving).
+            self.counters["disconnection_requests"] += 1
+            self.record(rec="disconnection_request", t=now)
+            self._send([(bytes([stp.DISCONNECTION_RESPONSE]), stp.PROTOCOL, 0, 0x01,
+                         1 << JOINER_INDEX)], 0, j.ip)
 
     def _mesh(self, j, m, now):
+        if m.port == mp.PORT_RELIABLE:
+            self._mesh_reliable(j, m, now)
+            return
         kind = m.payload[0] if m.payload else None
         if kind == mp.JOIN_REQUEST:
             ack = mp.read_ack_id(m.payload)
@@ -339,6 +353,27 @@ class HostSession:
             self._send(msgs, 0, self.broadcast)
         else:
             self.record(rec="mesh_rx", t=now, kind=kind, payload=m.payload.hex())
+
+    def _mesh_reliable(self, j, m, now):
+        """The mesh's reliable window, port 1, where a console leaving the room sends its leave
+        request (docs/bdsp_session.md, Leaving)."""
+        try:
+            ack, answer = answer_departure(m.payload, HOST_INDEX)
+        except ValueError:
+            ack = answer = None
+        if ack is not None:
+            self._send([(ack, mp.PROTOCOL, mp.PORT_RELIABLE, rl.MESSAGE_FLAGS, 1 << JOINER_INDEX)],
+                       j.variable_id or 0, j.ip)
+        if answer is None or answer[0] != mp.LEAVE_RESPONSE:
+            self.record(rec="mesh_rx", t=now, port=m.port, payload=m.payload.hex())
+            return
+        if not j.leaving:
+            j.leaving = True
+            self.counters["leave_requests"] += 1
+            self.record(rec="leave_request", t=now, payload=m.payload.hex())
+        for _ in range(2):
+            self._send([(answer, mp.PROTOCOL, mp.PORT_UNRELIABLE, 0x01, 1 << JOINER_INDEX)], 0,
+                       j.ip)
 
     def _rtt(self, j, m, now):
         reply = rtt.response_for(m.payload)
@@ -461,7 +496,7 @@ class HostSession:
         if j.join_ack is not None and j.join_response is not None and now >= j.next_join_response:
             self._send([(j.join_response, mp.PROTOCOL, 0, 0x01, 0)], 0, self.broadcast)
             j.next_join_response = now + STATION_RETRY
-        if j.join_acked:
+        if j.join_acked and not j.leaving:
             if now >= self.next_mesh:
                 self._send([(build_update_mesh(self.mesh_entries(), self.mesh_counter),
                              mp.PROTOCOL, 0, 0x01, ALL_STATIONS)], DST_VAR_ALL, j.ip)
@@ -489,12 +524,18 @@ class HostSession:
 
 class TradePartner:
     """The game side of a trading room member, as a retail partner answers (docs/bdsp_trade.md).
-    `complete` gates the answer to the ready-ok, after which the console writes its save."""
+    `complete` gates the answer to the ready-ok, after which the console writes its save. `offer`
+    is one PB8 or a list, one per trade; the last is offered again once the list runs out."""
 
-    def __init__(self, offer, trainer_name="PkCamp", trainer_id=41234, secret_id=23117,
-                 complete=False, approach_delay=2.0, security_repeat=1.0, state=room.STATE_NONE,
-                 recruiting=0, save_theirs=None, record=None):
-        self.offer = offer
+    def __init__(self, offer, trainer_name="POKELDN", trainer_id=41234, secret_id=23117,
+                 complete=False, approach_delay=0.0, security_repeat=1.0, state=room.STATE_NONE,
+                 recruiting=0, save_theirs=None, record=None, remote=None):
+        self.offers = [offer] if isinstance(offer, (bytes, bytearray)) else list(offer)
+        # Online (pokeldn.online): the partner's console's 0x13 answers this console's, and our
+        # ready-ok, after which the console saves, waits for both consoles' (docs/online.md).
+        self.remote = remote
+        self.want_offer = self.want_ready = False
+        self.sent = None                   # the partner record our 0x13 carried this round
         self.trainer = room.build_trade_traner(trainer_name, trainer_id, secret_id)
         self.complete = complete
         self.approach_delay, self.security_repeat = approach_delay, security_repeat
@@ -508,7 +549,17 @@ class TradePartner:
         self.their_security = None
         self.next_security = 0.0
         self.their_pokes = 0
+        self.their_poke = None             # the record the console last offered, what a trade delivers
         self.trades = 0
+        self.arriving = False              # sealed: the console is saving and animating this trade
+        if self.offer:
+            screen.offer("bdsp", self.offer)
+
+    @property
+    def offer(self):
+        if self.remote is not None:
+            return self.sent
+        return self.offers[min(self.trades, len(self.offers) - 1)]
 
     def game(self, joiner, g, payload, now):
         data_id, fields = g["data_id"], g.get("fields") or {}
@@ -537,11 +588,23 @@ class TradePartner:
             return []
         if data_id == room.TRADE_TRANER:
             self.record(rec="their_trainer", t=now, fields=room.parse_trade_traner(body))
+            # The console's save, for a gift made for it (pokeldn.receiver_gift).
+            receiver_gift.hear(self.remote, room.traner_trainer, body)
             return [self.trainer]
         if data_id == room.TRADE_POKE:
+            if self.arriving:                  # the next round's first Pokemon
+                self.our_security, self.their_security, self.arriving = 0, None, False
             self.their_pokes += 1
-            self.save_theirs(self.their_pokes, body)
+            # A reselection within one trade replaces that trade's file.
+            self.save_theirs(self.trades + 1, body)
+            self.their_poke = body
             self.record(rec="their_poke", t=now, n=self.their_pokes)
+            if self.remote is not None:
+                if self.their_security is not None and self.sent is not None:
+                    return [room.build_trade_poke(self.sent)]   # the security phase's copy
+                self.remote.offer(body)
+                self.want_offer, self.want_ready, self.sent = True, False, None
+                return []
             return [room.build_trade_poke(self.offer)]
         if data_id == room.TRADE_POKE_CHECK_OK:
             self.record(rec="their_check_ok", t=now)
@@ -553,31 +616,60 @@ class TradePartner:
                 return []
             self.our_security = room.mirror_trade_state(self.their_security)
             self.next_security = now + self.security_repeat
+            # this answer lands in its WAIT_READYOK; it writes its save next (docs/bdsp_trade.md)
+            if self.their_security >= room.TRADE_STATE_SEND_READYOK and not self.arriving:
+                self.arriving = True
+                self.trades += 1
+                if self.remote is not None:
+                    self.remote.done()
+                self.record(rec="trade_complete", t=now, trades=self.trades)
+                show_done()
+                screen.received("bdsp", self.their_poke)
+                if self.offer:
+                    screen.offer("bdsp", self.offer)
             return [room.build_trade_ready_ok(self.our_security, is_trade_ok=1)]
         if data_id == room.TRADE_READY_OK:
             self.record(rec="their_ready_ok", t=now, fields=fields, answered=self.complete)
+            if self.remote is not None and self.complete:
+                self.want_ready = True
+                self.remote.accept()
+                return []
             return [room.build_trade_ready_ok()] if self.complete else []
         if data_id == room.RETURN_SELECT:
-            if self.our_security or self.their_security is not None:
-                self.trades += 1
-                self.record(rec="trade_complete", t=now, trades=self.trades)
-                show_done()
-            self.our_security, self.their_security = 0, None
+            # a reset of the round: the console's back-out, or its answer to a stray 0x21
+            self.record(rec="their_return_select", t=now, fields=fields)
+            self.our_security, self.their_security, self.arriving = 0, None, False
+            if self.remote is not None and fields.get("isReturnSelect"):
+                self.want_offer = self.want_ready = False
+                self.remote.withdraw()
             return []
         return []
 
     def tick(self, joiner, now):
         out = []
+        if self.remote is not None and self.their_security is None and not self.arriving:
+            theirs = self.remote.theirs()
+            if self.sent is not None and theirs.offer != self.sent and not self.want_offer:
+                # 0x45 {1}: "the other player chose to cancel"; the console picks again
+                # (docs/bdsp_trade.md, Leaving the box).
+                self.sent, self.want_ready = None, False
+                out.append(room.build_fields(room.RETURN_SELECT, 1))
+            if self.want_offer and theirs.offer is not None:
+                self.want_offer, self.sent = False, theirs.offer
+                out.append(room.build_trade_poke(self.sent))
+                screen.offer("bdsp", self.sent)
+            if self.want_ready and theirs.accepted and self.sent is not None and theirs.offer == self.sent:
+                self.want_ready = False
+                out.append(room.build_trade_ready_ok())
         if (self.approach_at is not None and not self.approached and now >= self.approach_at
                 and joiner.join_acked):
             self.approached = True
             self.approach_at = None
             self.record(rec="approach", t=now)
             out.append(room.build_talk_reserve())
-        # a state is re-said once a second: WAIT_READYOK and a CHILD's SEND_READYOK only end on a
-        # message arriving inside them, and the repeat stops at the return to the select window
-        if (self.our_security and self.their_security is not None and now >= self.next_security
-                and not joiner.tx_pending):
+        # a CHILD's SEND_READYOK ends only on a message arriving inside it (docs/bdsp_trade.md)
+        if (self.our_security and room.repeats_trade_state(self.their_security)
+                and now >= self.next_security and not joiner.tx_pending):
             self.next_security = now + self.security_repeat
             out.append(room.build_trade_ready_ok(self.our_security, is_trade_ok=1))
         return out

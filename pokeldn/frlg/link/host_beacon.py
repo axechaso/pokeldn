@@ -47,6 +47,13 @@ def _apply_profile_to_search_word(record, profile):
     word |= ((player.language << beacon.SEARCH_LANGUAGE_SHIFT)
              & beacon.SEARCH_LANGUAGE_MASK)
     record[offset:offset + 2] = word.to_bytes(2, "little")
+    flags = int.from_bytes(record[offset:offset + 4], "little")
+    flags &= ~(beacon.SEARCH_NATIONAL_LINK | beacon.SEARCH_NATIONAL_DEX | beacon.SEARCH_GAME_CLEAR)
+    national = profile.national_flags
+    flags |= beacon.SEARCH_NATIONAL_LINK if national["national_link"] else 0
+    flags |= beacon.SEARCH_NATIONAL_DEX if national["national_dex"] else 0
+    flags |= beacon.SEARCH_GAME_CLEAR if national["game_clear"] else 0
+    record[offset:offset + 4] = flags.to_bytes(4, "little")
 
 
 def _element(element_id, data):
@@ -73,7 +80,7 @@ def build_wifi_beacon(bssid, channel, sequence, ssid_length=32, dtim_period=3):
 
 def build_trade_app_data(profile, host_session_id):
     app_data = bytearray(beacon.mutate_beacon(
-        CAPTURED_TRADE_BEACON, name=profile.discovery_name,
+        CAPTURED_TRADE_BEACON, name=profile.discovery_name, language=profile.to_link_player().language,
         trainer_id=profile.discovery_trainer_id))
     pia_name = profile.session_name.encode("utf-8")[:64]
     app_data[0x17:0x1B] = len(pia_name).to_bytes(4, "big")
@@ -95,7 +102,7 @@ def _build_activity_app_data(profile, host_session_id, activity, trade_board=Non
     candidate only if IsPartnerActivityAcceptable finds the activity in its link group's accept
     list [src/data/union_room.h:398-453; union_room.c:1590] (docs/frlg_link.md)."""
     app_data = bytearray(beacon.mutate_beacon(
-        CAPTURED_TRADE_BEACON, name=profile.discovery_name,
+        CAPTURED_TRADE_BEACON, name=profile.discovery_name, language=profile.to_link_player().language,
         trainer_id=profile.discovery_trainer_id))
     pia_name = profile.session_name.encode("utf-8")[:64]
     app_data[0x17:0x1B] = len(pia_name).to_bytes(4, "big")
@@ -141,17 +148,19 @@ def build_colosseum_app_data(profile, host_session_id):
                                     beacon.ACTIVITY_BATTLE_SINGLE)
 
 
-def build_wonder_card_app_data(profile, host_session_id):
+def build_wonder_card_app_data(profile, host_session_id, *, japanese=False):
     """Mystery Gift -> Wonder Cards -> Friend (sAcceptedActivityIds_WonderCard)."""
-    return _build_activity_app_data(profile, host_session_id,
-                                    beacon.ACTIVITY_WONDER_CARD)
+    return _build_activity_app_data(
+        profile, host_session_id,
+        beacon.ACTIVITY_WONDER_CARD_JAPANESE if japanese else beacon.ACTIVITY_WONDER_CARD)
 
 
-def build_wonder_news_app_data(profile, host_session_id):
+def build_wonder_news_app_data(profile, host_session_id, *, japanese=False):
     """Mystery Gift -> Wonder News -> Friend, which accepts ACTIVITY_WONDER_NEWS alone
     [sAcceptedActivityIds_WonderNews, src/data/union_room.h:406] (docs/frlg_gift.md)."""
-    return _build_activity_app_data(profile, host_session_id,
-                                    beacon.ACTIVITY_WONDER_NEWS)
+    return _build_activity_app_data(
+        profile, host_session_id,
+        beacon.ACTIVITY_WONDER_NEWS_JAPANESE if japanese else beacon.ACTIVITY_WONDER_NEWS)
 
 
 def activate_trade_app_data(app_data, host_session_id):

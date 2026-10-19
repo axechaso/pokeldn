@@ -1,4 +1,4 @@
-/* The host link: COBS frames on UART0 (ESP32) or USB Serial/JTAG (S3, C3), closed by 0x00.
+/* The host link: COBS frames on UART0 (ESP32) or USB Serial/JTAG (S3, C3, C6), closed by 0x00.
    The message set is in docs/hardware_esp32.md and pokeldn/ldn/esp32.py. */
 #pragma once
 
@@ -23,6 +23,11 @@ void wire_set_baud(uint32_t baud);
    handler, so the count starts after the HELLO frame on both sides. */
 void wire_credit_reset(void);
 uint32_t wire_dropped(void);
+/* True once the host watchdog judges the host gone: every message is discarded, uncounted, until the
+   host sends a command again. */
+void wire_set_host_away(bool away);
+/* Host bytes the reader has taken since boot (the CREDIT count before any reset of it). */
+uint32_t wire_consumed(void);
 /* Host commands lost: frames that failed COBS or their CRC; the 128-byte hardware FIFO
    overflowing before the driver drained it; the driver's 16 KB ring full. */
 uint32_t wire_rx_bad(void);

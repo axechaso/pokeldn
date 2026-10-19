@@ -101,8 +101,8 @@ A payload is `struct.pack("<HBB", id, discriminator, 0)` then the body, built at
 by `0x006db840` (`strh w3`, the discriminator from `manager+0x480f0`, `strb wzr`) and parsed by
 `0x006db620`. The discriminator is a generation counter, `[content+0x370] = (+1) mod 255`
 (`0x008b6670`), pushed into `[manager+0x480f0]`; a forced CancelAccepted steps it on content 40
-(`0x006db470`, `0x010dcea4..0x010dcec8`); registrars zero it (`0x010d53a0`). All 107 payloads of one
-run carried zero.
+(`0x006db470`, `0x010dcea4..0x010dcec8`); registrars zero it (`0x010d53a0`). The 107 payloads of
+one trade with no forced CancelAccepted all carried zero.
 
 ### Reading the registrations live
 
@@ -113,7 +113,7 @@ run carried zero.
     id      = holder's vtable slot 7, called at 0x006db740 (`ldr x8, [x8, #0x38]`)
 
 Slot 7 returns `[holder+0x160]` here; elsewhere decode its `ldrh`. Empty on an idle screen; a seated
-link trade adds two entries within two seconds and keeps them; Mystery Gift adds none.
+link trade adds two entries (seen within two seconds of the seat); Mystery Gift adds none.
 
 ### Dispatch gates, ports and senders
 
@@ -199,7 +199,8 @@ non-zero hash a hosting Sword sent matches, e.g. content 50:
     elementId 20000, host      clock 2278   then 2338 after its pair moved
     crc32 chain                8ffa0f2e     then b3615e90
 
-A clock can change before its message is sent. A joiner echoing the host's hash traded.
+A clock can change before its message is sent. A joiner that echoes the host's hash completes a
+trade against a hosting Sword.
 
 ## The party payload on protocol 0x84
 
@@ -248,6 +249,21 @@ the result is 9 when both hold, else 10 (`cinc` `0x00b2e778`). `0x010719f0`, `0x
 `0x01071c00` compare it and a CRC over 0x640 bytes at `+0x188` (`0x008ffa10`). The descriptor is
 copied whole at 18 sites, four in `StateDownloadTeamMenu` (`0x013e660c` to `0x013e7c58`).
 
+match+0x70 is an optional (flag `+0x70`, value from `+0x78`: a u64 key, a pointer, a u64, a pointer,
+then the descriptor at `+0x98`). Its only writer is `0x00ad9cf0` (memcpy in `0x00adeaf0`): the Battle
+Stadium matching update `0x00ad5750` fills it at `0x00ad6a2c` from `[state+0xb8]+0x20`, and
+`0x00ad6a68` and `0x00b1ea88` clear it. That request object is filled by the team download job
+(`0x014f7fd0`..`0x014f809c`, done flag `+0x18`) from its result holder at `[job+0x88]`: descriptor
+`+0x00..+0x2f` six u64 from `+0x38`, `+0x30..+0x35` six bytes from `+0x68`, `+0x36..+0x135` from
+`+0x6e`, then overwritten by the `v1/validate` signature (`0x014f8094`). The holder takes whole the
+0x158-byte entry of the team list whose key matches the list's selected key (`0x01503f10`, copied
+at `0x014fa804`). The list `0x0150320c` holds two kinds of entry:
+
+| key | entry |
+|---|---|
+| (1, team) | a save battle team: six u64 `box \| slot << 32`, one per member, from `save+0x525 + team*12 + i*2` (`0x0140a5c0`, `0x0140a5f0`); name at `save+0x4a0 + team*0x16` |
+| (2, i) | a stored record: bytes 0x26..0x15b of a 0x87f-byte record `0x01430670` loads |
+
 The signature is RSA-2048, PKCS#1 v1.5, SHA-256, checked by `0x011aedf0(team, v, sig)` (callers
 `0x00b2f19c`, `0x00b2f1e0`, `0x00b2f2e0`, `0x0109eb68`), the only caller of
 `nn::crypto::detail::BigNum::ModExp` (PLT `0x018fff50`, GOT `0x0260fb38`):
@@ -264,7 +280,7 @@ The signature is RSA-2048, PKCS#1 v1.5, SHA-256, checked by `0x011aedf0(team, v,
 
 The console holds only the public key; the image carries
 `https://v3-lp1.vp.n.srv.nintendo.net/v1/public_key` (`0x01bd7d41`) and `.../v1/validate`
-(`0x01c11a93`), so a Nintendo server signs (deduced). Link Trade never reaches the check.
+(`0x01c11a93`), so a Nintendo server presumably signs. Link Trade never reaches the check.
 
 `v1/validate` (`0x011a2a70`) sends a NUL-terminated string (all of `v1/public_key`'s body), the key
 version as BE u16 (key holder `+0x68`, set from the `v1/public_key` reply by `0x0144fb90`), the
@@ -348,7 +364,11 @@ The sample state is `+0x1c8` of `[[0x261bd18]]`, set only by `0x00ebf570`, zeroe
 also read by the native `IsPlayerRideBicycleType` (`0x0148b960` -> `0x00da0210`); the Lua enum at
 `0x00e57940` names motions `NORMAL`, `BICYCLE_GROUND`, `BICYCLE_WATER` (`1 | 2<<32` at
 `0x00e5793c`). The `0x25614c0` slot also starts an activity record of kind 11 (`0x0111b660`), hands
-it to `[0x26108d8]` (`0x00fa13c0`) and pushes a sample.
+it to `[0x26108d8]` (`0x00fa13c0`) and pushes a sample. The `0x25614c0` object is the Pokemon Camp
+visit: the natives `PokeCampToVisit` (request `0x0100`, state 3) and `NpcPokeCampToVisit` (`0x0000`,
+state 4) build it, as do the network-side requests `0x0101` (state 3) and `0x0001` (state 4), and the
+image carries the multiplayer camp's `contents.pokecamp.pb.KwSyncData`. State 6 is Max Raid Battle
+matching.
 
 `a` and `b` pack into bits 0-1 and 2-3 (`0x01123710`; `0x01123760` reads `b` 3 as 0). The reset
 `0x00eb97b0` in mode 0 sets `a` from the area key `[[[0x2617c48]]+0x180]` (`0x00eb97d0..0x00eb9848`):

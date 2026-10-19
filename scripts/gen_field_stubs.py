@@ -51,7 +51,8 @@ def render():
     ]
     for source in sorted(ASM_DIR.glob("*.s")):
         code, symbols = assemble(source)
-        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        # Git may check out CRLF on Windows; source identities use the committed LF form.
+        digest = hashlib.sha256(source.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
         lines.append(f"    {source.stem!r}: (")
         lines.append(f"        bytes.fromhex({code.hex()!r}),")
         lines.append(f"        {digest!r},")

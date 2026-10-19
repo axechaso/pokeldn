@@ -21,8 +21,11 @@ from pokeldn.host_support import open_output
 from pokeldn import pokemon as pokemon_service
 from pokeldn import config
 from pokeldn import gen8, pla
-from pokeldn.ldn import pia6, pia_connect, reliable5, rtt_protocol, show_done
+from pokeldn.ldn import left_after_trade, pia6, pia_connect, reliable5, rtt_protocol, show_done
 from pokeldn.ldn import channel_table
+from pokeldn import receiver_gift
+from pokeldn.app import screen
+from pokeldn.online import session as online
 from pokeldn.pla import data_exchange, game_channel, trade_box
 from pokeldn.pla import pokemon as pla_pokemon
 from pokeldn.ldn.ldn_mitm_host import IpHostTransport
@@ -63,6 +66,7 @@ RTT_RESPONSE = 1
 
 SESSION_MESSAGE_NAMES = {
     0: "join request", 1: "join request ack", 2: "join response", 3: "leave request",
+    4: "leave response",
     5: "update session", 6: "update session ack", 7: "left station sync",
     8: "left station sync ack", 9: "start host migration", 10: "start host migration ack",
 }
@@ -138,8 +142,12 @@ def build_bundle(keys, our_ip, messages, dst_var, nonce8, *, protocol, flags=EST
 def build_parser():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--print-packets", action="store_true",
+                    help="print every packet in and out; the --capture file keeps them either way")
     ap.add_argument("--code", default="00000000", help="the eight digits the player types")
     ap.add_argument("--seconds", type=float, default=240.0, help="how long to hold the network up")
+    online.add_arguments(ap)
+    receiver_gift.add_arguments(ap, "--trade-box-record")
     ap.add_argument("--phy", default="auto")
     ap.add_argument("--channel", type=int, default=None)
     ap.add_argument("--keys", default="~/.switch/prod.keys")
@@ -151,7 +159,7 @@ def build_parser():
                     help="host over ldn_mitm on the LAN for an emulator; no radio and no root")
     ap.add_argument("--net-protocol", type=lambda v: int(v, 0), default=PROTO_NET,
                     help="the Net protocol id to send the connection request under")
-    ap.add_argument("--player-name", default="PkCamp",
+    ap.add_argument("--player-name", default="POKELDN",
                     help="the LDN node name; a retail console publishes its profile name here")
     ap.add_argument("--rtt-probe", action="store_true",
                     help="also send an RTT request, which a peer answers with no state at all")
@@ -182,7 +190,7 @@ def build_parser():
     ap.add_argument("--hello-protocol", type=lambda v: int(v, 0), default=PROTO_BROADCAST_RELIABLE,
                     help="the protocol the host sends its reliable game data on; the game's own reader "
                          "polls 0x80 (BroadcastReliable), so 0x80 puts data where the game drains it")
-    ap.add_argument("--host-player-name", default="PkCamp",
+    ap.add_argument("--host-player-name", default="POKELDN",
                     help="the host's player name in the station-list update, which the game reads as "
                          "identity; a real name in place of the placeholder single space")
     ap.add_argument("--host-player-id", default="00000000000000020000000000000000",
@@ -199,9 +207,12 @@ def build_parser():
                     help="send the host's own record on the 0x81 data exchange once the console "
                          "opens its stream; the exchange the trade scene is the success branch of")
     ap.add_argument("--data-exchange-name", default=None,
-                    help="the player name in that record; the game shows it as the trade partner")
+                    help="the player name in that record; the game shows it as the trade partner "
+                         "(default --player-name)")
     ap.add_argument("--data-exchange-id", default=None,
                     help="hex: the four-byte player id in that record")
+    ap.add_argument("--gender", type=int, choices=(0, 1), default=0,
+                    help="0 male, 1 female: the gender in that record, whose look follows it")
     ap.add_argument("--game-channel", action="store_true",
                     help="open the game's own reliable channel (0x7c) once the data exchange is "
                          "done: answer the console's channel message, send the same back, and open "
@@ -228,12 +239,16 @@ def build_parser():
     ap.add_argument("--trade-box-collect", default=None,
                     help="write every record the console shows or offers to this directory, one "
                          "file per distinct record, named by species and nickname")
+    ap.add_argument("--offer-out", default=None,
+                    help="write the record the console traded to this file, -N before the extension "
+                         "for trade N above 1")
     ap.add_argument("--fresh-pid", action="store_true",
                     help="offer the record under a new PID and encryption constant, drawn once per "
                          "run, shiny state kept, so a save that took it before takes it again")
-    ap.add_argument("--trade-box-record", default=None,
+    ap.add_argument("--trade-box-record", action="append", default=[],
                     help="offer this record file instead of the reference one; stored or party, "
-                         "encrypted or decrypted")
+                         "encrypted or decrypted. Repeatable, one per trade in order; the last is "
+                         "offered again after the list")
     ap.add_argument("--interrupt-before-phase-6", action="store_true",
                     help="after answering phase 3, wait for the console's phase 6, then leave "
                          "without answering it; this deliberately triggers the game's trade "
@@ -246,7 +261,8 @@ def build_parser():
     ap.add_argument("--stay-after-leave", action="store_true",
                     help="keep the network up and go silent after the leave instead of ending the "
                          "run; separates what a console reads in the leave from what it reads in "
-                         "the network going down")
+                         "the network going down. Also keeps the run (and BOOT marks) after a "
+                         "console leaves following a trade")
     ap.add_argument("--data-exchange-skip-source-check", action="store_true",
                     help="put the skip-source-check flag on the record, where a reference host "
                          "sends none; one variable if a run shows the record is not dispatched")
@@ -264,13 +280,15 @@ def build_parser():
 def main():
     ap = build_parser()
     args = ap.parse_args()
+    offer_check = {}            # a gift made for the receiving player takes it too (pokeldn.receiver_gift)
     if args.trade_box_record:
         edits = {k: v for k, v in (("level", args.trade_box_level),
                  ("experience", args.trade_box_experience), ("nickname", args.trade_box_nickname),
                  ("pid", int(args.trade_box_pid, 16) if args.trade_box_pid else None)) if v is not None}
-        args.trade_box_record = pokemon_service.prepare_file("pla", args.trade_box_record,
-            fresh=args.fresh_pid, transform=lambda raw: pla_pokemon.encrypt(
-                pla_pokemon.write(pla_pokemon.load(raw), **edits)))
+        offer_check = dict(fresh=args.fresh_pid, transform=lambda raw: pla_pokemon.encrypt(
+            pla_pokemon.write(pla_pokemon.load(raw), **edits)))
+        args.trade_box_record = [pokemon_service.prepare_file("pla", path, **offer_check)
+                                 for path in args.trade_box_record]
         args.trade_box_level = args.trade_box_experience = args.trade_box_nickname = args.trade_box_pid = None
         args.fresh_pid = False
 
@@ -318,22 +336,27 @@ def main():
     else:
         exchange_record = data_exchange.build_record(
             player_id=(bytes.fromhex(args.data_exchange_id) if args.data_exchange_id else None),
-            name=args.data_exchange_name)
+            name=args.data_exchange_name or args.player_name, gender=args.gender)
     exchange_sent = set()
     box_edits = {k: v for k, v in dict(
         level=args.trade_box_level, experience=args.trade_box_experience,
         nickname=args.trade_box_nickname,
         pid=(int(args.trade_box_pid, 16) if args.trade_box_pid else None)).items()
         if v is not None}
-    box_file = os.path.expanduser(args.trade_box_record) if args.trade_box_record else None
+    box_files = [os.path.expanduser(path) for path in args.trade_box_record] or [None]
 
     fresh_draw = os.urandom(6) if args.fresh_pid else None
 
-    def build_offer():
+    def build_offer(box_file):
         """-> the encrypted offer; a rebuild keeps the run's one --fresh-pid draw."""
         template = (pla_pokemon.encrypt(pla_pokemon.load(Path(box_file).read_bytes()))
                     if box_file else trade_box.REFERENCE_RECORD)
-        if args.trade_box_ours:
+        return box_offer(template, ours=not box_file)
+
+    def box_offer(template, ours=False):
+        """-> `template`, an encrypted record, as the trade box offers it, after the checks every offer takes; a
+        gift made for the receiving player takes them too (pokeldn.receiver_gift)."""
+        if args.trade_box_ours or ours:
             template = trade_box.build_our_record(
                 template=template, **data_exchange.read_record(exchange_record))
         if box_edits:
@@ -346,23 +369,53 @@ def main():
         return pokemon_service.validate("pla", template)
 
     # Re-read when the file changes, so a new offer needs no restart of the session.
-    box_state = {"mtime": os.path.getmtime(box_file) if box_file else None,
-                 "record": build_offer()}
+    box_states = [{"mtime": os.path.getmtime(path) if path else None, "record": build_offer(path)}
+                  for path in box_files]
+    trades = [0]
 
     def offer_record():
+        """-> the record for the trade at hand: one per completed trade, the last once they run out."""
+        index = min(trades[0], len(box_files) - 1)
+        box_file, box_state = box_files[index], box_states[index]
         if box_file:
             mtime = os.path.getmtime(box_file)
             if mtime != box_state["mtime"]:
-                box_state.update(mtime=mtime, record=build_offer())
+                box_state.update(mtime=mtime, record=build_offer(box_file))
                 print("[pla] offer reloaded: "
                       f"{pla_pokemon.describe(pla_pokemon.decrypt(box_state['record']))}")
         return box_state["record"]
 
-    if args.trade_box:
-        print(f"[pla] offering {pla_pokemon.describe(pla_pokemon.decrypt(box_state['record']))}")
+    partner = online.partner("pla", args, code=args.code, name=args.player_name)
+    online_boxes = {}       # station -> trade_box.OnlineBox
+    # A gift made for the receiving player stands in for an online partner, one per console
+    # (pokeldn.receiver_gift).
+    receiving = None
+    if partner is None and args.trade_box and box_files[0]:
+        receiving = receiver_gift.setup("pla", args, [state["record"] for state in box_states],
+                                        lambda raw: box_offer(pla_pokemon.encrypt(pla_pokemon.load(raw))),
+                                        **offer_check)
+    helped = partner is not None or receiving is not None
+
+    def online_box(ip):
+        """The console's trade box with the online partner, or with a gift made for its own save."""
+        if ip not in online_boxes:
+            helper = partner
+            if receiving is not None:
+                helper = receiver_gift.ReceiverGift("pla", *receiving,
+                                                    notify=receiver_gift.pop_up(f"gift-{ip}"),
+                                                    shown=lambda body: screen.offer("pla", body))
+            online_boxes[ip] = trade_box.OnlineBox(helper)
+        return online_boxes[ip]
+    if partner is not None and args.trade_box_record:
+        print("[pla] --online offers the partner's Pokemon; --trade-box-record is ignored")
+    if args.trade_box and partner is None:
+        for n, state in enumerate(box_states, start=1):
+            print(f"[pla] trade {n} offers {pla_pokemon.describe(pla_pokemon.decrypt(state['record']))}")
+        screen.offer("pla", box_states[0]["record"])
     if args.trade_box_collect:
         os.makedirs(os.path.expanduser(args.trade_box_collect), exist_ok=True)
     collected = set()
+    console_offer = {}      # the record each console last offered (selector 4), the one a trade delivers
     rx_windows = {}
     tx_window = reliable5.SendWindow(GAME_CHANNEL_RESEND)
     # One send sequence per stream, mirrors included: a mirror reusing the console's id makes its
@@ -422,9 +475,15 @@ def main():
     station_ids = {}
     left = set()
     phase3_sent = set()
+    arriving = set()        # stations whose trade animation is running
+
+    def arrived(src_ip):
+        if src_ip in arriving:
+            arriving.discard(src_ip)
+            screen.arrived()
 
     def leave(src_ip):
-        """The type-3 leave a quitting console bursts; it takes no reply (docs/pla.md, Leaving)."""
+        """The type-3 leave burst; only a host answers it (`0x738000`, docs/pla.md, Leaving)."""
         ids = station_ids.get(src_ip)
         if ids is None or src_ip in left:
             return
@@ -441,6 +500,7 @@ def main():
         else:
             print(f"[pla] {src_ip}: stopping WITHOUT a leave request (--leave-sends 0)")
 
+    gone = False
     try:
         while time.time() < deadline:
             now = time.time()
@@ -456,6 +516,14 @@ def main():
             # WaitConnected.
             for entry in list(transport.participants):
                 seen_ips.add(entry[1])
+            if not gone and left_after_trade(transport.participants):
+                gone = True
+                for ip in list(arriving):
+                    arrived(ip)
+                if not args.stay_after_leave:
+                    print("[pla] the console left after the trade; closing")
+                    break
+                print("[pla] the console left after the trade; staying up (--stay-after-leave)")
             if not args.no_net_probe:
                 for ip in list(seen_ips):
                     if ip == transport.our_ip or ip in left:
@@ -488,7 +556,22 @@ def main():
                 transport.send(pkt, ip)
                 record(rec="out", dst=ip, kind="game channel resend", port=port, seq=seq,
                        hex=pkt.hex(), t=now)
-                print(f"[pla] -> {ip}: game channel resend (port {port}, seq {seq})")
+                if args.print_packets:
+                    print(f"[pla] -> {ip}: game channel resend (port {port}, seq {seq})")
+            for ip, box in list(online_boxes.items()):
+                if ip in left or ip not in station_ids:
+                    continue
+                offers, mirrors = box.tick()
+                for selector, counter, box_record in offers:
+                    send_reliable(ip, station_ids[ip]["console_var"], trade_box.build_message(
+                        box_record, sequence_id=next_seq(ip, trade_box.PORT), selector=selector,
+                        counter=counter), protocol=trade_box.PROTOCOL, port=trade_box.PORT)
+                    print(f"[pla] -> {ip}: trade box, the partner's {trade_box.describe(box_record)}")
+                for body in mirrors:
+                    send_reliable(ip, station_ids[ip]["console_var"], game_channel.build_message(
+                        bytes(game_channel.KEY_SIZE), body, next_seq(ip, trade_box.PORT)),
+                        protocol=trade_box.PROTOCOL, port=trade_box.PORT)
+                    print(f"[pla] -> {ip}: trade step, both consoles confirmed")
             transport.wait_readable(0.05)
             for payload, src_ip in transport.recv():
                 seen += 1
@@ -505,13 +588,15 @@ def main():
                     print(f"[pla] {src_ip}: {header!r} DID NOT AUTHENTICATE")
                     continue
                 authed += 1
-                print(f"[pla] {src_ip}: {header!r} footer={ids}")
+                if args.print_packets:
+                    print(f"[pla] {src_ip}: {header!r} footer={ids}")
                 # A fault in one message is reported and the session kept.
                 try:
                     for msg in pia6.parse_messages(plain):
                         if src_ip in left:
                             break
-                        print(f"       {_describe(msg)}  {msg.payload.hex()}")
+                        if args.print_packets:
+                            print(f"       {_describe(msg)}  {msg.payload.hex()}")
                         record(rec="msg", src=src_ip, protocol=msg.protocol, port=msg.port,
                                flags=msg.message_flags, payload=msg.payload.hex())
                         if msg.protocol == PROTO_NET and len(msg.payload) > 1:
@@ -519,6 +604,19 @@ def main():
                                 answered.add(src_ip)
                                 print(f"[pla] {src_ip} answered the connection request; "
                                       f"waiting for its session join")
+                        # The leaver resends every 500 ms until this, four sends at most (`0x73bab8`).
+                        if (msg.protocol == PROTO_SESSION and len(msg.payload) >= 17
+                                and msg.payload[0] == pia_connect.SESSION_LEAVE_REQUEST):
+                            body = pia_connect.build_session_leave_response_v11(
+                                msg.payload, random4=os.urandom(4))
+                            pkt = build_reply(keys, transport.our_ip, body, header.src_var,
+                                              os.urandom(8))
+                            transport.send(pkt, src_ip)
+                            record(rec="out", dst=src_ip, kind="session leave response",
+                                   hex=pkt.hex(), t=time.time())
+                            print(f"[pla] -> {src_ip}: session leave response (type 4); "
+                                  f"the console is leaving")
+                            arrived(src_ip)
                         if (msg.protocol == PROTO_SESSION and msg.payload
                                 and msg.payload[0] == SESSION_JOIN_REQUEST):
                             j = pia_connect.parse_session_join_v11(msg.payload)
@@ -627,27 +725,33 @@ def main():
                                 record(rec="out", dst=src_ip, kind="game channel ack",
                                        ack_id=window.next, hex=pkt.hex(), t=time.time())
                                 if not ready:
-                                    print(f"[pla] -> {src_ip}: game channel ack (port {msg.port}, "
-                                          f"seq {cm['sequence_id']}, "
-                                          + ("a repeat)" if cm["sequence_id"] < window.next
-                                             else f"held behind {window.next})"))
+                                    if args.print_packets:
+                                        print(f"[pla] -> {src_ip}: game channel ack (port {msg.port}, "
+                                              f"seq {cm['sequence_id']}, "
+                                              + ("a repeat)" if cm["sequence_id"] < window.next
+                                                 else f"held behind {window.next})"))
                             for cm in ready:
                                 key, payload_body = game_channel.split_message(cm["payload"])
                                 announced = (msg.port == game_channel.JOINER_PORT
                                              and channel_table.is_announcement(cm["payload"]))
-                                print(f"[pla] -> {src_ip}: game channel ack (port {msg.port}, "
-                                      f"seq {cm['sequence_id']}, "
-                                      + ("channel table)" if announced else
-                                         f"key {key.hex()}, body {payload_body[:16].hex()}"
-                                         f"{'...' if len(payload_body) > 16 else ''} "
-                                         f"{len(payload_body)}B)"))
+                                if args.print_packets:
+                                    print(f"[pla] -> {src_ip}: game channel ack (port {msg.port}, "
+                                          f"seq {cm['sequence_id']}, "
+                                          + ("channel table)" if announced else
+                                             f"key {key.hex()}, body {payload_body[:16].hex()}"
+                                             f"{'...' if len(payload_body) > 16 else ''} "
+                                             f"{len(payload_body)}B)"))
                                 offered = trade_box.read_payload(cm["payload"])
                                 if offered is not None:
+                                    # Its first after a trade: back on its box (docs/pla.md).
+                                    arrived(src_ip)
                                     print(f"[pla] <- {src_ip}: trade box, "
                                           f"{trade_box.selector_name(offered['selector'])} "
                                           f"{trade_box.describe(offered['record'])}")
                                     record(rec="box", src=src_ip, selector=offered["selector"],
                                            hex=offered["record"].hex(), t=time.time())
+                                    if offered["selector"] == trade_box.SELECTOR_OFFERING:
+                                        console_offer[src_ip] = offered["record"]
                                     if args.trade_box_collect and offered["record"] not in collected:
                                         collected.add(offered["record"])
                                         try:
@@ -674,8 +778,21 @@ def main():
                                         # the phase key closes once the trade is written
                                         if not opened and ckey == trade_box.PHASE_KEY:
                                             show_done()
-                                            print(f"[pla] {src_ip}: trade complete, the phase key "
-                                                  "closed")
+                                            screen.received("pla", console_offer.get(src_ip))
+                                            arriving.add(src_ip)
+                                            trades[0] += 1
+                                            if src_ip in online_boxes:
+                                                online_boxes[src_ip].done()
+                                            elif args.trade_box:
+                                                screen.offer("pla", offer_record())
+                                            print(f"[pla] {src_ip}: trade {trades[0]} complete, the "
+                                                  "phase key closed")
+                                            if args.offer_out and src_ip in console_offer:
+                                                path = pokemon_service.trade_path(args.offer_out,
+                                                                                  trades[0])
+                                                with open_output(path, "wb") as fh:
+                                                    fh.write(console_offer.pop(src_ip))
+                                                print(f"[pla] wrote the record the console traded, {path}")
                                         if not opened:
                                             continue
                                         announce = game_channel.build_payload_message(
@@ -706,11 +823,15 @@ def main():
                                 # Mirroring the console's selector 5 completes the state its own
                                 # sender set.
                                 selector = trade_box.read_selector(cm["payload"])
+                                mirror_bodies = []
                                 if (args.trade_box and offered is None and selector is not None
                                         and selector[0] in trade_box.MIRRORED_SELECTORS):
+                                    mirror_bodies = ([selector[1]] if not helped
+                                                     else online_box(src_ip).on_selector(*selector))
+                                for mirror_body in mirror_bodies:
                                     seq = next_seq(src_ip, msg.port)
                                     body = game_channel.build_message(
-                                        bytes(game_channel.KEY_SIZE), selector[1], seq)
+                                        bytes(game_channel.KEY_SIZE), mirror_body, seq)
                                     pkt = send_reliable(src_ip, header.src_var, body,
                                                         protocol=trade_box.PROTOCOL,
                                                         port=trade_box.PORT)
@@ -760,19 +881,22 @@ def main():
                                           f"(port {game_channel.HOST_PORT}, key eight zero bytes)")
                                 # Answer with the selector we were sent: a showing and an offer land
                                 # in different slots.
+                                answers = []
                                 if args.trade_box and offered is not None:
-                                    box_record = offer_record()
+                                    answers = ([(offered["selector"], offered["counter"], offer_record())]
+                                               if not helped else online_box(src_ip).on_box(offered))
+                                for answer_selector, answer_counter, box_record in answers:
                                     seq = next_seq(src_ip, msg.port)
                                     body = trade_box.build_message(
                                         box_record, sequence_id=seq,
-                                        selector=offered["selector"], counter=offered["counter"])
+                                        selector=answer_selector, counter=answer_counter)
                                     pkt = send_reliable(src_ip, header.src_var, body,
                                                         protocol=trade_box.PROTOCOL,
                                                         port=trade_box.PORT)
                                     record(rec="out", dst=src_ip, kind="trade box", hex=pkt.hex(),
                                            t=time.time())
                                     print(f"[pla] -> {src_ip}: trade box (port {trade_box.PORT}, "
-                                          f"{trade_box.selector_name(offered['selector'])}, "
+                                          f"{trade_box.selector_name(answer_selector)}, "
                                           f"{trade_box.describe(box_record)})")
 
                         # Clock kind 0 is answered with kind 1: the sequence and originate tick
@@ -818,6 +942,13 @@ def main():
                                 is_new = rm["sequence_id"] > reliable_high.get(src_ip, 0)
                                 high = max(reliable_high.get(src_ip, 0), rm["sequence_id"])
                                 reliable_high[src_ip] = high
+                                if receiving is not None and is_new and rm["flags"] & reliable5.FLAG_ZLIB:
+                                    # The console's record names its save, for a gift made for it
+                                    # (pokeldn.receiver_gift).
+                                    receiver_gift.hear(
+                                        online_box(src_ip).partner,
+                                        lambda payload: data_exchange.read_trainer(data_exchange.decompress(payload)),
+                                        rm["payload"])
                                 # The console reads entry[1] and requires its station byte to be the
                                 # sender's index, 0 (docs/pla.md, Sustaining the mesh).
                                 entries = [
@@ -838,8 +969,9 @@ def main():
                                 transport.send(pkt, src_ip)
                                 record(rec="out", dst=src_ip, kind="reliable ack",
                                        ack_id=high + 1, hex=pkt.hex(), t=time.time())
-                                print(f"[pla] -> {src_ip}: reliable ack (stream {rm['stream_id']}, "
-                                      f"seq {high}, ack_id {high + 1}, port {msg.port})")
+                                if args.print_packets:
+                                    print(f"[pla] -> {src_ip}: reliable ack (stream {rm['stream_id']}, "
+                                          f"seq {high}, ack_id {high + 1}, port {msg.port})")
                                 # The console sends its record only after the host's; the ten-second
                                 # leave waits on it (docs/pla.md).
                                 if args.data_exchange and src_ip not in exchange_sent:
@@ -911,6 +1043,8 @@ def main():
         print("\n[pla] interrupted")
     finally:
         transport.stop()
+        if partner:
+            partner.close()
         if cap:
             cap.close()
 

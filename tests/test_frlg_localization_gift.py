@@ -247,7 +247,7 @@ def test_host_application_reuses_configuration_and_closes_operation(example, tmp
     config = SimpleNamespace(role=HostOptions(), profile=None, ldn=None, trust_pia=True)
     app = LocalizationHostApplication(config, operation, log=lambda *args: None)
     assert app.config is config and app.operation is operation
-    assert app._make_engine(None, None).server is operation.server
+    assert app._build_engine(None, None).server is operation.server
     operation.result.set_result({"state": "COMPLETE"})
     monkeypatch.setattr(HostApplication, "run", lambda self: True)
     assert app.run() is True

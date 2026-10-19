@@ -4,6 +4,7 @@ run() advances until it blocks and publishes ``action`` as ("send", ident, paylo
 
 from pokeldn.frlg.gift import ereader_trainer, mg_script, wonder_news
 from pokeldn.frlg.rom import buffer_script, builds, mystery_event
+from pokeldn.frlg.save import readout
 from pokeldn.frlg.text import charmap, easychat
 from pokeldn.frlg.gift.mystery_gift import (
     MG_LINKID_CARD, MG_LINKID_CLIENT_SCRIPT, MG_LINKID_DYNAMIC_MSG,
@@ -38,6 +39,7 @@ SVR_GET_CARD_STAT = "SVR_GET_CARD_STAT"
 SVR_LOAD_DENIED_MSG = "SVR_LOAD_DENIED_MSG"
 SVR_READ_MEVENT_STATUS = "SVR_READ_MEVENT_STATUS"
 SVR_LOAD_BUFFER_SCRIPT = "SVR_LOAD_BUFFER_SCRIPT"
+SVR_LOAD_BUFFER_LEAD = "SVR_LOAD_BUFFER_LEAD"
 SVR_READ_BUFFER_STATUS = "SVR_READ_BUFFER_STATUS"
 SVR_LOAD_BUFFER_VERDICT_MSG = "SVR_LOAD_BUFFER_VERDICT_MSG"
 SVR_READ_BUFFER_DUMP = "SVR_READ_BUFFER_DUMP"
@@ -130,6 +132,10 @@ DEFAULT_BUFFER_SUCCESS_MESSAGE = _encode_message(
     "The code ran and read your\nTRAINER ID correctly.", None)
 DEFAULT_BUFFER_FAILURE_MESSAGE = _encode_message(
     "The code ran but read the\nwrong value.", None)
+
+
+# The consoles a payload built for each game serves (pokeldn.frlg.gift.gift_composer.GameRules).
+GAME_CONSOLES = {"frlg": ("firered", "leafgreen"), "emerald": ("emerald",)}
 
 
 class MysteryGiftServerError(Exception):
@@ -411,15 +417,18 @@ SCRIPT_DUMP_MEMORY = (
 )
 
 
-def script_dump_memory(blocks=1):
-    """-> the host script for a dump of `blocks` consecutive kilobytes in ONE session; one
-    MG_LINKID_RESPONSE per block, which SVR_READ_BUFFER_DUMP appends."""
-    if blocks == 1:
+def script_dump_memory(blocks=1, leads=0):
+    """-> the host script for a dump of `blocks` consecutive kilobytes in ONE session, after `leads`
+    payloads sent and run first; one MG_LINKID_RESPONSE per block, which SVR_READ_BUFFER_DUMP
+    appends."""
+    if blocks == 1 and not leads:
         return SCRIPT_DUMP_MEMORY
     return (
         *_GAME_DATA_PREFIX,
-        (SVR_LOAD_CLIENT_SCRIPT, mg_script.client_script_dump_memory(blocks)),
+        (SVR_LOAD_CLIENT_SCRIPT, mg_script.client_script_dump_memory(blocks, leads)),
         (SVR_SEND,),
+        *[step for index in range(leads)
+          for step in ((SVR_LOAD_BUFFER_LEAD, index), (SVR_SEND,))],
         (SVR_LOAD_BUFFER_SCRIPT,),
         (SVR_SEND,),
         *[step for _ in range(blocks)
@@ -439,6 +448,26 @@ SCRIPT_RUN_BUFFER_SCRIPT = (
     (SVR_GOTO_IF_EQ, True, _SCRIPT_BUFFER_SUCCESS),
     (SVR_GOTO, _SCRIPT_BUFFER_FAILURE),
 )
+
+
+def script_run_buffer_script(leads=0):
+    """-> SCRIPT_RUN_BUFFER_SCRIPT with `leads` payloads sent and run first, in one session (a
+    save-write before install-kept); the verdict is the last payload's answer."""
+    if not leads:
+        return SCRIPT_RUN_BUFFER_SCRIPT
+    return (
+        *_GAME_DATA_PREFIX,
+        (SVR_LOAD_CLIENT_SCRIPT, mg_script.client_script_run_buffer(leads)),
+        (SVR_SEND,),
+        *[step for index in range(leads)
+          for step in ((SVR_LOAD_BUFFER_LEAD, index), (SVR_SEND,))],
+        (SVR_LOAD_BUFFER_SCRIPT,),
+        (SVR_SEND,),
+        (SVR_RECV, MG_LINKID_RESPONSE),
+        (SVR_READ_BUFFER_STATUS,),
+        (SVR_GOTO_IF_EQ, True, _SCRIPT_BUFFER_SUCCESS),
+        (SVR_GOTO, _SCRIPT_BUFFER_FAILURE),
+    )
 
 
 # sServerScript_TossPrompt [decomp:src/mystery_gift_scripts.c:151]
@@ -493,25 +522,29 @@ class MysteryGiftServer:
 
     def __init__(self, card=None, ram_script=None, *, news=None, stamp=None,
                  activation_script=None, install_activation_script=None, trainer=None,
-                 mevent=None, buffer_code=None, buffer_expect=None, buffer_dump_size=None,
+                 mevent=None, buffer_code=None, buffer_lead=(), buffer_expect=None,
+                 buffer_dump_size=None,
                  buffer_dump_blocks=1, buffer_dump_address=0, buffer_dump_addresses=(),
                  buffer_decode=None, buffer_reference=None,
                  buffer_success_message=None, buffer_failure_message=None,
                  questionnaire=None, denied_message=None, expect_console=None,
-                 script=None, per_build=None, log=lambda *a: None):
+                 script=None, per_build=None, game="frlg", log=lambda *a: None):
         self.expect_console = None if expect_console is None else str(expect_console).lower()
-        if self.expect_console not in (None, "firered", "leafgreen"):
+        if game not in GAME_CONSOLES:
+            raise MysteryGiftServerError(f"game is one of {', '.join(GAME_CONSOLES)}, got {game!r}")
+        self.game = game
+        if self.expect_console not in (None, *GAME_CONSOLES[game]):
             raise MysteryGiftServerError(
-                f"expect_console is 'firered' or 'leafgreen', got {expect_console!r}")
+                f"expect_console is one of {', '.join(GAME_CONSOLES[game])}, got {expect_console!r}")
         self.console_mismatch = None
         self.news = None if news is None else bytes(news)
         if self.news is not None:
             if card is not None or ram_script is not None:
                 raise MysteryGiftServerError(
                     "a Wonder News session carries no Wonder Card and no RAM script")
-            if len(self.news) != wonder_news.WONDER_NEWS_SIZE:
+            if len(self.news) not in (wonder_news.WONDER_NEWS_SIZE, wonder_news.JAPANESE_WONDER_NEWS_SIZE):
                 raise MysteryGiftServerError(
-                    f"Wonder News must be exactly {wonder_news.WONDER_NEWS_SIZE} bytes, "
+                    f"Wonder News must be exactly 224 or {wonder_news.WONDER_NEWS_SIZE} bytes, "
                     f"got {len(self.news)}")
             if not wonder_news.validate(self.news):
                 raise MysteryGiftServerError(
@@ -527,9 +560,9 @@ class MysteryGiftServer:
                 raise MysteryGiftServerError(
                     f"delivery RAM script is {len(self.ram_script)} bytes; the console "
                     f"only saves the first {self.MAX_RAM_SCRIPT_SIZE}")
-            if len(self.card) != WONDER_CARD_SIZE:
+            if len(self.card) not in (WONDER_CARD_SIZE, 164):
                 raise MysteryGiftServerError(
-                    f"Wonder Card must be exactly {WONDER_CARD_SIZE} bytes, got {len(self.card)}")
+                    f"Wonder Card must be exactly 164 or {WONDER_CARD_SIZE} bytes, got {len(self.card)}")
         self.stamp = None if stamp is None else bytes(stamp)
         self.activation_script = (None if activation_script is None
                                   else bytes(activation_script))
@@ -584,6 +617,12 @@ class MysteryGiftServer:
                 raise MysteryGiftServerError(
                     "a buffer script runs on its own: no card, news, stamp rally, visiting "
                     "trainer or Mystery Event script in the same session")
+        # Payloads run before buffer_code in the same session; their answers are not read.
+        self.buffer_lead = tuple(bytes(code) for code in buffer_lead)
+        for code in self.buffer_lead:
+            buffer_script.validate(code)
+        if self.buffer_lead and self.buffer_code is None:
+            raise MysteryGiftServerError("payloads run ahead of the last one, and there is none")
         self.buffer_dump_size = None if buffer_dump_size is None else int(buffer_dump_size)
         # Only memory-dump-multi uses these; every other payload answers once.
         self.buffer_dump_blocks = int(buffer_dump_blocks)
@@ -680,9 +719,9 @@ class MysteryGiftServer:
         elif self.is_mevent_distribution:
             self.script = SCRIPT_SEND_MYSTERY_EVENT
         elif self.is_buffer_distribution:
-            self.script = (script_dump_memory(self.buffer_dump_blocks)
+            self.script = (script_dump_memory(self.buffer_dump_blocks, len(self.buffer_lead))
                            if self.buffer_dump_size is not None
-                           else SCRIPT_RUN_BUFFER_SCRIPT)
+                           else script_run_buffer_script(len(self.buffer_lead)))
         else:
             self.script = SCRIPT_SEND_WONDER_CARD
         if self.questionnaire is not None and script is None:
@@ -790,6 +829,7 @@ class MysteryGiftServer:
         self.game_data = mg_script.parse_link_game_data(self._received)
         self.info("Console identified itself: " + self.game_data.describe())
         self._check_expected_console()
+        self._check_game()
         self._select_build()
         for line in self.game_data.describe_extras():
             self.info(line)
@@ -807,8 +847,19 @@ class MysteryGiftServer:
             f"{got.upper()}. Nothing was sent. Put the other cartridge on the Mystery Gift "
             "search screen and launch again, or drop --expect-console if the run does not care.")
 
+    def _check_game(self):
+        """Refuse a console of another game, before anything is sent: a gift names its own game's
+        flags, vars and specials (docs/rse.md, Mystery Gift)."""
+        got = self.game_data.version_name.lower()
+        if got in GAME_CONSOLES[self.game]:
+            return
+        self.console_mismatch = (self.game, got)
+        raise MysteryGiftServerError(
+            f"THIS GIFT IS FOR {' OR '.join(GAME_CONSOLES[self.game]).upper()} AND THE CONSOLE THAT "
+            f"JOINED IS {got.upper()}. Nothing was sent: its flags and variables are another game's.")
+
     BUILD_FIELDS = ("card", "ram_script", "news", "stamp", "activation_script",
-                    "install_activation_script", "trainer", "mevent", "buffer_code",
+                    "install_activation_script", "trainer", "mevent", "buffer_code", "buffer_lead",
                     "buffer_expect", "buffer_dump_size", "buffer_dump_blocks",
                     "buffer_dump_address", "buffer_dump_addresses", "buffer_decode",
                     "buffer_reference")
@@ -834,7 +885,7 @@ class MysteryGiftServer:
         self.info(f"Console build {code} ({self.build.name}): sending the bytes built for it.")
 
     def _do_svr_check_game_data(self):
-        self.param = mg_script.validate_link_game_data(self.game_data)
+        self.param = mg_script.validate_link_game_data(self.game_data, news=self.news is not None)
         if not self.param:
             self.info("Console game data failed MysteryGift_ValidateLinkGameData; "
                       "declining to send the card.")
@@ -943,6 +994,12 @@ class MysteryGiftServer:
         self.info(f"Mystery Event script status: {self.mevent_status} "
                   f"({MEVENT_STATUS_NAMES.get(self.mevent_status, 'set by our own setstatus')})")
 
+    def _do_svr_load_buffer_lead(self, index):
+        code = self.buffer_lead[index]
+        self._loaded = (MG_LINKID_RAM_SCRIPT, code, len(code))
+        self.info(f"buffer script {index + 1} of {len(self.buffer_lead) + 1} (native ARM code): "
+                  + buffer_script.describe(code))
+
     def _do_svr_load_buffer_script(self):
         self._loaded = (MG_LINKID_RAM_SCRIPT, self.buffer_code, len(self.buffer_code))
         self.info("buffer script (native ARM code): "
@@ -957,7 +1014,14 @@ class MysteryGiftServer:
                 (buffer_script.FLASH_WRITE, buffer_script.FLASH_PATCH)):
             self.info(f"Buffer script status: 0x{self.buffer_status:08X}, {refusal}")
         expected, mask, why = self._expected_buffer_status()
-        if expected is None:
+        installer = buffer_script.describe(self.buffer_code).startswith(
+            (buffer_script.INSTALL_KEPT, buffer_script.INSTALL_RESIDENT))
+        if expected is None and installer and self.buffer_status == buffer_script.INSTALL_REFUSED:
+            # Nothing installed: a kept blob that did not sum, or no handler to chain to. The
+            # failure exit does not save [mystery_gift_menu.c:1379].
+            self.buffer_matched = False
+            self.info(f"Buffer script status: 0x{self.buffer_status:08X} - nothing was installed")
+        elif expected is None:
             self.buffer_matched = True
             self.info(f"Buffer script status: 0x{self.buffer_status:08X} "
                       f"({self.buffer_status}) - the payload returned 1 and answered")
@@ -966,10 +1030,10 @@ class MysteryGiftServer:
             verdict = "MATCHES" if self.buffer_matched else "DOES NOT MATCH"
             self.info(f"Buffer script status: 0x{self.buffer_status:08X} {verdict} "
                       f"0x{expected:08X} ({why})")
-            if self.buffer_expect == BUFFER_EXPECT_TRAINER_ID and self.buffer_matched:
+            if self.buffer_expect == BUFFER_EXPECT_TRAINER_ID:
                 # playerTrainerId: TID low half, SID high half. The SID travels in no link message.
-                self.info(f"  -> TID (public) {self.buffer_status & 0xFFFF}, "
-                          f"SID (SECRET) {self.buffer_status >> 16}")
+                self.info(f"  Trainer ID {self.buffer_status & 0xFFFF}, "
+                          f"Secret ID {self.buffer_status >> 16}")
         self.param = self.buffer_matched
         self.trace.append(("buffer_status", self.buffer_status, self.buffer_matched))
 
@@ -1114,6 +1178,11 @@ class MysteryGiftServer:
             return
         if self.buffer_dump_size == buffer_script.ANCHORS_SIZE:
             for line in buffer_script.describe_anchors(self.buffer_dump):
+                self.info(f"  {line}")
+        if buffer_script.describe(self.buffer_code).startswith(buffer_script.SAVE_DUMP + " "):
+            asked = buffer_script.save_dump_parameters(self.buffer_code)
+            for line in readout.describe(asked["block"], asked["offset"], self.buffer_dump,
+                    language=1 if self.game_data and self.game_data.game_code.endswith(b"J") else None):
                 self.info(f"  {line}")
 
     def _do_svr_load_buffer_verdict_msg(self):

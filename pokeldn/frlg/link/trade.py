@@ -305,6 +305,7 @@ class TradeEngine:
         self._cancel_wait = None  # [S6]
         self._cancel_after_send = False
         self.commits = 0
+        self.anim_starts = 0
         self._finish_sent_at_last_commit = False
         self.done = False
         self.cancelled = False
@@ -639,6 +640,8 @@ class TradeEngine:
             if self.cancelled:
                 return
             # anim_delay frames before READY_FINISH [trade.c:1659-1661; trade_scene.c:2527-2536].
+            if self.state != S7_ANIM:
+                self.anim_starts += 1
             self.state = S7_ANIM
             self._anim_wait = self.anim_delay
         elif cmd == CONFIRM_FINISH_TRADE:
@@ -671,8 +674,17 @@ class TradeEngine:
             # One side selected, the other cancelled [trade.c:1695-1712, 1737-1746]: both return to
             # the trade menu [2094-2113] and the leader waits for both to select again. Ending the
             # session here left the leader waiting forever.
-            self.log(f"<- {LINKCMD_NAMES.get(cmd, hex(cmd))}: back to the trade menu; selecting again")
-            self.info("Trade cancelled by one side; back at the menu.")
+            # PLAYER_CANCEL while we are READY is the leader's player choosing Cancel [trade.c:1704-
+            # 1712]; we cancel at the menu so their next Cancel ends the session.
+            if cmd == PLAYER_CANCEL_TRADE and self.state == S5_SELECT:
+                self.leaving = True
+                self.log("<- PLAYER_CANCEL_TRADE at selection: the console's player cancelled; "
+                         "cancelling with them")
+                self.info("The console's player cancelled; Cancel again on the console to leave.")
+            else:
+                self.log(f"<- {LINKCMD_NAMES.get(cmd, hex(cmd))}: back to the trade menu; "
+                         "selecting again")
+                self.info("Trade cancelled by one side; back at the menu.")
             self.state = S4_PARTY
             self._selected = False
             self._reselect_wait = RESELECT_DELAY
@@ -746,18 +758,22 @@ class TradeEngine:
             self._cancel_wait = INVALID_CANCEL_DELAY
             self.cancelled = True
 
+    def incoming_mon(self):
+        """The host's chosen Pokemon, the one `_commit` takes, or None before it chose."""
+        if self.host_cursor is None:
+            return None
+        off = self.host_cursor % PARTY_SIZE * monmod.PARTY_MON_SIZE
+        return monmod.Mon(bytes(self._host_party[off:off + monmod.PARTY_MON_SIZE]))
+
     def _commit(self):
         """TradeMons [trade_scene.c:1054-1083]: host party[host_cursor % PARTY_SIZE] into our
         offered slot. More trades re-arm (BufferTradeParties re-runs [trade.c:935]), else leave."""
         # Capture READY_FINISH-before-commit before _reset_round_state clears it.
         self._finish_sent_at_last_commit = self._finish_sent
         self.commits += 1
-        received = None
         offered_slot = self.offered_slots[self.round]
-        if self.host_cursor is not None:
-            idx = self.host_cursor % PARTY_SIZE
-            off = idx * monmod.PARTY_MON_SIZE
-            received = monmod.Mon(bytes(self._host_party[off:off + 100]))
+        received = self.incoming_mon()
+        if received is not None:
             self.received_mon = received
             self.received_mons.append(received)
             self.info("Trade confirmed.")

@@ -83,6 +83,7 @@ FLASH_PATCH = "flash-patch"
 FLASH_READ = "flash-read"
 SLOOP_SVC = "sloop-svc"
 INSTALL_RESIDENT = "install-resident"
+INSTALL_KEPT = "install-kept"
 
 # Save flash: 32 sectors of 0x1000 [decomp:include/save.h]. Only swi 0x48 and swi 0x56 write it
 # [docs/frlg_rom.md, the Sloop syscall boundary].
@@ -1675,6 +1676,12 @@ SCRIPT_REGISTRY = {
         "every frame until a soft reset; answers with the V-blank handler it found "
         "(--resident turbo, --resident-param extra=N field=N battle=N hold=0x100 budget=228; needs --write-unsafe)",
         None),
+    INSTALL_KEPT: BufferScriptSpec(
+        INSTALL_KEPT,
+        "install the resident hook kept in the save's filler_B20 (written by save-write --resident), "
+        "after checking its sum; answers with the V-blank handler it found, 0xBAD0BAD0 when nothing "
+        "was installed",
+        None),
 }
 
 
@@ -1695,6 +1702,13 @@ def build_save_dump(block=SAVE_BLOCK_2, offset=0, size=MAX_BUFFER_SCRIPT_SIZE):
     code[SAVE_DUMP_OFFSET_OFFSET:SAVE_DUMP_OFFSET_OFFSET + 4] = offset.to_bytes(4, "little")
     code[SAVE_DUMP_SIZE_OFFSET:SAVE_DUMP_SIZE_OFFSET + 4] = size.to_bytes(4, "little")
     return bytes(code)
+
+
+def save_dump_parameters(code):
+    """-> {block, offset, size}: what build_save_dump patched in."""
+    word = lambda at: int.from_bytes(code[at:at + 4], "little")
+    return {"block": SAVE_BLOCK_2 if word(SAVE_DUMP_WHICH_OFFSET) == 0 else SAVE_BLOCK_1,
+            "offset": word(SAVE_DUMP_OFFSET_OFFSET), "size": word(SAVE_DUMP_SIZE_OFFSET)}
 
 
 def scratch_regions(block):
@@ -1800,10 +1814,11 @@ SAVE_SLOT_LAYOUT_ADDRESS = 0x083F58C4
 SECTOR_CHUNK_MIN = 2000
 
 
-def sector_chunk_size(sector_id):
+def sector_chunk_size(sector_id, build=None):
     """-> how many bytes of sector `sector_id` the game's checksum covers."""
     try:
-        return SECTOR_CHUNK_SIZES[int(sector_id)]
+        return (builds.resolve(build).saveblock1_size - 3 * SECTOR_DATA_SIZE
+                if int(sector_id) == 4 else SECTOR_CHUNK_SIZES[int(sector_id)])
     except KeyError:
         raise BufferScriptError(
             f"sector id {sector_id} is not one of the {len(SECTOR_CHUNK_SIZES)} a save slot "
@@ -1846,7 +1861,7 @@ def build_flash_write(sector, *, source=FLASH_WRITE_SCRATCH, fill_base=0x4657000
     if footer and words == FLASH_WRITE_WORDS:
         # Fill the id's own chunk and leave the rest zero, as the game does; a full fill would fail
         # the game's chunk checksum.
-        words = (sector_chunk_size(sector_id) if position is None
+        words = (sector_chunk_size(sector_id, build) if position is None
                  else SECTOR_CHUNK_MIN) // 4
     if not 1 <= words <= FLASH_WRITE_WORDS:
         raise BufferScriptError(
@@ -2114,25 +2129,108 @@ RESIDENT_HOOKS = {
     "turbo": ("turbo_hook", {"extra": 4, "field": 0, "battle": 0, "overlay": 0, "hold": 0,
                              "help": 0, "budget": 0, "ring": 0,
                              "watch": 0x02024028, "frames": 0x0203FF60}),
+    # turbo with no overlay and no RNG history [asm/resident/turbo-lite.s]
+    "turbo-lite": ("turbo_hook", {"extra": 4, "field": 0, "battle": 0, "hold": 0, "help": 0, "budget": 0,
+                                  "frames": 0x0203FF60}),
     "shiny": ("shiny_hook", {"method": 0, "offset": 4, "search": 16, "slow": 0x100,
                              "slow_frames": 3, "help": 0x0203F171, "state": 0x0203FF80,
                              "overlay": 0x0203FF98}),
     "ivs": ("ivs_hook", {"mon": 0x02024280, "words": 0x0203FF80, "overlay": 0x0203FF80,
                          "overlay2": 0x0203FF84}),
     "noencounter": ("noencounter_hook", {"flag": 0x020386D8}),
+    "noclip": ("noclip_hook", {"hold": 0x100, "help": 0x0203F171, "state": 0x0203FF80}),
+    "follower": ("follower_hook", {"state": 0x0203FFDC, "images": 0x0203FBB4, "deoxys": None}),
 }
 # A hook's IWRAM and ROM words are the build's [Build.hook_literals]. RESIDENT_DATA: the data a hook
 # keeps past its code, in bytes.
-RESIDENT_DATA = {"p_frames": 20, "p_ring": 140, "p_state": 36, "p_words": 12}
+RESIDENT_DATA = {"p_frames": 20, "p_ring": 140, "p_state": 36, "p_words": 12, "p_images": 72}
+# Above the highest EWRAM symbol's end, 0x0203FBAC, and below the kept handler at 0x0203FBFC.
+RESIDENT_DATA_FLOOR = 0x0203FBB4
+# The follower's line when A is pressed facing it, by cartridge language: FD 02 is STR_VAR_1, the
+# lead's nickname; FE a line break [charmap.txt]. asm/resident/follower.s, p_text.
+FOLLOWER_TEXT = {"french": ("saute", "de joie !"), "english": ("jumps", "for joy!"),
+                 "spanish": ("salta", "de gozo!"), "italian": ("salta", "di gioia!"),
+                 "german": ("hüpft", "vor Freude"), "japanese": ("jumps", "for joy!")}
+FOLLOWER_TEXT_SIZE = 20
 R_BUTTON = 0x100
 # gHelpSystemToggleWithRButtonDisabled, French [RunHelpSystemCallback's literal, 0x0813F6FC].
 HELP_R_DISABLED = 0x0203F171
 
 
-def resident_blob(name, *, build=None, **params):
-    """-> (THUMB bytes, entry offset, p_original offset) for one of RESIDENT_HOOKS, on `build`."""
+# Several hooks resident at once: "turbo+noencounter", settings as "turbo.field=2". Laid out back to
+# back from RESIDENT_BASE, each one's p_original the next one's entry, so the installers see one hook.
+CHAIN = "+"
+CHAIN_ORDER = ("turbo", "turbo-lite", "noclip", "shiny", "ivs", "noencounter")   # turbo's passes last
+# Data a hook keeps outside its code, by parameter, and its size.
+CHAIN_DATA = {"turbo": {"frames": 20}, "turbo-lite": {"frames": 20}, "shiny": {"state": 36}, "ivs": {"words": 12}, "noclip": {"state": 24}}
+# The free word range under the kept handler: RESIDENT_DATA_FLOOR..0x0203FBFC.
+CHAIN_LOW = (RESIDENT_DATA_FLOOR, 0x0203FBFC)
+
+
+def chain_names(name):
+    """The hooks a --resident value names, in the order they run."""
+    names = name.split(CHAIN)
+    if len(names) == 1:
+        return names
+    unknown = [n for n in names if n not in CHAIN_ORDER]
+    if unknown:
+        runs_alone = [n for n in unknown if n in RESIDENT_HOOKS]
+        raise BufferScriptError(f"{', '.join(runs_alone)} runs alone" if runs_alone else
+                                f"unknown resident hook {unknown[0]!r}; have {sorted(RESIDENT_HOOKS)}")
+    if len(set(names)) != len(names):
+        raise BufferScriptError(f"{name} names a hook twice")
+    return sorted(names, key=CHAIN_ORDER.index)
+
+
+def _chain_blob(names, build, params):
+    """-> (THUMB bytes, entry offset, p_original offset, [(data address, size)]) for hooks run in turn."""
     from pokeldn.frlg.rom import native_script
     from pokeldn.frlg.rom.resident_stubs import STUBS
+    own = {n: {} for n in names}
+    for key, value in params.items():
+        hook, _, field = key.partition(".")
+        if hook not in own or not field:
+            raise BufferScriptError(f"{key}: a setting of a chain is HOOK.NAME, HOOK one of {names}")
+        own[hook][field] = value
+    drawing = [n for n in names if n in ("shiny", "ivs") or (n == "turbo" and own[n].get("overlay"))]
+    if len(drawing) > 1:
+        raise BufferScriptError(f"{' and '.join(drawing)} both draw in the screen's top-right corner")
+    sizes = [len(STUBS[n][0]) for n in names]
+    end = native_script.RESIDENT_BASE + sum(sizes)
+    if end > 0x02040000:
+        raise BufferScriptError(f"{CHAIN.join(names)} is {sum(sizes)} bytes; the resident area holds "
+                                f"{0x02040000 - native_script.RESIDENT_BASE}")
+    free = [list(CHAIN_LOW), [end, 0x02040000]]
+    data = []
+    for n in names:
+        for field, size in CHAIN_DATA.get(n, {}).items():
+            if field in own[n]:
+                continue
+            region = next((r for r in free if r[1] - r[0] >= size), None)
+            if region is None:
+                raise BufferScriptError(f"{CHAIN.join(names)} leaves no room for {n}'s {field}")
+            own[n][field] = region[0]
+            data.append((region[0], size))
+            region[0] += size
+    blob, at, links = bytearray(), 0, []
+    for n, size in zip(names, sizes):
+        part, entry, original = resident_blob(n, build=build, **own[n])
+        links.append((at + entry, at + original))
+        blob += part
+        at += size
+    for (_, original), (entry, _) in zip(links, links[1:]):
+        blob[original:original + 4] = (native_script.RESIDENT_BASE + entry + 1).to_bytes(4, "little")
+    return bytes(blob), links[0][0], links[-1][1], data
+
+
+def resident_blob(name, *, build=None, **params):
+    """-> (THUMB bytes, entry offset, p_original offset) for one of RESIDENT_HOOKS, or a chain of
+    them (CHAIN), on `build`."""
+    from pokeldn.frlg.rom import native_script
+    from pokeldn.frlg.rom.resident_stubs import STUBS
+    names = chain_names(name)
+    if len(names) > 1:
+        return _chain_blob(names, build, params)[:3]
     if name not in RESIDENT_HOOKS:
         raise BufferScriptError(f"unknown resident hook {name!r}; have {sorted(RESIDENT_HOOKS)}")
     entry, defaults = RESIDENT_HOOKS[name]
@@ -2140,19 +2238,69 @@ def resident_blob(name, *, build=None, **params):
     unknown = set(params) - set(defaults)
     if unknown:
         raise BufferScriptError(f"{name} takes {sorted(defaults)}, not {sorted(unknown)}")
+    build = builds.resolve(build)
+    defaults = {key: build.ewram.get("party" if key == "mon" else key, value)
+                for key, value in defaults.items()}
     params = {**defaults, **params}
-    if name == "turbo" and params["hold"] & R_BUTTON and "help" not in explicit:
-        params["help"] = HELP_R_DISABLED  # held R would open the Help System
+    if name in ("turbo", "turbo-lite") and params["hold"] & R_BUTTON and "help" not in explicit:
+        params["help"] = build.ewram.get("help", HELP_R_DISABLED)  # held R would open the Help System
     if name == "shiny" and "state" in explicit and "overlay" not in explicit:
         params["overlay"] = params["state"] + 24  # the word the hook shows
+    if name == "follower" and params["deoxys"] is None:
+        # the version's form: Attack on FireRed, Defense on LeafGreen [asm/resident/follower.s]
+        firered = builds.resolve(build).version == "firered"
+        params["deoxys"] = 0x00FDFCFD if firered else 0x00FDFDFC
     if name == "ivs" and "words" in explicit:
         params["overlay"], params["overlay2"] = params["words"], params["words"] + 4
     symbols = STUBS[name][2]
     literals = {key: value for key, value in builds.resolve(build).hook_literals().items()
-                if f"p_{key}" in symbols}
+                if f"p_{key}" in symbols and key not in params}
     words = native_script.resident_words(name, **params, **literals)
-    return (b"".join(w.to_bytes(4, "little") for w in words), symbols[entry],
-            symbols["p_original"])
+    blob = b"".join(w.to_bytes(4, "little") for w in words)
+    if build.language == "japanese" and name in ("turbo", "turbo-lite"):
+        at = symbols["printer_stride"]
+        blob = blob[:at] + b"\x20" + blob[at + 1:]
+    if name == "follower":
+        from pokeldn.frlg.text import charmap
+        first, second = FOLLOWER_TEXT[builds.resolve(build).language]
+        text = (b"\xFD\x02" + charmap.encode(" " + first) + b"\xFE" + charmap.encode(second)
+                + b"\xFF").ljust(FOLLOWER_TEXT_SIZE, b"\x00")
+        at = symbols["p_text"]
+        blob = blob[:at] + text[:FOLLOWER_TEXT_SIZE] + blob[at + FOLLOWER_TEXT_SIZE:]
+        if len(text) > FOLLOWER_TEXT_SIZE:
+            raise BufferScriptError(f"the follower's line is {len(text)} bytes, past {FOLLOWER_TEXT_SIZE}")
+    return blob, symbols[entry], symbols["p_original"]
+
+
+def _check_resident_layout(name, blob, dest):
+    """Refuse a hook outside 0x0203FC00..0x02040000, or whose data overlaps its code, the kept
+    handler below it, a claimed symbol, or another hook's data in a chain."""
+    from pokeldn.frlg.rom import native_script
+    from pokeldn.frlg.rom.resident_stubs import STUBS
+    if dest % 4 or not (0x0203FC00 <= dest and dest + len(blob) <= 0x02040000):
+        raise BufferScriptError(
+            f"0x{dest:08X} is not word-aligned space inside 0x0203FC00..0x02040000, the only EWRAM "
+            "no symbol claims")
+    names = chain_names(name)
+    if len(names) > 1 and dest != native_script.RESIDENT_BASE:
+        raise BufferScriptError(f"a chain links its hooks at 0x{native_script.RESIDENT_BASE:08X}")
+    taken, at = [], 0
+    for n in names:
+        part = blob[at:at + len(STUBS[n][0])]
+        for data, size in RESIDENT_DATA.items():  # the hook's data lies outside its code
+            where = STUBS[n][2].get(data)
+            address = int.from_bytes(part[where:where + 4], "little") if where is not None else 0
+            if not address:
+                continue
+            size = CHAIN_DATA.get(n, {}).get(data[2:], size) if len(names) > 1 else size
+            if (dest - 4 < address + size and address < dest + len(blob)
+                    or address + size > 0x02040000 or address < RESIDENT_DATA_FLOOR
+                    or any(a < address + size and address < a + s for a, s in taken)):
+                raise BufferScriptError(
+                    f"{name} is {len(blob)} bytes from 0x{dest:08X} and runs into its {data[2:]} "
+                    f"at 0x{address:08X}, or that leaves the unclaimed EWRAM")
+            taken.append((address, size))
+        at += len(part)
 
 
 def build_install_resident(name, *, dest=None, table=None, build=None, **params):
@@ -2166,21 +2314,9 @@ def build_install_resident(name, *, dest=None, table=None, build=None, **params)
     if len(code) + len(blob) > MAX_BUFFER_SCRIPT_SIZE:
         raise BufferScriptError(
             f"{name} is {len(blob)} bytes; with the installer that is past the "
-            f"{MAX_BUFFER_SCRIPT_SIZE}-byte receive buffer")
-    if dest % 4 or not (0x0203FC00 <= dest and dest + len(blob) <= 0x02040000):
-        raise BufferScriptError(
-            f"0x{dest:08X} is not word-aligned space inside 0x0203FC00..0x02040000, the only EWRAM "
-            "no symbol claims")
-
-    from pokeldn.frlg.rom.resident_stubs import STUBS
-    for data, size in RESIDENT_DATA.items():  # the hook's data lies past its code
-        at = STUBS[name][2].get(data)
-        address = int.from_bytes(blob[at:at + 4], "little") if at is not None else 0
-        if address and (dest < address + size and address < dest + len(blob)
-                        or address + size > 0x02040000):
-            raise BufferScriptError(
-                f"{name} is {len(blob)} bytes from 0x{dest:08X} and runs into its {data[2:]} "
-                f"at 0x{address:08X}, or that runs past EWRAM")
+            f"{MAX_BUFFER_SCRIPT_SIZE}-byte receive buffer. save-write --resident {name} keeps it "
+            "in the save and installs it in one session")
+    _check_resident_layout(name, blob, dest)
 
     def put(at, value):
         code[at:at + 4] = (int(value) & 0xFFFFFFFF).to_bytes(4, "little")
@@ -2193,29 +2329,49 @@ def build_install_resident(name, *, dest=None, table=None, build=None, **params)
     return bytes(code) + blob
 
 
-# A resident hook kept in the save: save-head, install-resident image, checksum, in filler_B20, run
-# by MOM's loader [asm/resident/save-head.s, docs/frlg_rom.md].
-RESIDENT_SAVE_MAGIC = 0x53524B50  # "PKRS"; the older "PKLD" loader refuses it
-RESIDENT_SAVE_STAGING = 0x0201C400      # gDecompressionBuffer + 0x400, above the staged loader
-RESIDENT_SAVE_SIZE = 0x400              # filler_B20, all of which the loader copies
+# A resident hook kept in the save: header, hook and sum in filler_B20, installed in place by
+# install-kept, sent after the save-write in one session and run by MOM's RAM script after a boot
+# [asm/install-kept.s, docs/frlg_rom.md].
+RESIDENT_SAVE_MAGIC = 0x32524B50  # "PKR2"; the older loaders want "PKLD" or "PKRS"
+RESIDENT_SAVE_SIZE = 0x400              # filler_B20
+RESIDENT_SAVE_HEADER = 16
+INSTALL_KEPT_THUMB_ENTRY = 8            # MOM's entry: everything before it is the ARM one
+INSTALL_REFUSED = 0xBAD0BAD0            # install-resident's and install-kept's "nothing installed"
 
 
 def build_resident_save_blob(name, *, build=None, **params):
-    """-> the bytes save-write puts at SaveBlock2 + 0xB20 for MOM's loader to install `name`."""
-    from pokeldn.frlg.rom.resident_stubs import STUBS
-    head, _digest, symbols = STUBS["save-head"]
-    if symbols["p_image"] != len(head):
-        raise BufferScriptError("save-head must end at its image")
-    blob = bytearray(head) + build_install_resident(name, build=build, **params)
-    blob += bytes(-len(blob) % 4)
-    blob[symbols["p_length"]:symbols["p_length"] + 4] = len(blob).to_bytes(4, "little")
-    checksum = sum(int.from_bytes(blob[i:i + 4], "little") for i in range(0, len(blob), 4))
-    blob += (checksum & 0xFFFFFFFF).to_bytes(4, "little")
-    if len(blob) > MAX_SAVE_WRITE_BYTES:
+    """-> the bytes save-write puts at SaveBlock2 + 0xB20 for install-kept to install `name`."""
+    from pokeldn.frlg.rom import native_script
+    blob, entry, original = resident_blob(name, build=build, **params)
+    _check_resident_layout(name, blob, native_script.RESIDENT_BASE)
+    head = (RESIDENT_SAVE_MAGIC.to_bytes(4, "little") + len(blob).to_bytes(4, "little")
+            + native_script.RESIDENT_BASE.to_bytes(4, "little")
+            + entry.to_bytes(2, "little") + original.to_bytes(2, "little"))
+    data = head + blob
+    checksum = sum(int.from_bytes(data[i:i + 4], "little") for i in range(0, len(data), 4))
+    data += (checksum & 0xFFFFFFFF).to_bytes(4, "little")
+    if len(data) > RESIDENT_SAVE_SIZE:
         raise BufferScriptError(
-            f"{name} in the save is {len(blob)} bytes; one save-write carries "
-            f"{MAX_SAVE_WRITE_BYTES}")
-    return bytes(blob)
+            f"{name} in the save is {len(data)} bytes; filler_B20 holds {RESIDENT_SAVE_SIZE}")
+    return data
+
+
+def build_install_kept(build=None):
+    """The install-kept payload for `build`: its last two words are &gSaveBlock2Ptr and
+    &gIntrTable[4]."""
+    build = builds.resolve(build)
+    code = bytearray(payload(INSTALL_KEPT))
+    code[-8:] = build.sb2ptr.to_bytes(4, "little") + build.intr_vblank.to_bytes(4, "little")
+    return bytes(code)
+
+
+def build_resident_save_session(name, *, build=None, **params):
+    """-> (the save-writes, install-kept): one session that keeps `name` in the save and installs it
+    from there. A blob past one save-write takes two, run in turn before install-kept."""
+    data = build_resident_save_blob(name, build=build, **params)
+    writes = tuple(build_save_write(data[at:at + MAX_SAVE_WRITE_BYTES], SAVE_BLOCK_2, 0xB20 + at)
+                   for at in range(0, len(data), MAX_SAVE_WRITE_BYTES))
+    return writes, build_install_kept(build)
 
 
 def build_flash_patch(sector_id, patch_offset, data, *, scratch=FLASH_WRITE_SCRATCH,
@@ -2232,7 +2388,7 @@ def build_flash_patch(sector_id, patch_offset, data, *, scratch=FLASH_WRITE_SCRA
             "flash-patch edits a live save sector in place. Pass unsafe=True to mean it.")
     if sector_id not in SECTOR_CHUNK_SIZES:
         raise BufferScriptError(f"sector id {sector_id} is not one a save slot carries")
-    chunk = sector_chunk_size(sector_id)
+    chunk = sector_chunk_size(sector_id, build)
     if not 1 <= len(data) <= FLASH_PATCH_MAX_BYTES:
         raise BufferScriptError(
             f"a patch carries 1..{FLASH_PATCH_MAX_BYTES} bytes, got {len(data)}")
@@ -2258,10 +2414,10 @@ def build_flash_patch(sector_id, patch_offset, data, *, scratch=FLASH_WRITE_SCRA
 
 def flash_write_source(fill_base=0x46570000, fill_step=1, words=FLASH_WRITE_WORDS,
                        footer=False, sector_id=0, counter=0, signature=SECTOR_SIGNATURE,
-                       position=None):
+                       position=None, build=None):
     """-> the exact bytes build_flash_write makes the console compose, for verifying the sector."""
     if footer and words == FLASH_WRITE_WORDS:
-        words = (sector_chunk_size(sector_id) if position is None else SECTOR_CHUNK_MIN) // 4
+        words = (sector_chunk_size(sector_id, build) if position is None else SECTOR_CHUNK_MIN) // 4
     pattern = b"".join(((int(fill_base) + i * int(fill_step)) & 0xFFFFFFFF).to_bytes(4, "little")
                        for i in range(int(words)))
     if not footer:
@@ -2270,7 +2426,7 @@ def flash_write_source(fill_base=0x46570000, fill_step=1, words=FLASH_WRITE_WORD
     out[0:len(pattern)] = pattern
     out[SECTOR_FOOTER_AT:SECTOR_FOOTER_AT + 2] = (int(sector_id) & 0xFFFF).to_bytes(2, "little")
     out[SECTOR_FOOTER_AT + 2:SECTOR_FOOTER_AT + 4] = sector_checksum(
-        out, sector_chunk_size(sector_id)).to_bytes(2, "little")
+        out, sector_chunk_size(sector_id, build)).to_bytes(2, "little")
     out[SECTOR_FOOTER_AT + 4:SECTOR_FOOTER_AT + 8] = (int(signature) & 0xFFFFFFFF).to_bytes(4, "little")
     out[SECTOR_FOOTER_AT + 8:SECTOR_FOOTER_AT + 12] = (int(counter) & 0xFFFFFFFF).to_bytes(4, "little")
     return bytes(out)
@@ -2434,6 +2590,7 @@ PATCHED_SPANS = {
                    FLASH_WRITE_THUNK_OFFSET + 4 - FLASH_WRITE_SECTOR_OFFSET),),
     SLOOP_SVC: ((SLOOP_FLAGS_OFFSET, SLOOP_DATA_OFFSET + SLOOP_DATA_MAX - SLOOP_FLAGS_OFFSET),),
     INSTALL_RESIDENT: ((INSTALL_DEST_OFFSET, INSTALL_BLOB_OFFSET + 4 - INSTALL_DEST_OFFSET),),
+    INSTALL_KEPT: ((len(PAYLOADS[INSTALL_KEPT][0]) - 8, 8),),
 }
 
 
@@ -2441,8 +2598,8 @@ def describe(code):
     """Name a payload from its bytes, operands and all."""
     code = bytes(code)
     for name, (committed, _) in PAYLOADS.items():
-        # save-write and install-resident vary in length.
-        longer_is_fine = name in (SAVE_WRITE, INSTALL_RESIDENT)
+        # save-write and install-resident vary in length; a received image is the whole buffer.
+        longer_is_fine = name in (SAVE_WRITE, INSTALL_RESIDENT, INSTALL_KEPT)
         if len(code) != len(committed) and not (longer_is_fine and len(code) > len(committed)):
             continue
         image, reference = bytearray(code[:len(committed)]), bytearray(committed)
@@ -2586,6 +2743,11 @@ def create_mon_copy_model(source):
     return _CREATE_MON_COPY_MODEL + (int(source) & 0xFFFFFFFF).to_bytes(4, "little")
 
 
+# Unicorn's default translation buffer is 1 GiB per instance; Windows commits it up front, and a few
+# instances awaiting collection exhaust the commit limit (an access violation inside uc_mem_map).
+TCG_BUFFER = 32 << 20
+
+
 class _Machine:
     """The console's memory across a whole CLI_RUN_BUFFER_SCRIPT: the image is copied once
     [decomp:src/mystery_gift_client.c:239] and then called every frame until it returns 1. `call`
@@ -2604,6 +2766,7 @@ class _Machine:
 
         validate(code)
         uc = unicorn.Uc(unicorn.UC_ARCH_ARM, unicorn.UC_MODE_ARM | unicorn.UC_MODE_LITTLE_ENDIAN)
+        uc.ctl_set_tcg_buffer_size(TCG_BUFFER)
         uc.mem_map(EWRAM_BASE, EWRAM_SIZE)
         uc.mem_map(IWRAM_BASE, IWRAM_SIZE)
         uc.mem_map(ROM_BASE, ROM_SIZE)
@@ -2616,18 +2779,23 @@ class _Machine:
         uc.mem_map(_RETURN_ADDRESS, 0x1000)
         # The chip is 128 KiB, erased; the CPU sees a 64 KiB window one bank at a time. swi 0x48
         # addresses the chip linearly, a guest load the window, so both are modelled.
-        self.uc = uc  # _show_bank needs it before the rest
+        # The window is I/O: a load reads the selected bank, a store is a command and lands nowhere.
+        self.uc = uc
         self.flash = bytearray(b"\xFF" * FLASH_SIZE)
         self.flash_bank = 0
-        uc.mem_map(FLASH_WINDOW_BASE, FLASH_WINDOW_SIZE)
+        uc.mmio_map(FLASH_WINDOW_BASE, FLASH_WINDOW_SIZE, self._on_flash_load, None,
+                    self._on_flash_store, None)
         self.flash_writes = []          # (number, sector, source, accepted, why)
         self.flash_reads = []           # (sector, offset, dest, length)
         self.bkpts = []                 # the immediate of each bkpt executed
-        uc.hook_add(unicorn.UC_HOOK_MEM_WRITE, self._on_flash_store,
-                    begin=FLASH_WINDOW_BASE, end=FLASH_WINDOW_BASE + FLASH_WINDOW_SIZE - 1)
         uc.hook_add(unicorn.UC_HOOK_INTR, self._on_swi)
         entry = build.read_flash
         uc.hook_add(unicorn.UC_HOOK_CODE, self._on_readflash, begin=entry, end=entry)
+        # On the stand-in ROM LoadGameSave is `bx lr`; the hook sets r0 before it runs.
+        self.loads = []                 # LoadGameSave: (result, the loaded copy's counter)
+        self._load_game_save = build.load_game_save
+        uc.hook_add(unicorn.UC_HOOK_CODE, self._on_load_game_save,
+                    begin=build.load_game_save, end=build.load_game_save)
 
         def word(offset, value):
             uc.mem_write(_CLIENT_ADDRESS + offset, (value & 0xFFFFFFFF).to_bytes(4, "little"))
@@ -2652,29 +2820,32 @@ class _Machine:
             uc.mem_write(_SAV2_ADDRESS, sav2)
         if sav1:
             uc.mem_write(_SAV1_ADDRESS, sav1)
+        # As on the console: the save block pointers, and VBlankIntr in gIntrTable[4].
+        uc.mem_write(build.sb2ptr, _SAV2_ADDRESS.to_bytes(4, "little"))
+        uc.mem_write(build.sb1ptr, _SAV1_ADDRESS.to_bytes(4, "little"))
+        uc.mem_write(build.intr_vblank, (build.vblank_intr | 1).to_bytes(4, "little"))
         for address, blob in (memory or {}).items():
             if address == FLASH_BASE:
                 self.flash[:len(blob)] = bytes(blob)     # the chip, not the aperture
             else:
                 uc.mem_write(address, bytes(blob))
-        self._show_bank()
+        if rom is None and not (memory or {}).get(self._load_game_save):
+            uc.mem_write(self._load_game_save, b"\x70\x47")     # bx lr on the blank stand-in ROM
 
         self.uc = uc
         self.armed_size = send_size
         self._sav2_len, self._sav1_len = len(sav2), len(sav1)
         self.calls = 0
 
-    def _show_bank(self):
-        """Put the selected bank in the aperture, undoing the command bytes a bank select stores."""
-        at = self.flash_bank * FLASH_WINDOW_SIZE
-        self.uc.mem_write(FLASH_WINDOW_BASE, bytes(self.flash[at:at + FLASH_WINDOW_SIZE]))
+    def _on_flash_load(self, uc, offset, size, user_data=None):
+        at = self.flash_bank * FLASH_WINDOW_SIZE + offset
+        return int.from_bytes(self.flash[at:at + size], "little")
 
-    def _on_flash_store(self, uc, access, address, size, value, user_data=None):
+    def _on_flash_store(self, uc, offset, size, value, user_data=None):
         """A store into the aperture is a command. Only the bank select is modelled
         [decomp:src/agb_flash.c SwitchFlashBank]."""
-        if address == FLASH_WINDOW_BASE and size == 1 and value in (0, 1):
+        if offset == 0 and size == 1 and value in (0, 1):
             self.flash_bank = value
-        self._show_bank()
 
     def _on_readflash(self, uc, address, size, user_data=None):
         """Model ReadFlash: copy `size` bytes of sector `sectorNum` into `dest`. Its REG_WAITCNT
@@ -2691,6 +2862,36 @@ class _Machine:
         cpsr = uc.reg_read(arm.UC_ARM_REG_CPSR)
         uc.reg_write(arm.UC_ARM_REG_CPSR, cpsr | (1 << 5) if link & 1 else cpsr & ~(1 << 5))
         uc.reg_write(arm.UC_ARM_REG_PC, link & ~1)
+
+    def _on_load_game_save(self, uc, address, size, user_data=None):
+        """Model LoadGameSave(SAVE_NORMAL): SAVE_STATUS_OK (1) when the chip holds a whole copy, the
+        newest taken as GetSaveValidStatus takes it, else SAVE_STATUS_CORRUPT (2)
+        [decomp:src/save.c:803]."""
+        from pokeldn.frlg.save import sav
+        arm = self._arm
+        summary = sav.describe(bytes(self.flash))
+        result = 1 if summary.sound else 2
+        self.loads.append((result, summary.newest.counter if summary.sound else None))
+        uc.reg_write(arm.UC_ARM_REG_R0, result)
+
+    def load(self, code, *, param, send_size=4, send_ident=0):
+        """The session's next CLI_RUN_BUFFER_SCRIPT: the 1 KiB receive buffer over
+        gDecompressionBuffer [mystery_gift_client.c:239] and the send as CLI_LOAD_TOSS_RESPONSE
+        armed it; everything else stays as the last payload left it."""
+        uc = self.uc
+
+        def word(offset, value):
+            uc.mem_write(_CLIENT_ADDRESS + offset, (value & 0xFFFFFFFF).to_bytes(4, "little"))
+
+        code = bytes(code)
+        uc.mem_write(GDECOMPRESSION_BUFFER, code)
+        uc.mem_write(_RECV_BUFFER_ADDRESS, code)
+        word(CLIENT_PARAM, int(param))
+        word(CLIENT_LINK + LINK_SEND_BUFFER, _SEND_BUFFER_ADDRESS)
+        uc.mem_write(_CLIENT_ADDRESS + CLIENT_LINK + LINK_SEND_SIZE, (send_size & 0xFFFF).to_bytes(2, "little"))
+        uc.mem_write(_CLIENT_ADDRESS + CLIENT_LINK + LINK_SEND_IDENT, (send_ident & 0xFFFF).to_bytes(2, "little"))
+        uc.mem_write(_SEND_BUFFER_ADDRESS, int(param).to_bytes(4, "little"))
+        self.armed_size = send_size
 
     def _on_swi(self, uc, intno, user_data=None):
         """Model the Sloop sector syscalls, as measured on the FR emulator: swi 0x48 copies 0x1000
@@ -2727,7 +2928,6 @@ class _Machine:
             self.flash[offset:offset + FLASH_SECTOR_SIZE] = payload_bytes
             if number == SWI_REPLACE_SECTOR:
                 self.flash[offset + SECTOR_SIGNATURE_OFFSET_IN_SECTOR] = 0xFF
-            self._show_bank()
         elif number == SWI_REPLACE_SECTOR:
             raise BufferScriptError(
                 f"swi 0x56 with a rejected destination aborts: {why}. On the console that is the "
@@ -2793,6 +2993,12 @@ class _Machine:
             client=client,
             pending_send=pending,
         )
+
+
+def session_machine(code, **kwargs):
+    """A console whose memory and flash outlive one payload, as within one Mystery Gift session:
+    call() runs a frame, load() hands it the session's next payload. Keywords as emulate()."""
+    return _Machine(code, **kwargs)
 
 
 def emulate(code, *, param=0, sav2=b"", sav1=b"", memory=None, send_size=4,

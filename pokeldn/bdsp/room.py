@@ -261,8 +261,8 @@ TRADE_POKE_CHECK_OK = 0x46        # NetDataTradePokeCheckOkData
 TRADE_READY_OK = 0x21             # NetDataTradeReadyOkData: past this the console writes its save
 TRADE_TRANER = 0x24               # NetDataTradeTranerData
 TRADE_POKE = 0x13                 # NetTradePokeData: a whole Pokemon, 328 bytes
-RETURN_SELECT = 0x45              # NetDataReturnSelectData: back in the select window after a
-                                  # trade, once a second; answering it changes nothing
+RETURN_SELECT = 0x45              # NetDataReturnSelectData: a round reset; {0} answers a {1}
+                                  # or a 0x21 landing in the select window (docs/bdsp_trade.md)
 
 
 def parse_trade_traner(body):
@@ -276,6 +276,14 @@ def parse_trade_traner(body):
             "trainer_id": trainer_id32 & 0xFFFF, "secret_id": trainer_id32 >> 16,
             "casset_version": casset, "lang_id": lang,
             "slack": bytes(body[16:26]).hex()}
+
+
+def traner_trainer(body):
+    """-> the trainer a `TradeTranerData` names, as pokeldn.receiver_gift takes it: id pair, version, language
+    and name. It carries no gender (docs/bdsp_trade.md)."""
+    t = parse_trade_traner(body)
+    return {"ot": t["name"], "tid": t["trainer_id"], "sid": t["secret_id"], "version": t["casset_version"],
+            "language": t["lang_id"]}
 
 
 TRADE_TRANER_SIZE = 32
@@ -338,6 +346,13 @@ def mirror_trade_state(their_state):
     if their_state >= TRADE_STATE_WAIT_POKE:
         return TRADE_STATE_SEND_READYOK
     return their_state
+
+
+def repeats_trade_state(their_state):
+    """-> whether our security state is still re-said: the answer to a console's SEND_READYOK lands
+    in its WAIT_READYOK in either role, and a later repeat can land in its select window and cancel
+    the next round (docs/bdsp_trade.md, The completed trade)."""
+    return their_state is not None and their_state < TRADE_STATE_SEND_READYOK
 
 
 def build_trade_ready_ok(trade_state=TRADE_STATE_WAIT, is_trade_ok=0):

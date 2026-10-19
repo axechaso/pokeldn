@@ -67,6 +67,8 @@ class MysteryGiftDistribution:
     # Native ARM code, run by CLI_RUN_BUFFER_SCRIPT [buffer_script.py], and its expected answer
     # (mg_server.BUFFER_EXPECT_TRAINER_ID, a u32, or None for any answer).
     buffer_code: bytes | None = None
+    # Payloads run before buffer_code in the same session, their answers unread.
+    buffer_lead: tuple = ()
     buffer_expect: object | None = None
     # Set when the payload repoints the console's outgoing message: how many bytes
     # MG_LINKID_RESPONSE carries instead of 4.
@@ -83,6 +85,8 @@ class MysteryGiftDistribution:
     buffer_decode: str | None = None
     # rom-checksum only: the path of the ROM image its sums are compared with, per build.
     buffer_reference: str | None = None
+    # The game whose flags and variables the scripts name; mg_server.GAME_CONSOLES lists who takes it.
+    game: str = "frlg"
 
     def __post_init__(self):
         if self.buffer_code is not None:
@@ -102,9 +106,9 @@ class MysteryGiftDistribution:
             object.__setattr__(self, "news", bytes(self.news))
             if self.card is not None or self.ram_script is not None:
                 raise ValueError("a Wonder News distribution carries no card or RAM script")
-            if len(self.news) != wonder_news.WONDER_NEWS_SIZE:
+            if len(self.news) not in (wonder_news.WONDER_NEWS_SIZE, wonder_news.JAPANESE_WONDER_NEWS_SIZE):
                 raise ValueError(
-                    f"Wonder News must be {wonder_news.WONDER_NEWS_SIZE} bytes")
+                    f"Wonder News must be 224 or {wonder_news.WONDER_NEWS_SIZE} bytes")
             if not wonder_news.validate(self.news):
                 raise ValueError("news id 0 fails ValidateWonderNews")
             if (self.stamp is not None or self.trainer is not None
@@ -116,8 +120,8 @@ class MysteryGiftDistribution:
             raise ValueError("a Mystery Gift distribution needs a card and a RAM script")
         object.__setattr__(self, "card", bytes(self.card))
         object.__setattr__(self, "ram_script", bytes(self.ram_script))
-        if len(self.card) != WONDER_CARD_SIZE:
-            raise ValueError(f"Wonder Card must be {WONDER_CARD_SIZE} bytes")
+        if len(self.card) not in (WONDER_CARD_SIZE, 164):
+            raise ValueError(f"Wonder Card must be 164 or {WONDER_CARD_SIZE} bytes")
         extras = (self.stamp, self.activation_script,
                   self.install_activation_script)
         if any(value is not None for value in extras):

@@ -52,8 +52,8 @@ def test_profile_rejects_invalid_human_configuration():
         {"sid": None},
         {"gender": 2},
         {"gender": False},
-        {"version": "emerald"},
-        {"language": "japanese"},
+        {"version": "crystal"},
+        {"language": "korean"},
         {"has_national_dex": 1},
         {"has_completed_game": None},
     ]

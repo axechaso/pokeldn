@@ -18,9 +18,13 @@ from pokeldn.frlg.link import beacon
 VERSIONS = {
     "firered": linkplayer.VERSION_FIRE_RED,
     "leafgreen": linkplayer.VERSION_LEAF_GREEN,
+    "emerald": linkplayer.VERSION_EMERALD,     # docs/rse.md: prepared ahead of a Switch release
+    "ruby": linkplayer.VERSION_RUBY,
+    "sapphire": linkplayer.VERSION_SAPPHIRE,
 }
-# Japanese is absent: its kana table shares byte values with the accented Latin range in charmap.py.
+RSE_VERSIONS = ("emerald", "ruby", "sapphire")
 LANGUAGES = {
+    "japanese": linkplayer.LANGUAGE_JAPANESE,
     "english": linkplayer.LANGUAGE_ENGLISH,
     "french": linkplayer.LANGUAGE_FRENCH,
     "italian": linkplayer.LANGUAGE_ITALIAN,
@@ -48,11 +52,12 @@ class TrainerProfile:
     def __post_init__(self):
         if not isinstance(self.name, str):
             raise ValueError("trainer name must be a string")
-        encoded = charmap.encode(self.name)
-        if not self.name or charmap.decode(encoded) != self.name:
+        encoded = charmap.encode(self.name, language=self.language)
+        if not self.name or charmap.decode(encoded, language=self.language) != self.name:
             raise ValueError("trainer name contains unsupported Gen III characters")
-        if len(encoded) > 7:
-            raise ValueError("trainer name must encode to at most 7 Gen III characters")
+        limit = 5 if self.language == "japanese" else 7
+        if len(encoded) > limit:
+            raise ValueError(f"trainer name must encode to at most {limit} Gen III characters")
         if (type(self.tid) is not int or type(self.sid) is not int
                 or not 0 <= self.tid <= 0xFFFF or not 0 <= self.sid <= 0xFFFF):
             raise ValueError("TID and SID must each fit in 16 bits")
@@ -114,11 +119,20 @@ class TrainerProfile:
         return ni.build_game_data(
             VERSIONS[self.version], self.tid, self.name,
             language=LANGUAGES[self.language], activity=activity,
-            started=started)
+            started=started, **self.national_flags)
+
+    @property
+    def national_flags(self):
+        """The advertised national flags: set for Ruby, Sapphire and Emerald only, so the FireRed and
+        LeafGreen bytes stay the ones retail consoles accepted (docs/rse.md, Joining a host)."""
+        if self.version not in RSE_VERSIONS:
+            return dict(national_link=False, national_dex=False, game_clear=False)
+        return dict(national_link=self.has_completed_game, national_dex=self.has_national_dex,
+                    game_clear=self.has_completed_game)
 
 
 DEFAULT_TRAINER = TrainerProfile(
-    name="PkCamp", tid=0x8822, sid=0x47ED, gender=0,
+    name="POKELDN", tid=0x8822, sid=0x47ED, gender=0,
     version="leafgreen", language="english",
     has_national_dex=True, has_completed_game=True)
 
@@ -135,6 +149,7 @@ class TradePlan:
     anim_delay: int | None = None
     player_ids_repeat_frames: int | None = None
     link_player_idle_frames: int | None = None
+    save_rounds: int | None = None
     trust_pia: bool = False
 
     def __post_init__(self):
@@ -159,6 +174,9 @@ class TradePlan:
                 and (type(self.link_player_idle_frames) is not int
                      or not 0 <= self.link_player_idle_frames <= 600)):
             raise ValueError("link_player_idle_frames must be between 0 and 600")
+        if (self.save_rounds is not None
+                and (type(self.save_rounds) is not int or not 1 <= self.save_rounds <= 12)):
+            raise ValueError("save_rounds must be between 1 and 12")
         if self.offered_slots is not None:
             if len(self.offered_slots) != self.trades:
                 raise ValueError("offered_slots must contain one slot per trade")
@@ -455,12 +473,12 @@ class BufferScriptPayload:
             name, params = self.write_resident
             object.__setattr__(self, "write_data",
                                buffer_script.build_resident_save_blob(name, **dict(params)))
-        if self.script == buffer_script.SAVE_WRITE:
+        if self.script == buffer_script.SAVE_WRITE and self.write_resident is None:
             if not self.write_data:
                 raise ValueError(
                     f"{buffer_script.SAVE_WRITE} needs the bytes to write (--write-text/--write-hex)")
-            object.__setattr__(self, "dump_size", len(self.write_data))
-        elif self.write_data is not None:
+            object.__setattr__(self, "dump_size", len(self._write_chunks()[-1][1]))
+        elif self.write_data is not None and self.write_resident is None:
             raise ValueError(
                 f"bytes to write are only meaningful with {buffer_script.SAVE_WRITE}")
         if self.script == buffer_script.FLASH_PATCH:
@@ -584,8 +602,9 @@ class BufferScriptPayload:
 
     @property
     def is_dump(self):
-        """Anything whose answer comes back as bytes on ident 19 rather than the 4-byte channel."""
-        return self.script in buffer_script.DUMP_SCRIPTS
+        """Anything whose answer comes back as bytes on ident 19 rather than the 4-byte channel. A
+        resident hook's save-write ends in install-kept, which answers on the channel."""
+        return self.script in buffer_script.DUMP_SCRIPTS and self.write_resident is None
 
     @property
     def spec(self):
@@ -641,17 +660,19 @@ class BufferScriptPayload:
                 fixed_personality=self.create_mon_personality if has_fixed else 0,
                 ot_id_type=self.create_mon_ot_id_type, fixed_ot_id=self.create_mon_ot_id,
                 destination=self.create_mon_destination,
+                party_base=build.ewram.get("party"), party_count=build.ewram.get("party_count"),
                 party_append=(buffer_script.PARTY_APPEND_DRY_RUN
                               if self.create_mon_append_dry_run
                               else buffer_script.PARTY_APPEND_WRITE if self.create_mon_append
                               else buffer_script.PARTY_APPEND_NO))
+        if self.script == buffer_script.SAVE_WRITE and self.write_resident is not None:
+            return buffer_script.build_install_kept(build)
+        if self.script == buffer_script.INSTALL_KEPT:
+            return buffer_script.build_install_kept(build)
         if self.script == buffer_script.SAVE_WRITE:
-            data = self.write_data
-            if self.write_resident is not None:
-                name, params = self.write_resident
-                data = buffer_script.build_resident_save_blob(name, build=build, **dict(params))
+            offset, data = self._write_chunks()[-1]
             return buffer_script.build_save_write(
-                data, self.dump_block, self.dump_offset, unsafe=self.write_unsafe)
+                data, self.dump_block, offset, unsafe=self.write_unsafe)
         if self.script == buffer_script.INSTALL_RESIDENT:
             return buffer_script.build_install_resident(
                 self.resident_name, build=build, **dict(self.resident_params))
@@ -677,9 +698,28 @@ class BufferScriptPayload:
                 build=build)
         return buffer_script.payload(self.script)
 
+    def _write_chunks(self):
+        """save-write's data as (offset, bytes) pieces of one payload each, in order."""
+        size = buffer_script.MAX_SAVE_WRITE_BYTES
+        return [(self.dump_offset + at, self.write_data[at:at + size])
+                for at in range(0, len(self.write_data), size)]
+
+    def build_lead(self, build=None):
+        """The payloads run before build_code's in the same session: a resident hook's
+        save-writes, or every piece but the last of a write past one payload."""
+        if self.write_resident is not None:
+            name, params = self.write_resident
+            return buffer_script.build_resident_save_session(name, build=build, **dict(params))[0]
+        if self.script == buffer_script.SAVE_WRITE:
+            return tuple(buffer_script.build_save_write(data, self.dump_block, offset,
+                                                        unsafe=self.write_unsafe)
+                         for offset, data in self._write_chunks()[:-1])
+        return ()
+
     def build_distribution(self, build=None):
         return MysteryGiftDistribution(
-            None, None, buffer_code=self.build_code(build), buffer_expect=self.expect,
+            None, None, buffer_code=self.build_code(build), buffer_lead=self.build_lead(build),
+            buffer_expect=self.expect,
             buffer_dump_size=self.dump_size if self.is_dump else None,
             buffer_dump_blocks=self.dump_blocks,
             buffer_dump_address=(self.dump_address or
@@ -719,8 +759,8 @@ class WonderNewsPayload:
         return wonder_news.build_news(self.news, news_id=self.news_id)
 
     def build_distribution(self, build=None):
-        """Text only: the same bytes for every build."""
-        return MysteryGiftDistribution(None, None, news=self.build_news())
+        """Text only, encoded for the selected cartridge."""
+        return MysteryGiftDistribution(None, None, news=wonder_news.for_build(self.build_news(), build))
 
 
 def _mystery_gift_host_defaults():
@@ -757,10 +797,12 @@ class MysteryGiftRunConfig:
     def __post_init__(self):
         if not isinstance(self.profile, TrainerProfile):
             raise ValueError("profile must be a TrainerProfile")
-        if not isinstance(self.payload,
-                          (MysteryGiftPayload, WonderNewsPayload, BufferScriptPayload)):
-            raise ValueError(
-                "payload must be a MysteryGiftPayload, WonderNewsPayload or BufferScriptPayload")
+        from pokeldn.frlg.gift.file import FilePayload
+        from pokeldn.rse.gifts import EmeraldPayload
+        if not isinstance(self.payload, (MysteryGiftPayload, WonderNewsPayload, BufferScriptPayload,
+                                         FilePayload, EmeraldPayload)):
+            raise ValueError("payload must be a MysteryGiftPayload, WonderNewsPayload, "
+                             "BufferScriptPayload, FilePayload or EmeraldPayload")
         if not isinstance(self.ldn, LdnConfig):
             raise ValueError("ldn must be an LdnConfig")
         if not isinstance(self.role, HostOptions):
@@ -833,7 +875,8 @@ def plan_builds(payload, console_build=CONSOLE_BUILD_AUTO, version=None):
     if not usable:
         raise ValueError(next(iter(built.values())))
     if console_build == CONSOLE_BUILD_AUTO and len(usable) == len(built) \
-            and all(chosen == usable[0] for chosen in usable):
+            and all(chosen == usable[0] for chosen in usable) \
+            and not getattr(payload, "requires_build_selection", False):
         return BuildPlan(usable[0], None)
     if version is not None:
         for code in built:
@@ -891,6 +934,8 @@ def profile_from_overrides(*, ot=None, version=None, language=None, trainer_id=N
         changes["version"] = version
     if language is not None:
         changes["language"] = language
+        if language == "japanese" and ot is None:
+            changes["name"] = base.name[:5]
     if trainer_id is not None:
         tid, sid = trainer_id
         changes["tid"] = tid

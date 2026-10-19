@@ -23,18 +23,19 @@ if os.path.isdir(BUNDLED_LDN):
     sys.path.insert(0, BUNDLED_LDN)
 
 import trio
-import ldn
+from pokeldn.ldn import api as ldn, radios
 
 from pokeldn.host_support import open_output
 from pokeldn import pokemon as pokemon_service
 from pokeldn import za
-from pokeldn.za import streams
+from pokeldn.za import host as za_host, streams
 from pokeldn.za.host import (MSG_CANCEL, OFFER_PICK, OFFER_PREVIEW,  # noqa: F401
                              build_command, command_round)
 from pokeldn.ldn import crypto, host_pia, ldn_mitm, pia_connect, reliable
 from pokeldn.ldn.transport import board_radio, find_ap_phy
 from pokeldn.host_support import resolve_keys, needs_root
 from pokeldn.ldn import show_done
+from pokeldn.app import screen
 
 # Ours until the host names one in the footer of its first mesh-addressed packet.
 OUR_VAR = 0xC493
@@ -55,7 +56,7 @@ def cleanup_stale():
 
 
 def make_socket(ifname, our_ip=None):
-    from pokeldn.ldn import userspace_ip  # no kernel interface (ESP32 on macOS)
+    from pokeldn.ldn import userspace_ip  # no kernel interface on the ESP32
     if our_ip is None and (user := userspace_ip.udp_socket(ifname, za.PIA_PORT)) is not None:
         user.setblocking(False)
         return user
@@ -96,6 +97,9 @@ GAME_BROADCAST = 11
 MESH_DESTINATION = 0x0001
 BROADCAST_RECIPIENTS = 3
 ACK_MESSAGE_FLAGS = 0x40
+# A console that named us its next host leaves the network about 0.2 s after our answer.
+MIGRATED_QUIET = 1.0
+LEAVE_SENDS, LEAVE_REPEAT = 4, 0.5
 # The station index a Broadcast Reliable payload is prefixed with: joiner 1, host 2.
 BROADCAST_PREFIX_JOINER = bytes.fromhex("00000001")
 # Once the fourth trade step is out the trade is saved on both sides (docs/za.md).
@@ -124,23 +128,43 @@ class GameStreams:
         self.selections = 0
         self.last_selection = 0.0
         self.traded_at = None
+        self.trades = 0
+        self.arriving = False         # a trade's animation is running on the console
         self.ref = {}
         for name in za.reference.NAMES:
             if os.path.exists(os.path.join(args.game_dir, f"{name}.bin")):
                 self.ref[name] = za.reference.load(name, args.game_dir)
-        # The preview marked 1, the pick marked 0 (docs/za.md, Hosting).
+        for name, prefix in (("identity10", 0), ("identity11", streams.PREFIX_SIZE)):
+            if name in self.ref:
+                self.ref[name] = za.reference.named(self.ref[name], args.trainer_name, prefix)
+        if "identity11" in self.ref and "identity11b" in self.ref:
+            self.ref["identity11b"] = (self.ref["identity11b"][:streams.PREFIX_SIZE]
+                                       + za.reference.sync_message(self.ref["identity11"],
+                                                                   streams.PREFIX_SIZE))
+        # The preview marked 1, the pick marked 0 (docs/za.md, Hosting). One per queued trade; the
+        # last serves every later trade.
+        paths = args.trade_offer or []
+        self.offers = [Path(p).read_bytes() for p in ([paths] if isinstance(paths, str) else paths)]
         self.offer = self.preview = None
-        if args.trade_offer:
-            record = Path(args.trade_offer).read_bytes()
-            if getattr(args, "fresh_pid", False):
-                record = za.pokemon.fresh_offer(record)
-                plain = za.pokemon.parse_offer(record)[1]
-                print(f"[za] offering pid {plain[0x1C:0x20][::-1].hex()} ec {plain[:4][::-1].hex()}")
-            self.preview = record[:-1] + bytes([OFFER_PREVIEW])
-            self.offer = record[:-1] + bytes([OFFER_PICK])
+        self.received = None          # the console's pick, the record a trade delivers
+        if self.offers:
+            self._load_offer(self.offers[0], renew=getattr(args, "fresh_pid", False))
+            screen.offer("za", self.offer)
         self.seen = {}
         self.dst_var = 0
         self.src_var = 0
+
+    def _load_offer(self, record, renew=False):
+        if renew:
+            record = za.pokemon.fresh_offer(record)
+            plain = za.pokemon.parse_offer(record)[1]
+            print(f"[za] offering pid {plain[0x1C:0x20][::-1].hex()} ec {plain[:4][::-1].hex()}")
+        self.preview = record[:-1] + bytes([OFFER_PREVIEW])
+        self.offer = record[:-1] + bytes([OFFER_PICK])
+
+    @property
+    def queue_done(self):
+        return self.traded_at is not None and self.trades >= len(self.offers)
 
     def _emit(self, proto, seq, flags_a, inner):
         link = self.links[proto]
@@ -212,8 +236,35 @@ class GameStreams:
             print(f"[za] sent {item[1][:2].hex()} ({len(item[1])} bytes) at {elapsed:.2f}s")
             if item[1] == LAST_STEP:
                 self.traded_at = elapsed
+                self.trades += 1
+                # Written once the trade completes; a pick can still be withdrawn.
+                if getattr(self.args, "offer_out", None) and self.received is not None:
+                    pokemon_service.save_received(
+                        "za", pokemon_service.trade_path(self.args.offer_out, self.trades),
+                        self.received)
                 show_done()
-                print(f"[za] trade_complete at {elapsed:.2f}s")
+                screen.received("za", self.received)
+                self.arriving = True
+                print(f"[za] trade_complete at {elapsed:.2f}s (trade {self.trades})")
+                self._next_trade(elapsed)
+
+    def arrived(self):
+        if self.arriving:
+            self.arriving = False
+            screen.arrived()
+
+    def _next_trade(self, elapsed):
+        """Back on its box the console trades again under round 0; the next queued record is
+        previewed, as a station does when its cursor moves (docs/za.md)."""
+        self.round = 0
+        self.picked = False
+        if self.trades < len(self.offers):
+            self._load_offer(self.offers[self.trades])
+            screen.offer("za", self.offer)
+            self.scheduled.append((elapsed + za_host.PREVIEW_DELAY, self.preview))
+        elif self.offer and getattr(self.args, "renew_offer", False):
+            self._load_offer(self.offer, renew=True)
+            screen.offer("za", self.offer)
 
     def _answer_trade(self, inner, elapsed):
         """A console sends a preview each time its cursor moves, so the pick is keyed on the mark.
@@ -226,9 +277,11 @@ class GameStreams:
             self.picked = False
             print(f"[za] the console cancelled; round {self.round}")
         elif head == "0101":
+            # Its first after a trade: back on its box, the animation over (docs/za.md).
+            self.arrived()
             self.host_offers += 1
-            if getattr(self.args, "offer_out", None) and len(inner) == za.pokemon.OFFER_SIZE:
-                pokemon_service.save_received("za", self.args.offer_out, inner)
+            if inner[-1:] == bytes([OFFER_PICK]):
+                self.received = bytes(inner)
             if inner[-1:] == bytes([OFFER_PICK]) and self.offer and not self.picked:
                 self.picked = True
                 self.scheduled.append((elapsed + 1.5, self.offer))
@@ -272,6 +325,8 @@ class GameStreams:
 def build_parser():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--print-packets", action="store_true",
+                    help="print every packet in and out; the --capture file keeps them either way")
     ap.add_argument("--phy", default="auto")
     ap.add_argument("--ifname", default="ldnclient")
     ap.add_argument("--keys", default="~/.switch/prod.keys")
@@ -279,8 +334,9 @@ def build_parser():
     ap.add_argument("--dwell", type=float, default=1.0, help="seconds per channel in a scan")
     ap.add_argument("--seconds", type=float, default=600.0, help="the whole run")
     ap.add_argument("--hold", type=float, default=120.0, help="how long to hold one seat")
-    ap.add_argument("--after-trade", type=float, default=90.0,
-                    help="seconds to keep the seat after the fourth step, then exit the run")
+    ap.add_argument("--hold-after-trade", type=float, default=None, metavar="SECONDS",
+                    help="leave this long after the last queued trade's fourth step; by default the "
+                         "seat is kept until the player backs out or --hold ends, as every joiner does")
     ap.add_argument("--quiet-seat", type=float, default=0.0,
                     help="end a seat on which the console has sent nothing for this long")
     ap.add_argument("--connect-timeout", type=float, default=12.0,
@@ -298,6 +354,9 @@ def build_parser():
                     help="send the band's Net connection request once seated")
     ap.add_argument("--no-answer", action="store_true",
                     help="stay silent; the run then measures what the console sends on its own")
+    ap.add_argument("--withhold", action="append", default=[], choices=("rtt", "update-ack"),
+                    help="never send this answer, to find what a seat needs (docs/za.md, "
+                         "Unresolved); repeatable")
     ap.add_argument("--session-join", action="store_true",
                     help="send the Session join request once the console's Net is acknowledged")
     ap.add_argument("--join-repeat", type=int, default=30,
@@ -311,6 +370,8 @@ def build_parser():
     ap.add_argument("--player-name", default=" ",
                     help="the name the Session join's PlayerInfo carries; a reference joiner "
                          "sends one space")
+    ap.add_argument("--trainer-name", default="POKELDN",
+                    help="the player name our identity carries, the one the trade screen shows")
     ap.add_argument("--source-id", choices=("ldn", "raw"), default="ldn",
                     help="our own constant id in the Session join: the LDN permutation of our MAC, "
                          "which is the form the console publishes for itself, or the MAC as it is")
@@ -330,9 +391,11 @@ def build_parser():
     ap.add_argument("--fresh-pid", action="store_true",
                     help="send the offer under a new PID and encryption constant, shiny state kept, "
                          "so a save that took this record before takes it again")
-    ap.add_argument("--offer-out", help="write the host's offered PA9 here")
-    ap.add_argument("--trade-offer", default=None,
-                    help="a 354-byte offer message to send once the streams are open")
+    ap.add_argument("--offer-out", help="write the host's offered PA9 here; trade N > 1 writes "
+                                         "FILE-N")
+    ap.add_argument("--trade-offer", action="append", default=[],
+                    help="a 354-byte offer message to send once the streams are open. Repeatable, "
+                         "one per trade in the seat; the last serves every later trade")
     ap.add_argument("--selection-delay", type=float, default=0.5,
                     help="seconds after the identity before the selection record starts; a "
                          "reference joiner waits about 0.46 s")
@@ -377,6 +440,10 @@ async def run_session(args, keys, host_ip, host_mac, our_ip, our_mac, record):
     counts = {}
     seen = authed = sent = 0
     first_in = None
+    last_in = t0
+    migrated_at = None
+    destroyed = False
+    leave = None
     pktid_by_dst = {}
     state = [None]
     # A per-station counter, incremented per packet: a random nonce falls outside the peer's window
@@ -387,6 +454,8 @@ async def run_session(args, keys, host_ip, host_mac, our_ip, our_mac, record):
                       establishing=False, unicast=True, pktid=None, footer_var=None, note=""):
         """One Pia packet carrying N messages, tiled in the order written."""
         nonlocal sent
+        if "rtt" in args.withhold and items[0][0] == pia_connect.PROTO_RTT:
+            return
         body = b"".join(reliable.build_message(proto, payload, msgflags)
                         for proto, payload, msgflags in items)
         proto = items[0][0]
@@ -417,10 +486,11 @@ async def run_session(args, keys, host_ip, host_mac, our_ip, our_mac, record):
         sent += 1
         record(rec="tx", data=out.hex(), to=to, proto=proto, t=time.time(),
                dt=round(time.monotonic() - t0, 4))
-        print(f"[za] -> proto 0x{proto:02x} "
-              + "+".join(str(len(p)) for _, p, _ in items)
-              + f" bytes, dst={dst_var:#06x} src={src_var:#06x} flags={flags:#04x}"
-              + (f", {note}" if note else ""))
+        if args.print_packets:
+            print(f"[za] -> proto 0x{proto:02x} "
+                  + "+".join(str(len(p)) for _, p, _ in items)
+                  + f" bytes, dst={dst_var:#06x} src={src_var:#06x} flags={flags:#04x}"
+                  + (f", {note}" if note else ""))
 
     def send(proto, payload, **kwargs):
         return send_messages([(proto, payload, kwargs.pop("msgflags", None))], **kwargs)
@@ -479,12 +549,35 @@ async def run_session(args, keys, host_ip, host_mac, our_ip, our_mac, record):
     while True:
         now = time.monotonic()
         tick = int((now - t0) * 59.727)
+        why = None
         if now - t0 >= args.hold:
-            print(f"[za] the hold ended after {now - t0:.1f}s")
+            why = f"the hold ended after {now - t0:.1f}s"
+        elif (args.hold_after_trade is not None and game is not None and game.queue_done
+                and now - t0 >= game.traded_at + args.hold_after_trade):
+            why = f"leaving the seat {args.hold_after_trade:.0f}s after trade {game.trades}"
+        if why and leave is None:
+            print(f"[za] {why}")
+            if conn is None or not conn.host_var or migrated_at is not None:
+                break
+            leave = {"sent": 0, "next": now, "answered": False}
+        if leave is not None:
+            # A leaving station re-sends its type 3 every 0.5 s and stops after four (docs/za.md).
+            if leave["answered"] or (leave["sent"] >= LEAVE_SENDS and now >= leave["next"]):
+                print("[za] the console answered our leave" if leave["answered"]
+                      else "[za] our leave went unanswered")
+                break
+            if leave["sent"] < LEAVE_SENDS and now >= leave["next"]:
+                send(pia_connect.PROTO_SESSION, za.build_leave_request(
+                         pia_connect.ldn_constant_id(our_mac), our_var, our_ip, os.urandom(4)),
+                     dst_var=conn.host_var, src_var=our_var, footer_var=conn.host_var,
+                     note="session leave request")
+                leave["sent"] += 1
+                leave["next"] = now + LEAVE_REPEAT
+        if destroyed:
+            print("[za] the console is closing its network; leaving it")
             break
-        if game is not None and game.traded_at is not None \
-                and now - t0 >= game.traded_at + args.after_trade:
-            print(f"[za] leaving the seat {args.after_trade:.0f}s after the trade")
+        if migrated_at is not None and now - last_in >= MIGRATED_QUIET:
+            print(f"[za] the console went quiet {now - last_in:.1f}s after leaving; ending the seat")
             break
         if args.quiet_seat and first_in is None and now - t0 >= args.quiet_seat:
             print(f"[za] nothing from the console in {args.quiet_seat:.0f}s; ending the seat")
@@ -532,8 +625,9 @@ async def run_session(args, keys, host_ip, host_mac, our_ip, our_mac, record):
                                 payload=m.payload.hex()) for m in messages]
         for m in messages:
             counts[m.proto] = counts.get(m.proto, 0) + 1
-        print(f"[za] datagram {seen} at {now - t0:.2f}s, src={header.src:#06x} "
-              f"dst={header.dst:#06x}: " + "; ".join(describe_msg(m) for m in messages))
+        if args.print_packets:
+            print(f"[za] datagram {seen} at {now - t0:.2f}s, src={header.src:#06x} "
+                  f"dst={header.dst:#06x}: " + "; ".join(describe_msg(m) for m in messages))
         record(**row)
         if conn is None:
             continue
@@ -541,8 +635,40 @@ async def run_session(args, keys, host_ip, host_mac, our_ip, our_mac, record):
         # the host's liveness timeout kicked us (docs/za.md).
         if header.footer == 2 and header.dst not in (0, pia_connect.SESSION_VAR, 0xFFFF):
             conn.learn_ids(header.dst, header.src)
+        last_in = now
         for m in messages:
-            if m.proto == pia_connect.PROTO_SESSION and m.payload[:1] == b"\x05" and conn is not None:
+            # A host leaving hands its role to us and waits 5 s for the type 10; the Net 0x11 that
+            # follows is answered too, as a reference joiner does (docs/za.md, Leaving).
+            if (m.proto == pia_connect.PROTO_SESSION
+                    and m.payload[:1] == bytes([za.SESSION_START_MIGRATION]) and len(m.payload) >= 28
+                    and za.migration_target(m.payload)[0] == pia_connect.ldn_constant_id(our_mac)):
+                send(pia_connect.PROTO_SESSION, za.build_migration_ack(m.payload), dst_var=0,
+                     src_var=our_var, footer=False, establishing=True, pktid=0,
+                     note="start host migration acknowledgement")
+                if game is not None:
+                    game.arrived()
+                if migrated_at is None:
+                    migrated_at = now - t0
+                    print(f"[za] the console is leaving and named us the next host at "
+                          f"{migrated_at:.2f}s; acknowledged")
+            if (leave is not None and m.proto == pia_connect.PROTO_SESSION
+                    and m.payload[:1] == bytes([za.SESSION_LEAVE_RESPONSE])
+                    and m.payload[5:13] == pia_connect.ldn_constant_id(our_mac)):
+                leave["answered"] = True
+            if (migrated_at is not None and m.proto == pia_connect.PROTO_NET
+                    and m.payload[1:2] == bytes([pia_connect.NET_CONN_REQUEST])):
+                net = pia_connect.parse_net_conn_request(m.payload)
+                if net is not None:
+                    send(pia_connect.PROTO_NET, pia_connect.build_net_response(net[2]), dst_var=0,
+                         src_var=our_var, footer=False, establishing=True, pktid=0,
+                         note=f"net 0x12, sequence {net[2]}")
+            # Then it repeats Net 0x40 every 0.3 s until its clients leave, for at most 4 s
+            # (docs/za.md, Leaving).
+            if (migrated_at is not None and m.proto == pia_connect.PROTO_NET
+                    and m.payload[:2] == bytes([1, pia_connect.NET_START_HOST_MIGRATION])):
+                destroyed = True
+            if (m.proto == pia_connect.PROTO_SESSION and m.payload[:1] == b"\x05" and conn is not None
+                    and "update-ack" not in args.withhold):
                 sequence = za.session_encoding.session_update_sequence(m.payload) \
                     if False else za.session_update_sequence(m.payload)
                 ack = za.build_session_update_ack(pia_connect.ldn_constant_id(our_mac), sequence)
@@ -696,10 +822,10 @@ def main_ip(args):
 def main(argv=None):
     ap = build_parser()
     args = ap.parse_args(argv)
-    if args.trade_offer and args.trade_offer != "echo":
-        args.trade_offer = pokemon_service.prepare_file("za", args.trade_offer, fresh=getattr(args, "fresh_pid", False))
-        if hasattr(args, "fresh_pid"):
-            args.fresh_pid = False
+    # Every queued record gets its own PID here; a later trade on the last record renews it again.
+    args.trade_offer = [pokemon_service.prepare_file("za", path, fresh=args.fresh_pid)
+                        for path in args.trade_offer]
+    args.renew_offer, args.fresh_pid = args.fresh_pid, False
     try:
         sys.stdout.reconfigure(line_buffering=True)
     except (AttributeError, ValueError):
@@ -787,7 +913,7 @@ def main(argv=None):
             param.phyname, param.ifname = phy, args.ifname
 
             async def seat():
-                with trio.move_on_after(args.connect_timeout) as scope:
+                with trio.move_on_after(radios.join_timeout(args.connect_timeout)) as scope:
                     async with ldn.connect(param) as network:
                         scope.deadline = float("inf")
                         info = network.info()

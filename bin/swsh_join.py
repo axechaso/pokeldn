@@ -18,7 +18,7 @@ if os.path.isdir(BUNDLED_LDN):
     sys.path.insert(0, BUNDLED_LDN)
 
 import trio
-import ldn
+from pokeldn.ldn import api as ldn
 from pokeldn.host_support import open_output
 from pokeldn.ldn.transport import board_radio, find_ap_phy
 from pokeldn.host_support import resolve_keys, needs_root
@@ -74,7 +74,7 @@ def build_parser():
     ap.add_argument("--ifname", default="ldnclient")
     ap.add_argument("--channels", default="1,6,11,36,40,44,48")
     ap.add_argument("--dwell", type=float, default=1.5)
-    ap.add_argument("--name", default="PkCamp", help="our display name in the session")
+    ap.add_argument("--name", default="POKELDN", help="our display name in the session")
     ap.add_argument("--pw-mode", default="raw", choices=["raw", "pad64", "all"],
                     help="the passphrase is 64 bytes already; pad64 is a no-op kept for symmetry")
     ap.add_argument("--passphrase", default=None, help="override, as ASCII")

@@ -66,6 +66,32 @@ def test_probe_cli_uses_existing_host_config_and_fixed_read_payload():
     assert config.console_build == "BPRE"
 
 
+def test_probe_host_initialization_keeps_its_server_and_supports_a_cardless_screen(model, monkeypatch):
+    from pokeldn.app import screen
+    from pokeldn.frlg.localization.host import LocalizationHostApplication
+
+    class FakeTransport:
+        NEEDS_RADIO = False
+
+        def __init__(self, **kwargs):
+            pass
+
+    args = localization_probe.build_parser().parse_args(["--report", "probe.json", "--no-local-config"])
+    operation = LocalizationProbeOperation(rom_size=model.profile.rom_size)
+    app = LocalizationHostApplication(localization_probe.host_config(args), operation,
+                                      transport_factory=FakeTransport, log=lambda *args: None)
+    shown = []
+    monkeypatch.setattr(screen, "gift", lambda *args, **kwargs: shown.append((args, kwargs)))
+    try:
+        app._build_components()
+        assert app.session.activity.server is operation.server
+        assert app.card is None
+        app._show_screen()
+        assert shown == [(("FRLG localization", "Read-only ROM capture"), {"species": None})]
+    finally:
+        operation.close()
+
+
 def test_probe_cli_help_has_no_original_rom_requirement():
     result = subprocess.run([sys.executable, str(ROOT / "tools/frlg/localization_probe.py"), "--help"],
                             capture_output=True, text=True)

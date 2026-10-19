@@ -20,8 +20,9 @@ def _ref(b64):
 UPDATE_SESSION = _ref("eNpjFPRkgAEmIH6RwmCwJNLh+uJD1ZEQUY+PCkqzXzNC1az8V8BoYAlhMIEYMAmG/6QxAEm/FCc=")
 REQUEST = _ref("eNpjZGB5PVtJ4aMHA8N1h8glnP8Z0CGDBhvbyn8FTAaWEJIBDCI6e168OMXAoF1f77FPKMqYlZGBkYEIwAgEAdnO"
                "ibkFDFQDjFRXSIxZAE50HHI=")
+# The retail host's response, its player's name replaced by POKELDN.
 RESPONSE = _ref("eNpjYmCJ6Ox58eIUA4N2fb0HpwiTBLMMgwpDBHMGYw3zFMYlDAwqTGwMDCv/FTAaWDKAwevZSgofPRgYrjtE"
-                "LomsPrQYKMTIQADk6dzvZwQC99KissQ8BvoDZoZRMAqGPritFGwGAIs2GHk=")
+                "LomsPrQYKMTIQADk6dzvZwSCAH9vVx8XPwa6A2aGUTAKhj64rRRsBgA+AhgT")
 JOIN_RESPONSE = _ref("eNpjYmJgZGRgYuAAQhBgYmNgWPmvgNHAEsxleD1bSeGjBwPDdYfIJZHVhxYDhRgZCAA2NqAJTAaWEBIi"
                      "FtHZ8+LFKQYG7fp6j31CUcasjLjNAUndVgo2BwA/Mhdm")
 UPDATE_MESH = _ref("eNpTYGIAAUZGBiYGJjYGhpX/ChgNLMFiDK9nKyl89GBguO4QuSSy+tBikDoGAoCNDWgCk4ElhISIRXT2"
@@ -54,7 +55,7 @@ def test_update_session_is_the_retail_hosts():
 
 def test_connection_response_is_the_retail_hosts():
     assert host.build_connection_response(stp.ldn_constant_id(JOINER_MAC), JOINER_VAR,
-                                          _host_location(), 0x6E2CDF8F, ["Gurvan"],
+                                          _host_location(), 0x6E2CDF8F, ["POKELDN"],
                                           0xDB225336) == RESPONSE
 
 
@@ -77,7 +78,7 @@ def test_connection_request_parses():
     req = host.parse_connection_request(REQUEST)
     assert req["target_variable_id"] == HOST_VAR
     assert req["location"]["variable_id"] == JOINER_VAR
-    assert req["player_names"] == ["PkCamp"]
+    assert req["player_names"] == ["PkCamp"]               # the recorded request
 
 
 class Console:
@@ -108,13 +109,13 @@ class Console:
         loc = stp.station_location(self.ip, 12345, stp.ldn_constant_id(self.mac), self.var,
                                    stp.ldn_service_variable_id(self.mac))
         return stp.build_connection_request(host_const, host_var, host.PROTOCOLS, loc,
-                                            player_infos=[stp.player_info("Gurvan", "", 3)],
+                                            player_infos=[stp.player_info("POKELDN", "", 3)],
                                             ack_id=7)
 
 
 def _session(record=None):
     adv = host.Advertisement(0x6E2CDF8F, 0x03326B15)
-    return host.HostSession(adv.keys, adv, "169.254.112.1", HOST_MAC, HOST_VAR, name="PkCamp",
+    return host.HostSession(adv.keys, adv, "169.254.112.1", HOST_MAC, HOST_VAR, name="POKELDN",
                             record=record)
 
 
@@ -227,9 +228,15 @@ def _game_out(got):
     return out
 
 
-def test_a_scripted_trade_is_answered_through_the_save():
-    offer = bytes(328)
-    p = host.TradePartner(offer, complete=True, approach_delay=3.0)
+@pytest.mark.parametrize("queued", [2, 6])
+def test_scripted_trades_are_answered_through_the_save_each_with_the_next_offer(queued):
+    """One association, a trade per offer and one more: each answers the console's Pokemon with the
+    next offer (the last again once they run out) and files the console's under that trade's
+    number."""
+    offers = [bytes([n]) * 328 for n in range(1, queued + 1)]
+    saved = []
+    p = host.TradePartner(offers, complete=True, approach_delay=3.0,
+                          save_theirs=lambda n, raw: saved.append((n, raw[:1])))
     s, c = _joined(p)
     seq = [0]
 
@@ -251,23 +258,32 @@ def test_a_scripted_trade_is_answered_through_the_save():
     [talk] = say(room.build_talk_reserve_result(can_talk=0, is_recruitment=1, emoticon_state=4),
                  4.2)
     assert talk == bytes.fromhex("0600050001000000")
-    [traner] = say(room.build_trade_traner("Gurvan", 44466, 4080), 5.0)
+    [traner] = say(room.build_trade_traner("POKELDN", 24680, 13579), 5.0)
     assert traner[0] == room.TRADE_TRANER and len(traner) == 35
-    [poke] = say(room.build_trade_poke(bytes(328)), 5.5)
-    assert poke == room.build_trade_poke(offer)
-    [ok] = say(room.build_fields(room.TRADE_POKE_CHECK_OK, 1), 6.0)
-    assert ok == room.build_fields(room.TRADE_POKE_CHECK_OK, 1)
-    [ready] = say(room.build_trade_ready_ok(room.TRADE_STATE_WAIT, 0), 7.0)
-    assert ready == room.build_trade_ready_ok()
-
-    # Each security-phase state is mirrored and repeated once a second.
-    for t, theirs in ((8.0, 1), (8.2, 2), (8.4, 3), (8.6, 4)):
-        [mine] = say(room.build_trade_ready_ok(theirs, 1), t)
-        assert mine == room.build_trade_ready_ok(room.mirror_trade_state(theirs), 1)
-    assert _game_out(c.read(s.tick(9.7)))
-    say(room.build_fields(room.RETURN_SELECT, 0), 30.0)
-    assert p.trades == 1
-    assert not _game_out(c.read(s.tick(32.0)))
+    t = 5.5
+    for trade, ours in enumerate([*offers, offers[-1]], start=1):
+        theirs = bytes([0x40 + trade]) * 328
+        [poke] = say(room.build_trade_poke(theirs), t)
+        assert poke == room.build_trade_poke(ours)
+        [ok] = say(room.build_fields(room.TRADE_POKE_CHECK_OK, 1), t + 0.5)
+        assert ok == room.build_fields(room.TRADE_POKE_CHECK_OK, 1)
+        [ready] = say(room.build_trade_ready_ok(room.TRADE_STATE_WAIT, 0), t + 1.5)
+        assert ready == room.build_trade_ready_ok()
+        # Each security-phase state is mirrored; it is repeated once a second until SEND_READYOK.
+        for dt, state in ((2.5, 1), (2.7, 2), (2.9, 3), (3.1, 4)):
+            [mine] = say(room.build_trade_ready_ok(state, 1), t + dt)
+            assert mine == room.build_trade_ready_ok(room.mirror_trade_state(state), 1)
+        assert _game_out(c.read(s.tick(t + 4.2))) == [room.build_trade_ready_ok(5, 1)]
+        for dt, state in ((4.3, 5), (4.5, 6)):
+            [mine] = say(room.build_trade_ready_ok(state, 1), t + dt)
+            assert mine == room.build_trade_ready_ok(room.mirror_trade_state(state), 1)
+        # The answer to SEND_READYOK seals the trade; a repeat while the console saves and
+        # animates lands in its select window (docs/bdsp_trade.md).
+        assert p.trades == trade
+        assert saved[-1] == (trade, theirs[:1])
+        for dt in (6.0, 12.0, 24.0, 29.0):
+            assert not _game_out(c.read(s.tick(t + dt)))
+        t += 30.0
 
 
 def test_the_ready_ok_is_not_answered_without_complete():
@@ -290,3 +306,48 @@ def test_an_ack_names_our_own_lowest_pending_not_theirs():
     entry = rl.parse_ack_payload(ack["payload"])["entries"][0]
     assert entry["ack_id"] == 7
     assert ack["lowest_pending"] == entry["field_0x50"] == s.joiner.tx_seq == 2
+
+
+# A retail Shining Pearl leaving our room, decrypted from its packet: the mesh leave request on 0x18
+# port 1 under the reliable header (sequence 1), naming its station index 1.
+LEAVE_REQUEST = bytes.fromhex("0f00000200010001000401")
+
+
+def test_a_leaving_console_is_answered_and_released():
+    """Unanswered, the console repeats its leave request for 5 s and its disconnection request
+    for 4 s before it deauthenticates (docs/bdsp_session.md, Leaving)."""
+    s, c = _joined(host.TradePartner(bytes(328)))
+    host_index = mp.parse_join_response(s.joiner.join_response)["host_index"]
+    got = c.send([(LEAVE_REQUEST, mp.PROTOCOL, mp.PORT_RELIABLE, 1, 1)], 10.0)
+    acks = [rl.parse(m.payload) for _, m in got if (m.protocol, m.port) == (mp.PROTOCOL, 1)]
+    assert [a["is_ack"] for a in acks] == [True]
+    assert rl.parse_ack_payload(acks[0]["payload"])["entries"][0]["ack_id"] == 2
+    # the leaver's handler [0x0154baf8] takes two bytes naming the host's index, from the host
+    responses = [m.payload for _, m in got if (m.protocol, m.port) == (mp.PROTOCOL, 0)]
+    assert responses == [bytes([mp.LEAVE_RESPONSE, host_index])] * 2
+    assert s.counters["leave_requests"] == 1
+
+    got = c.send([(bytes([stp.DISCONNECTION_REQUEST]), stp.PROTOCOL, 0, 1, 1)], 10.5)
+    assert [m.payload for _, m in got] == [bytes([stp.DISCONNECTION_RESPONSE])]
+
+    # nothing more goes to a station that has left the mesh
+    c.send([(lp.build_ack(s.session_seq), lp.PROTOCOL, 0, lp.MESSAGE_FLAGS, 0)], 10.6)
+    assert not c.read(s.tick(12.0))
+
+
+@pytest.mark.parametrize("message, own, answer", [
+    # a retail joiner leaving: the host (index 0) owes the leaver's handler [0x0154baf8] `08 00`
+    (LEAVE_REQUEST, 0, "0800"),
+    # a retail host leaving its room names us (index 1) next host; its wait [0x015607bc] ends on
+    # `48 01` from each station [0x0154b068]
+    (bytes.fromhex("0f0000030001000100440001"), 1, "4801"),
+    # neither is answered by the station that sent it
+    (LEAVE_REQUEST, 1, None),
+    (bytes.fromhex("0f0000030001000100440001"), 0, None),
+])
+def test_a_departure_is_answered_and_its_window_acked(message, own, answer):
+    from pokeldn.bdsp.session import answer_departure
+    ack, got = answer_departure(message, own)
+    entry = rl.parse_ack_payload(rl.parse(ack)["payload"])["entries"][0]
+    assert (entry["stream_id"], entry["ack_id"]) == (0, 2)
+    assert (got.hex() if got else None) == answer

@@ -21,6 +21,7 @@ A retail Sword has traded with pokeldn in both roles ([Hosting a trade](swsh_tra
 | [The sync framework](swsh_protocol.md) | message ids, contents, holders, routing, the party payload |
 | [Trading](swsh_trade.md) | the trade screen, the box state machine, the confirmation ladder |
 | [Mystery Gift](swsh_gift.md) | the Mystery Gift menu's local-wireless branch |
+| [Max Raid Battles](swsh_raid.md) | the den lobby, its advertisement, hosting a raid a console serves, the battle a guest fights, leaving |
 
 ## Sources
 
@@ -52,17 +53,18 @@ fills before the script resumes). A call is `PUSH` per argument, right to left, 
 
 ## Unresolved
 
-- [Player profile](swsh_protocol.md#the-player-profile): the feature behind vtable `0x25614c0`
-  (activity record kind 11, `0x00dedf3c`; sample state 3 or 4). Sample states 3, 4, 6 are named only
-  by their setters. `a_wr0301` as the Crown Tundra wild area is read from the numbering; one beacon
+- [Player profile](swsh_protocol.md#the-player-profile): which role sample states 3 and 4 stand for
+  in a Pokemon Camp session (`StateCreateSession`, `StateConnect`). `a_wr0301` as the Crown Tundra wild area is read from the numbering; one beacon
   taken there settles it.
-- [Battle Stadium](swsh_protocol.md#the-battle-stadium-block): what writes the team descriptor's
-  `+0`, `+4`, `+6` (a save with a validated team shows it). Whether the `v1/validate` reply's 0x100
-  bytes reach `match+0x98` past `0x014f808c`'s copy to `[x19+0xb0]+0x76`; its status 1 and up to six
-  u32.
+- [Battle Stadium](swsh_protocol.md#the-battle-stadium-block): which save block `0x01430670` reads
+  for a stored team record, and what a save team's descriptor holds at `+0x30..+0x135` before the
+  `v1/validate` signature replaces `+0x36` (the entry at `[sp+0x28]` after `0x015039f0`).
 - Sword against Shield: binary readings are Shield's, the console is Sword; the
   [session constants](swsh_session.md#taking-a-seat) hold across the pair. Sword testing bit 0 of a
-  card's version mask is inferred from Shield's code with version 44 (`0x2C`) for `0x007d4270`'s
-  `0x2D`, and from PKHeX `RestrictVersion` (1 Sword, 2 Shield, 3 both).
-- [Mystery Gift](swsh_gift.md#what-the-menu-refuses): whether `0x010b6110` or `0x010159d0` checks
-  legality (illegal moves were accepted on retail).
+  card's version mask is inferred from Shield's code, where the test is `1 << (v == 0x2D)` and eleven
+  of the 31 call sites of `0x007d4270` compare against both `0x2C` and `0x2D`, and from PKHeX
+  `RestrictVersion` (1 Sword, 2 Shield, 3 both); two retail Sword snapshots carry `0x2C` at MyStatus
+  `+0xA4`. Sword's own `0x007d4270` and its communication id literal are unread.
+- [Mystery Gift](swsh_gift.md#what-the-menu-refuses): whether a retail console takes a kind-1 gift
+  whose species is absent from the game as an emulated Shield does, as a bad egg named "Egg"; and
+  what such an egg does on hatching or in a trade.

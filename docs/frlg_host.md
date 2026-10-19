@@ -61,9 +61,12 @@ stateDiagram-v2
 ```
 
 After the final trade the host waits for the Switch trade menu; the player selects CANCEL and
-confirms YES. The host finishes the standby barriers, waits five seconds before leaving the room,
-and keeps normal peer traffic for fifteen seconds after the Switch confirms close
-(`READY_CLOSE_LINK`), then queues the RFU disconnect. An LDN leave event stops peer output at once.
+confirms YES, and the host answers with `BOTH_CANCEL_TRADE` at once. The host finishes the standby
+barriers, waits five seconds before leaving the room unless the Switch leaves first, and keeps
+normal peer traffic for fifteen seconds after the Switch confirms close (`READY_CLOSE_LINK`), then
+queues the RFU disconnect. It answers the console's Session leave request with type 4
+([frlg_link.md](frlg_link.md), Leaving the Pia session). An LDN leave event stops peer output at
+once.
 
 ## Shutdown and cleanup
 
@@ -72,8 +75,11 @@ close sockets and the network, clean the LDN vifs. The same cleanup runs on norm
 `KeyboardInterrupt`, startup failure after partial allocation, and beacon-worker failure. Saving a
 received Pokemon is independent of capture logging.
 
-The Mystery Gift hosts never stop on their own after a gift. The trade and battle hosts stop when the
-console leaves LDN.
+Every host, trade, battle and Mystery Gift alike, stops when the console leaves LDN
+(`HostApplication.run`): at once when no close was confirmed, after a 2 s settle
+(`HOST_CLOSE_SETTLE_SECONDS`) when it was. `--end-on-success` stops a Mystery Gift host once a
+successful delivery's disconnect is sent, without waiting for the console to leave; its `--idle-timeout`
+stops it after that many seconds without Switch traffic.
 
 ## Trainer profile propagation
 
@@ -91,17 +97,17 @@ and derives every view from it:
 ## Failure handling
 
 - Preflight rejects a radio without AP support.
-- Legacy Linux hosting profiles: ALFA AWUS036ACHM / `mt76x0u` with `--skip-encryption
-  --no-accept-decrypted-ccmp`; TP-Link Archer T3U `2357:012d` / `rtw88_8822bu` with
-  `--skip-encryption --accept-decrypted-ccmp`. Startup warns when the flags do not match the driver.
-- On Linux the AP must mark the station `NL80211_STA_FLAG_AUTHORIZED` after LDN authentication;
-  without it the Realtek station disappears about three seconds after joining.
-- `--accept-decrypted-ccmp` strips the retained MIC from hardware-decrypted CCMP frames before TAP
-  delivery. Radiotap trailing FCS bytes are removed for every driver.
+- On a Linux Wi-Fi card the AP must mark the station `NL80211_STA_FLAG_AUTHORIZED` after LDN
+  authentication. Driver profiles and flags are on [Adapters](hardware_adapters.md).
 - Transport or beacon-thread failure aborts the run and unwinds what was created.
-- An unexpected participant leave halts output. After a normal room-close confirmation the host
-  keeps the fifteen-second grace even if the participant disappears: the Switch may still be in its
-  fade, warp and bridge teardown.
+- An unexpected participant leave halts output. After a room-close confirmation, a participant that
+  disappears from LDN ends the run after a 2 s settle (`HOST_CLOSE_SETTLE_SECONDS`) rather than at
+  once; the fifteen-second grace runs to its end only while the participant stays.
+- The grace (`HostTradeTiming.post_client_close_grace_frames`) counts only while the RFU leader is
+  in UNI; the console's `D` moves it to DISCONNECTED (`pokeldn/gba/rfu_leader.py`), and the engine
+  stops ticking. In 13 retail FireRed host trades the console sent `D` 0.1 s after its first
+  `READY_CLOSE_LINK`, kept the Pia transport answered and left LDN 0.5 to 4.0 s after it; the grace
+  never acts on a normal close.
 - Output is written only for a complete received Pokemon; input `.pk3`/`.ek3` files are never
   modified.
 

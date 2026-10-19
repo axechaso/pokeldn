@@ -3,11 +3,12 @@
 import struct
 
 from pokeldn.ldn import clone, reliable3
+from pokeldn.ldn import local_protocol as lp
 from pokeldn.ldn import mesh_protocol as mp
 from pokeldn.ldn.station_protocol import DISCONNECTION_REQUEST, DISCONNECTION_RESPONSE
 from pokeldn.ldn import station9
 
-__all__ = ["Leaver"]
+__all__ = ["Leaver", "host_departure", "unagreed_vote"]
 
 RELEASE_ORDER = (1, 0, 2, 3)
 # The console's pause between its last release and its leave request, measured three times.
@@ -20,8 +21,9 @@ class Leaver:
     answered or given up on."""
 
     def __init__(self, participant, offered_clone, step, tail, counter, station=1,
-                 host_bit=1, clone_ids=RELEASE_ORDER):
+                 host_bit=1, clone_ids=RELEASE_ORDER, host_index=0):
         self.p = participant
+        self.host_index = host_index
         self.offered = offered_clone
         self.step, self.tail, self.counter = step, tail, counter
         self.station = station
@@ -43,7 +45,8 @@ class Leaver:
         self.counter += 1
         data = (b"\x04\0\0\0" + struct.pack("<III", arg, self.counter, self.step)
                 + struct.pack("<I", self.tail))
-        rec = clone.build_state_record(self.offered, self.station, 3, self.p.ms(now), data)
+        rec = clone.build_state_record(self.offered, self.station, 3,
+                                         self.p.record_clock(2, self.offered, now), data)
         return clone.build_data_message(clone.STATE_DATA, 2, self.station, self.offered,
                                         self.p.frame(now), rec, flags=3)
 
@@ -100,7 +103,9 @@ class Leaver:
             c = clone.parse_command(payload)
             if c:
                 self.acked.add(c["clone_id"])
-        elif protocol == mp.PROTOCOL and payload and payload[0] == mp.LEAVE_RESPONSE:
+        elif protocol == mp.PROTOCOL and bytes(payload) == bytes([mp.LEAVE_RESPONSE,
+                                                                  self.host_index]):
+            # The console's handler 0x591bf4 takes only the host's index at [1].
             if not self.leave_answered:
                 self.leave_answered = True
                 # A retail host migrates every 0.3 s and waits five seconds for the leaver, so the
@@ -116,3 +121,36 @@ class Leaver:
                 self.done = True
                 self.log.append("disconnection response")
         return []
+
+
+def host_departure(protocol, payload, station_index):
+    """-> (replies, leave) for a console host that leaves: the migration start's ack and `48 <own
+    index>` (wait 0x58aeb0, 5 s unanswered); `leave` on START_HOST_MIGRATION, repeated until no
+    station is on the network (0x5d3fd0, 10 s). docs/lgpe_session.md, A host leaving."""
+    payload = bytes(payload)
+    if protocol == mp.PROTOCOL and len(payload) > reliable3.HEADER_SIZE:
+        r = reliable3.parse(payload)
+        if r and r["size"] and mp.parse_migration_start(r["payload"]) is not None:
+            return ([(reliable3.build_ack(r["sequence"] + 1), mp.PROTOCOL, 1),
+                     (mp.build_migration_response(station_index), mp.PROTOCOL, 0)], False)
+    if protocol == lp.PROTOCOL and len(payload) >= lp.HEADER_SIZE:
+        try:
+            kind, _ = lp.parse_header(payload)
+        except ValueError:
+            return [], False
+        return [], kind == lp.START_HOST_MIGRATION
+    return [], False
+
+
+def unagreed_vote(participant):
+    """-> the clone both stations vote on with one argument while the session host's A differs,
+    else None. The host's authority (main 0x11b6c0) moves A within one tick of agreement
+    (docs/lgpe_session.md, The two clone records a trade walks)."""
+    p = participant
+    for cid, theirs in p.shared.items():
+        ours = p.our_data(cid)
+        if (len(theirs) >= 20 and theirs[:4] == ours[:4] == b"\x01\0\0\0"
+                and theirs[4:8] == ours[4:8] and theirs[16:20] == ours[16:20]
+                and p.agreed.get(cid, bytes(4))[:4] != theirs[4:8]):
+            return cid
+    return None

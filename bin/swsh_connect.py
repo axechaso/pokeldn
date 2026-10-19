@@ -2,9 +2,13 @@
 """Speak version-4 Pia to a Sword/Shield console, from the first packet out to a completed trade.
 
 Never pass --verbose to a live run; use --capture. docs/swsh_session.md, docs/pia.md.
+An emulated console hosting over ldn_mitm, with no radio:
+
+    ./.venv/bin/python bin/swsh_connect.py --ip-join --host-ip 127.0.0.2 --our-ip 127.0.0.3 \
+        --preset trade --offer-file FILE
 """
 from pathlib import Path
-import argparse, json, os, shlex, socket, struct, sys, time, traceback, zlib
+import argparse, contextlib, json, math, os, shlex, socket, struct, sys, time, traceback, zlib
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
@@ -13,21 +17,28 @@ if os.path.isdir(BUNDLED):
     sys.path.insert(0, BUNDLED)
 
 import trio, ldn
-from pokeldn.host_support import open_output
+from pokeldn.host_support import open_output, write_file
 from pokeldn import pokemon as pokemon_service
 from pokeldn.host_support import resolve_keys, needs_root
-from pokeldn.ldn import (broadcast4, local_protocol as lp, mesh_protocol as mesh, pia4, reliable4,
+from pokeldn.ldn import (broadcast4, ldn_mitm, ldn_mitm_host, local_protocol as lp,
+                        mesh_protocol as mesh, pia4, reliable4,
                         reliable5, rtt_protocol as rtt, station4,
-                        station_protocol as stp)
+                        station_protocol as stp, host4)
 from pokeldn.ldn.transport import board_radio, find_ap_phy
 from pokeldn.swsh import COMM_ID, PASSPHRASE, PIA_PORT, packet_iv, session_keys
 from pokeldn.swsh import trade as swsh_trade
+from pokeldn.swsh import raid as swsh_raid
+from pokeldn.swsh import raid_battle
+from pokeldn.ldn import sync_clock
 from pokeldn import gen8
 from pokeldn.swsh import pokemon as swsh_pokemon
 from pokeldn.swsh import trade_payload
 from pokeldn.ldn import show_done
+from pokeldn.app import screen
 
-SCENE_ACCEPTING = 60001           # logged, never a gate
+# Only a matching search's network takes a seat; its Y-Comm beacon (65535) never reached the trade
+# box in 16 of 16 joins [docs/swsh_session.md, How a searching Sword finds a partner].
+SCENE_ACCEPTING = 60001
 
 
 def _expand(spec):
@@ -52,8 +63,15 @@ def cleanup():
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def make_socket(ifname):
-    from pokeldn.ldn import userspace_ip  # no kernel interface (ESP32 on macOS)
+def make_socket(ifname, our_ip=None):
+    if our_ip is not None:
+        # An emulated host holds UDP *:12345 on this machine: bind our own address [docs/ldn.md].
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((our_ip, PIA_PORT))
+        s.setblocking(False)
+        return s
+    from pokeldn.ldn import userspace_ip  # no kernel interface on the ESP32
     if (user := userspace_ip.udp_socket(ifname, PIA_PORT)) is not None:
         user.setblocking(False)
         return user
@@ -85,21 +103,28 @@ def wrap(keys, our_mac, our_constant, nonce8, payload, protocol, station, port=0
     return pia4.build_packet(keys.session_key, iv, body, station=station, nonce8=nonce8)
 
 
-async def main_async(args):
+async def find_radio(args):
+    """-> (SessionKeys, target record, seat context) for the matching search on the air, or an exit
+    code. The seat yields (host_ip, host_mac, our_ip, our_mac)."""
     keys_file = ldn.load_keys(resolve_keys(args.keys))
     phy = find_ap_phy(log=print) if args.phy == "auto" else args.phy
     cleanup()
-    nets = await ldn.scan(keys_file, phyname=phy,
-                          channels=[int(c) for c in args.channels.split(",")],
-                          dwell_time=args.dwell)
     want = int(args.comm_id, 16) if args.comm_id else COMM_ID
-    for n in nets:
-        print(f"[cx] saw comm_id=0x{n.local_communication_id:016x} ch={n.channel} "
-              f"scene={n.scene_id} {n.num_participants}/{n.max_participants}")
-    net = next((n for n in nets if n.local_communication_id == want), None)
+    net = None
+    for _ in range(args.scans):
+        nets = await ldn.scan(keys_file, phyname=phy,
+                              channels=[int(c) for c in args.channels.split(",")],
+                              dwell_time=args.dwell)
+        for n in nets:
+            print(f"[cx] saw comm_id=0x{n.local_communication_id:016x} ch={n.channel} "
+                  f"scene={n.scene_id} {n.num_participants}/{n.max_participants}")
+        net = next((n for n in nets if n.local_communication_id == want
+                    and args.scene in (None, n.scene_id)), None)
+        if net is not None:
+            break
     if net is None:
-        print("[cx] target not on the air - is the console on Y-Comm -> Link Trade -> local RIGHT "
-              "NOW? It stops advertising a minute or so after a seat is released.")
+        print("[cx] no matching search on the air - is the console on Y-Comm -> Link Trade, past BOTH "
+              "messages? It stops advertising a minute or so after a seat is released.")
         return 3
     if net.num_participants >= net.max_participants:
         print("[cx] the session is FULL, no seat to take")
@@ -113,7 +138,126 @@ async def main_async(args):
     param.keys, param.network, param.password = keys_file, net, PASSPHRASE
     param.name, param.app_version = args.name.encode(), net.app_version
     param.phyname, param.ifname = phy, args.ifname
+    target = dict(comm_id=net.local_communication_id, channel=net.channel,
+                  scene_id=net.scene_id, ssid=net.ssid.hex(),
+                  application_data=bytes(getattr(net, "application_data", b"") or b"").hex())
 
+    @contextlib.asynccontextmanager
+    async def seat():
+        async with ldn.connect(param) as network:
+            info = network.info()
+            parts = list(getattr(info, "participants", []) or [])
+            host = parts[0] if parts else None
+            host_ip = getattr(host, "ip_address", None) or "169.254.14.1"
+            host_mac = bytes(getattr(host, "mac_address", b"") or b"")
+            ours = next((p for p in parts[1:] if getattr(p, "connected", False)), None)
+            our_ip = getattr(ours, "ip_address", None) or host_ip.rsplit(".", 1)[0] + ".2"
+            our_mac = bytes(getattr(ours, "mac_address", b"") or b"")
+            yield host_ip, host_mac, our_ip, our_mac
+    return keys, target, seat
+
+
+class _Advertised:
+    """The fields of a scanned network `session_keys` and the target record read."""
+
+    def __init__(self, info):
+        self.application_data = bytes(ldn_mitm.advertise_data(info))
+        self.local_communication_id, _, self.scene_id = struct.unpack_from("<QHH", info, 0)
+        self.num_participants = info[ldn_mitm_host.OFF_NODE_COUNT]
+        self.max_participants = info[ldn_mitm_host.OFF_NODE_COUNT_MAX]
+        self.app_version = ldn_mitm_host.node_local_comm_version(info, 0)
+        self.ssid = ldn_mitm.session_id(info)
+
+
+def ip_scan_once(scan_ip, host_ip, timeout):
+    """-> the emulated host's NetworkInfo, or None. The bridge drops a scan from the host's own
+    address, so it leaves from `scan_ip` [docs/ldn.md, Hosting for an emulator]."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as us:
+        us.settimeout(timeout)
+        us.bind((scan_ip, 0))
+        try:
+            us.sendto(ldn_mitm.build(ldn_mitm.SCAN), (host_ip, ldn_mitm.PORT))
+            while True:
+                data, _ = us.recvfrom(4096)
+                kind, info = ldn_mitm.parse(data)
+                if kind == ldn_mitm.SCAN_RESP:
+                    return info
+        except (socket.timeout, OSError, ValueError):
+            return None
+
+
+def ip_associate(our_ip, host_ip, our_mac, name, timeout, version):
+    """-> (synced NetworkInfo, the TCP connection the seat lasts as long as)."""
+    tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    tcp.settimeout(timeout)
+    tcp.bind((our_ip, 0))
+    tcp.connect((host_ip, ldn_mitm.PORT))
+    tcp.sendall(ldn_mitm.build(ldn_mitm.CONNECT,
+                               ldn_mitm.build_node_info(our_ip, our_mac, name.encode(),
+                                                        version=version)))
+    kind, synced = ldn_mitm.parse(tcp.recv(8192))
+    if kind != ldn_mitm.SYNC_NETWORK:
+        tcp.close()
+        raise RuntimeError(f"the host answered our connect with type {kind}, not SyncNetwork")
+    tcp.settimeout(None)
+    return synced, tcp
+
+
+async def find_ip(args):
+    """`find_radio` against an emulated console hosting over ldn_mitm: no radio, no root, no keys."""
+    our_ip = args.our_ip
+    if our_ip is None:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect((args.host_ip, ldn_mitm.PORT))
+            our_ip = probe.getsockname()[0]
+    our_mac = b"\x02\x00" + socket.inet_aton(our_ip)
+    want = int(args.comm_id, 16) if args.comm_id else COMM_ID
+    print(f"[cx] ip-join: host {args.host_ip}, us {our_ip}, comm_id={want:#018x}")
+    net = None
+    for attempt in range(args.scans):
+        if attempt:
+            await trio.sleep(args.dwell)
+        # Windows fails a scan at once (WSAECONNRESET) while nothing listens: the sleep paces it.
+        info = ip_scan_once(args.scan_ip or our_ip, args.host_ip, args.dwell)
+        if info is None:
+            continue
+        n = _Advertised(info)
+        print(f"[cx] saw comm_id=0x{n.local_communication_id:016x} scene={n.scene_id} "
+              f"{n.num_participants}/{n.max_participants}")
+        if n.local_communication_id == want and args.scene in (None, n.scene_id):
+            net = n
+            break
+    if net is None:
+        print(f"[cx] no matching search at {args.host_ip} - is the emulated console on Y-Comm -> "
+              "Link Trade, past BOTH messages?")
+        return 3
+    if net.num_participants >= net.max_participants:
+        print("[cx] the session is FULL, no seat to take")
+        return 5
+    synced, tcp = ip_associate(our_ip, args.host_ip, our_mac, args.name, args.dwell * 4,
+                               net.app_version)
+    net = _Advertised(synced)
+    keys = session_keys(net)
+    print(f"[cx] target ssid={net.ssid.hex()} scene={net.scene_id} app_version={net.app_version}")
+    print(f"[cx] {keys}")
+    target = dict(comm_id=net.local_communication_id, channel=None, scene_id=net.scene_id,
+                  ssid=net.ssid.hex(), application_data=net.application_data.hex())
+    _ip, host_mac, *_ = ldn_mitm_host.read_node(synced, 0)
+
+    @contextlib.asynccontextmanager
+    async def seat():
+        try:
+            yield args.host_ip, bytes(host_mac), our_ip, our_mac
+        finally:
+            tcp.close()
+    return keys, target, seat
+
+
+async def main_async(args):
+    found = await (find_ip if args.ip_join else find_radio)(args)
+    if isinstance(found, int):
+        return found
+    keys, target, seat = found
     cap = open_output(args.capture, "w") if args.capture else None
 
     def record(**kw):
@@ -121,21 +265,12 @@ async def main_async(args):
             cap.write(json.dumps(kw) + "\n")
             cap.flush()
 
-    record(rec="target", comm_id=net.local_communication_id, channel=net.channel,
-           scene_id=net.scene_id, ssid=net.ssid.hex(),
-           application_data=bytes(getattr(net, "application_data", b"") or b"").hex(),
-           session_key=keys.session_key.hex(), session_param=keys.session_param)
+    record(rec="target", **target, session_key=keys.session_key.hex(),
+           session_param=keys.session_param)
 
-    async with ldn.connect(param) as network:
-        info = network.info()
-        parts = list(getattr(info, "participants", []) or [])
-        host = parts[0] if parts else None
-        host_ip = getattr(host, "ip_address", None) or "169.254.14.1"
-        host_mac = bytes(getattr(host, "mac_address", b"") or b"")
-        ours = next((p for p in parts[1:] if getattr(p, "connected", False)), None)
-        our_ip = getattr(ours, "ip_address", None) or host_ip.rsplit(".", 1)[0] + ".2"
-        our_mac = bytes(getattr(ours, "mac_address", b"") or b"")
-        bcast = our_ip.rsplit(".", 1)[0] + ".255"
+    async with seat() as (host_ip, host_mac, our_ip, our_mac):
+        # Over ldn_mitm the subnet broadcast reaches no emulator: the host is the only peer.
+        bcast = host_ip if args.ip_join else our_ip.rsplit(".", 1)[0] + ".255"
         print(f"[cx] *** ASSOCIATED *** us={our_ip} ({our_mac.hex()}) "
               f"host={host_ip} ({host_mac.hex()})")
         if len(our_mac) != 6 or len(host_mac) != 6:
@@ -148,7 +283,7 @@ async def main_async(args):
         record(rec="seat", us=our_ip, our_mac=our_mac.hex(), host=host_ip,
                host_mac=host_mac.hex(), our_constant=our_constant, host_constant=host_constant)
 
-        sock = make_socket(args.ifname)
+        sock = make_socket(args.ifname, our_ip if args.ip_join else None)
         t0 = time.monotonic()
         st = {"seq": None, "host_var": None, "host_constant_seen": None, "last_update": None,
               "updates": 0, "phase": "listen", "station": None, "acks": 0,
@@ -158,7 +293,7 @@ async def main_async(args):
               "joins_out": 0, "mesh_in": 0, "join_response": None, "mesh_acks": 0,
               "updates_mesh": 0, "rtt_in": 0, "rtt_out": 0, "reliable_in": 0,
               "reliable_last": None, "broadcast_in": 0, "data_out": 0, "data_acked": None,
-              "broadcast_ack_ids": set(), "broadcast_stray_ids": set(), "windows": {},
+              "broadcast_ack_ids": set(), "raid_rx": [], "raid_rx7c": [], "ack_slot0": {}, "broadcast_stray_ids": set(), "windows": {},
               "their_ack_id": 0, "data_seqs": 0,
               "their_payload": None, "ack_by_proto": {}, "said_by_proto": {},
               "seen_by_proto": {}, "answer_queue": [],
@@ -174,17 +309,22 @@ async def main_async(args):
               "selection_sent": False, "box_queue": [], "box_seen": [], "box_next": 0.0,
               "we_are_host": False, "update_mesh_out": 0,
               "migration_pending": None, "migration_out": 0, "migration_acked": None,
+              "host_leaving": None,
               "said_serial": 0, "serial_by_proto": {}, "serial_by_port": {},
               "rpc_seen": {}, "rpc_pair_sent": set(), "offer_status_answered": set(),
               "rpc_bodies_answered": set(), "confirmation_opened": False, "rpc_pair_delta": {},
               "confirm_status_answered": set(),
               "confirm_queue": None,
               "confirm_steps_seen": set(), "confirm_last_step": None,
-              "ladder_finished": False,
+              "ladder_finished": False, "trades": 0, "first_pk8": None,
               "block_out": 0, "block_acked": None}
 
         accepted = trio.Event()           # station handshake closed; a mesh join waits for it
         nonce = int.from_bytes(os.urandom(8), "big")
+
+        def run_until(extra=0.0):
+            """-> when a sender gives up; --send-seconds 0 keeps it sending until the run ends."""
+            return time.monotonic() + args.send_seconds + extra if args.send_seconds else math.inf
 
         def next_nonce():
             nonlocal nonce
@@ -216,6 +356,52 @@ async def main_async(args):
                   f"0x7c port {args.rpc_port}, clock {clock}\n"
                   f"[tx]       {pair[0].hex()}\n[tx]       {pair[1].hex()}")
 
+
+        def validated(raw):
+            if getattr(args, "validate_offer", False):
+                raw = swsh_pokemon.encrypt(gen8.load(pokemon_service.prepare("swsh", raw)))
+            return raw
+
+        def renewed(raw):
+            return swsh_pokemon.encrypt(gen8.fresh_identity(gen8.decrypt(raw)))
+
+        def queued_offer(n):
+            """-> our record for trade n > 1: the n-th --offer-file, else the last again, else the
+            first trade's; one offered again gets a new PID under --fresh-pid."""
+            files = args.offer_file
+            if n <= len(files):
+                return validated(swsh_pokemon.encrypt(gen8.load(Path(files[n - 1]).read_bytes())))
+            raw = (swsh_pokemon.encrypt(gen8.load(Path(files[-1]).read_bytes())) if files
+                   else st["first_pk8"])
+            return validated(renewed(raw) if args.fresh_pid else raw)
+
+        def next_trade():
+            """The console offers from its box after a finished ladder: the next trade.
+
+            Contents 50 and 40 and pings 130 and 120 are built anew for every trade; content 30
+            and ping 110 last the session (docs/swsh_trade.md, Trades in a row on one session)."""
+            n = st["trades"] + 1
+            st["our_pk8"] = queued_offer(n)
+            for key in ("offered_pk8", "confirm_queue", "confirm_last_step"):
+                st[key] = None
+            for key in ("pk8_offer_sent", "trade_ready_sent", "ladder_finished",
+                        "confirmation_opened", "selection_sent"):
+                st[key] = False
+            for key in ("offer_status_answered", "confirm_steps_seen", "confirm_status_answered"):
+                st[key] = set()
+            per_trade = {swsh_trade.RPC_ENVELOPE_BASE + offset
+                         for offset in (swsh_trade.SELECTION_OFFSET, swsh_trade.CONFIRMATION_OFFSET)}
+            st["rpc_seen"] = {k: v for k, v in st["rpc_seen"].items() if k[0] not in per_trade}
+            st["rpc_pair_sent"] -= per_trade
+            st["rpc_bodies_answered"] = {k for k in st["rpc_bodies_answered"]
+                                         if k[0] not in per_trade}
+            for envelope in per_trade:
+                st["rpc_pair_delta"].pop(envelope, None)
+            ours = swsh_pokemon.read(st["our_pk8"])
+            screen.offer("swsh", st["our_pk8"])
+            print(f"\n[tx] *** TRADE {n}: THE CONSOLE OFFERS AGAIN *** we offer species "
+                  f"{ours['species']} {ours['nickname']!r} level {ours['level']}")
+            record(rec="next_trade", trade=n, our_pk8=st["our_pk8"].hex())
 
         def _opener_for(offset):
             """-> the opener for content `offset`'s 10000-base holder.
@@ -251,6 +437,10 @@ async def main_async(args):
                 record(rec="rx_reliable_ack", t=now, protocol=protocol, port=port,
                        raw=got["payload"].hex())
                 for e in (shape if isinstance(shape, list) else []):
+                    if e["slot"] == 0:
+                        # Slot 0 only: other slots hold stale ids (docs/pia.md, the ack payload).
+                        key = (protocol, port)
+                        st["ack_slot0"][key] = max(st["ack_slot0"].get(key, 0), e["ack_id"])
                     st["their_ack_id"] = max(st["their_ack_id"], e["ack_id"])
                     st["ack_by_proto"][protocol] = max(st["ack_by_proto"].get(protocol, 0),
                                                        e["ack_id"])
@@ -268,6 +458,23 @@ async def main_async(args):
             if not (w["seqs"] and got["sequence_id"] <= max(w["seqs"])):
                 st["their_payload"] = got["payload"]
                 st["said_by_proto"][protocol] = got["payload"]
+                if protocol == reliable4.BROADCAST_PROTOCOL:
+                    # BattleStart and Rewards come deflated under flag 0x10 (docs/swsh_raid.md).
+                    data = got["payload"]
+                    if got["flags"] & reliable5.FLAG_ZLIB:
+                        try:
+                            data = zlib.decompress(data)
+                        except zlib.error:
+                            pass
+                    st["raid_rx"].append(data)
+            if protocol == 0x7C and got["sequence_id"] not in w["seqs"]:
+                data = got["payload"]
+                if got["flags"] & reliable5.FLAG_ZLIB:
+                    try:
+                        data = zlib.decompress(data)
+                    except zlib.error:
+                        pass
+                st["raid_rx7c"].append((port, data))
                 st["said_by_port"][(protocol, port)] = got["payload"]
             # pingSynced on id 130 is the cue to open the selection phase.
             if args.selection_start and got["payload"] == swsh_trade.sync(
@@ -292,7 +499,9 @@ async def main_async(args):
                         step = swsh_trade.parse_sync_step(member["body"])
                         if step is not None and step[0] >= LADDER_FINAL_PHASE:
                             if not st["ladder_finished"]:
+                                st["trades"] += 1
                                 show_done()
+                                screen.received("swsh", st["offered_pk8"])
                                 print(f"\n[rx] *** THE LADDER IS FINISHED - phase {step[0]} is the "
                                       f"teardown rung, THE ABORT STANDS DOWN *** "
                                       f"{member['body'].hex()} at t={now:.2f}")
@@ -534,7 +743,14 @@ async def main_async(args):
                 print(f"\n[rx] t={now:6.2f} *** BOX SYNC STATE COMMAND {command} *** on the trade "
                       f"holder - the console naming its own state machine")
                 record(rec="rx_box_command", t=now, command=command)
+                # B after accepting clears our flags with its 5 (0x00aa57d0): its next offer gets ours
+                # and box command 1 again (docs/swsh_trade.md, The box state machine).
+                if command == 5:
+                    st["offered_pk8"] = None
+                    st["pk8_offer_sent"] = st["trade_ready_sent"] = False
             offered = swsh_trade.offered_pokemon(got["payload"])
+            if offered is not None and st["ladder_finished"]:
+                next_trade()
             if offered is not None and st["offered_pk8"] is None:
                 st["offered_pk8"] = offered
                 read = swsh_pokemon.read(offered)
@@ -542,8 +758,9 @@ async def main_async(args):
                       f"{read['species']} {read['nickname']!r} level {read['level']} "
                       f"OT {read['ot_name']!r} ({read['trainer_id']}/{read['secret_id']})")
                 if args.save_offered:
-                    write_file(args.save_offered, offered)
-                    print(f"[rx]     saved to {args.save_offered}")
+                    path = pokemon_service.trade_path(args.save_offered, st["trades"] + 1)
+                    write_file(path, offered)
+                    print(f"[rx]     saved to {path}")
                 # One-shot, and it outranks the mirror, which answers the RPC pair the console
                 # repeats.
                 if args.offer_echo:
@@ -616,6 +833,20 @@ async def main_async(args):
                               for k, v in m.items()} for m in msgs])
                 for f in msgs:
                     body = f["payload"]
+                    step = departure_step(body) if (args.leave_with_host and
+                                                    f["protocol"] == lp.PROTOCOL) else None
+                    if step and step[0] == "ack":
+                        station = st["station"] if st["station"] is not None else 0
+                        sock.sendto(wrap(keys, our_mac, our_constant, next_nonce(), step[1],
+                                         lp.PROTOCOL, station),
+                                    (host_ip if args.unicast else bcast, PIA_PORT))
+                        record(rec="tx_ack", t=now, seq=lp.parse_ack(step[1]), station=station,
+                               departure=True)
+                    elif step and st["host_leaving"] is None:
+                        st["host_leaving"] = now
+                        record(rec="leave_with_host", t=now)
+                        print(f"\n[rx] t={now:6.2f} *** START_HOST_MIGRATION: THE CONSOLE IS "
+                              f"CLOSING ITS NETWORK - LEAVING IT ***")
                     if f["protocol"] == lp.PROTOCOL and len(body) >= 2 \
                             and body[1] == lp.UPDATE_SESSION:
                         us = lp.parse_update_session(body)
@@ -664,7 +895,15 @@ async def main_async(args):
                                 args.respond_with == "both" and st["responses"] % 2)
                             cid = our_constant if mine else them["constant_id"]
                             vid = (st["our_variable_id"] if mine else them["variable_id"])
-                            reply = station4.build_connection_response(args.respond_result, cid, vid)
+                            # The 840-byte form: an emulated Shield never pings after the
+                            # 56-byte one (docs/swsh_session.md, Reaching the game layer).
+                            if args.respond_result == 0:
+                                reply = host4.build_host_response(
+                                    cid, vid, 0x40000000 | st["responses"], name=args.name)
+                            else:
+                                reply = station4.build_connection_response(
+                                    args.respond_result, cid, vid,
+                                    min_size=station4.ACCEPTED_RESPONSE_SIZE)
                             pkt = wrap(keys, our_mac, our_constant, next_nonce(), reply,
                                        station4.PROTOCOL, args.connect_station_first)
                             sock.sendto(pkt, (addr[0], PIA_PORT))
@@ -1070,11 +1309,11 @@ async def main_async(args):
                   f"{f' zlib {len(body)}->{len(wire)} B' if args.send_zlib else ''}")
             print(f"[tx]     the message: {body.hex()}")
             # A stream: one message alone does not hold the console's state.
-            deadline = time.monotonic() + args.send_seconds
+            deadline = run_until()
             seq = args.send_sequence
             answered_serial = None
             while time.monotonic() < deadline:
-                if seq - args.send_sequence >= args.send_count:
+                if args.send_count and seq - args.send_sequence >= args.send_count:
                     break
                 said = st["said_by_proto"].get(args.send_protocol)
                 if (args.answer_once and st["offer_pending"] is None
@@ -1174,7 +1413,7 @@ async def main_async(args):
             if args.send_snapshot is None:
                 return
             if args.send_snapshot == "live":
-                deadline = time.monotonic() + args.send_seconds + args.send_after + args.send_wait
+                deadline = run_until(args.send_after + args.send_wait)
                 wanted = range(trade_payload.FRAGMENT_COUNT)
                 while not all(i in st["snapshot_bodies"] for i in wanted):
                     if time.monotonic() > deadline:
@@ -1208,8 +1447,8 @@ async def main_async(args):
             if edits or args.offer_file:
                 at = (args.offer_slot - 1) * swsh_pokemon.SIZE_PARTY
                 if args.offer_file:
-                    raw = swsh_pokemon.encrypt(gen8.load(Path(args.offer_file).read_bytes()))
-                    print(f"[tx] slot {args.offer_slot} is {args.offer_file}")
+                    raw = swsh_pokemon.encrypt(gen8.load(Path(args.offer_file[0]).read_bytes()))
+                    print(f"[tx] slot {args.offer_slot} is {args.offer_file[0]}")
                 else:
                     raw = original_party[at:at + swsh_pokemon.SIZE_PARTY]
                 if struct.unpack_from("<I", raw, 0)[0] == 0:
@@ -1225,10 +1464,12 @@ async def main_async(args):
             if args.offer_slot:
                 at = (args.offer_slot - 1) * swsh_pokemon.SIZE_PARTY
                 raw = payload[at:at + swsh_pokemon.SIZE_PARTY]
-                if getattr(args, "validate_offer", False):
-                    raw = swsh_pokemon.encrypt(gen8.load(pokemon_service.prepare("swsh", raw)))
-                    payload = payload[:at] + raw + payload[at + swsh_pokemon.SIZE_PARTY:]
-                st["our_pk8"] = raw
+                if args.fresh_pid and not args.offer_file:
+                    raw = renewed(raw)
+                raw = validated(raw)
+                payload = payload[:at] + raw + payload[at + swsh_pokemon.SIZE_PARTY:]
+                st["our_pk8"] = st["first_pk8"] = raw
+                screen.offer("swsh", raw)
                 ours = swsh_pokemon.read(st["our_pk8"])
                 print(f"[tx] we will offer slot {args.offer_slot}: species {ours['species']} "
                       f"{ours['nickname']!r} level {ours['level']}")
@@ -1244,7 +1485,7 @@ async def main_async(args):
                   f"{[p['nickname'] for p in fields['party'] if p]}, "
                   f"consistent {trade_payload.party_matches_trainer(fields)}")
 
-            deadline = time.monotonic() + args.send_seconds + args.send_after + args.send_wait
+            deadline = run_until(args.send_after + args.send_wait)
             while st["snapshot_in"] == 0:
                 if time.monotonic() > deadline:
                     print("\n[tx] the console never sent its snapshot; ours stayed home")
@@ -1287,7 +1528,7 @@ async def main_async(args):
             port = args.rpc_port
             key = (reliable5.PROTOCOL, port)
             dests = [host_constant] if args.send_destinations != "none" else []
-            deadline = time.monotonic() + args.send_seconds + args.send_after + args.send_wait
+            deadline = run_until(args.send_after + args.send_wait)
             seq = reliable4.FIRST_SEQUENCE
             last_answered = None
             answered_serial = None
@@ -1378,7 +1619,7 @@ async def main_async(args):
                 return
             key = (mesh.PROTOCOL, mesh.PORT_RELIABLE)
             dests = [host_constant] if args.send_destinations != "none" else []
-            deadline = time.monotonic() + args.send_seconds + args.send_after + args.send_wait
+            deadline = run_until(args.send_after + args.send_wait)
             seq = reliable4.FIRST_SEQUENCE
             while time.monotonic() < deadline:
                 payload = st["migration_pending"]
@@ -1417,7 +1658,7 @@ async def main_async(args):
             Without it the link drops about 1.3 s after the console hands the host role over."""
             if not args.update_mesh:
                 return
-            deadline = time.monotonic() + args.send_seconds + args.send_after + args.send_wait
+            deadline = run_until(args.send_after + args.send_wait)
             counter = None
             while time.monotonic() < deadline:
                 if not (st["we_are_host"] and st["last_update_mesh"] and st["our_index"] is not None):
@@ -1446,6 +1687,130 @@ async def main_async(args):
                 await trio.sleep(args.update_mesh_period)
 
 
+        async def raid_sender():
+            """A Max Raid guest's three lobby messages on 0x80 port 0 once our snapshot is through:
+            PlayerInfo (zlib, 4 KB window, flag 0x10), BattleReady, SelectPokemon (docs/swsh_raid.md)."""
+            if not args.raid_join:
+                return
+            while not st["snapshot_done_sent"]:
+                await trio.sleep(0.1)
+            await trio.sleep(0.3)
+            if st["our_pk8"] is None:
+                print("[raid] no Pokemon to select: pass --offer-slot N")
+                return
+            z = zlib.compressobj(9, zlib.DEFLATED, 12)
+            info = z.compress(swsh_raid.player_info(args.raid_name)) + z.flush()
+            msgs = [reliable4.build_message(info, reliable4.FIRST_DATA_FLAGS | reliable5.FLAG_ZLIB, 1,
+                                            lowest_pending=1, destinations=[host_constant]),
+                    reliable4.build_data_message(swsh_raid.battle_ready(), 2,
+                                                 destinations=[host_constant]),
+                    reliable4.build_data_message(swsh_raid.select_pokemon(st["our_pk8"]), 3,
+                                                 destinations=[host_constant])]
+            print(f"\n[raid] *** SENDING PlayerInfo {args.raid_name!r}, BattleReady, SelectPokemon ***")
+            for attempt in range(40):
+                for body in msgs:
+                    sock.sendto(wrap(keys, our_mac, our_constant, next_nonce(), body,
+                                     reliable4.BROADCAST_PROTOCOL, args.connect_station_first),
+                                (host_ip, PIA_PORT))
+                    record(rec="tx_data", t=time.monotonic() - t0, protocol=0x80, message=body.hex())
+                await trio.sleep(0.5)
+                if max(st["broadcast_ack_ids"], default=0) > 3:
+                    print(f"[raid] *** THE HOST ACKED ALL THREE *** after {attempt + 1} sends")
+                    break
+            else:
+                print("[raid] the host never acked the three messages")
+                return
+            if args.raid_ready is None:
+                return
+            await trio.sleep(args.raid_ready)
+            body = reliable4.build_data_message(swsh_raid.battle_ready(True), 4,
+                                                destinations=[host_constant])
+            print("\n[raid] *** READY ***")
+            for attempt in range(40):
+                sock.sendto(wrap(keys, our_mac, our_constant, next_nonce(), body,
+                                 reliable4.BROADCAST_PROTOCOL, args.connect_station_first),
+                            (host_ip, PIA_PORT))
+                record(rec="tx_data", t=time.monotonic() - t0, protocol=0x80, message=body.hex())
+                await trio.sleep(0.5)
+                if max(st["broadcast_ack_ids"], default=0) > 4:
+                    print(f"[raid] *** THE HOST ACKED OUR READY *** after {attempt + 1} sends")
+                    break
+            # The host answers its own ready with BattleStart, BossPokemon, Rewards, BattleSeed and a
+            # BattleReady whose byte 12 is 1; the guest echoes that stage (docs/swsh_raid.md).
+            while True:
+                said = [swsh_raid.parse(p) for p in st["raid_rx"]]
+                if any(x and x[0] == swsh_raid.BATTLE_READY and x[1][12] == 1 for x in said):
+                    break
+                await trio.sleep(0.1)
+            print("\n[raid] *** THE HOST STARTS THE BATTLE *** fields "
+                  f"{sorted({x[0] for x in said if x})}")
+            # An emulated guest sends its SelectPokemon again first.
+            msgs = [reliable4.build_data_message(swsh_raid.select_pokemon(st["our_pk8"]), 5,
+                                                 destinations=[host_constant]),
+                    reliable4.build_data_message(swsh_raid.battle_ready(True, started=True), 6,
+                                                 destinations=[host_constant])]
+            for attempt in range(40):
+                for body in msgs:
+                    sock.sendto(wrap(keys, our_mac, our_constant, next_nonce(), body,
+                                     reliable4.BROADCAST_PROTOCOL, args.connect_station_first),
+                                (host_ip, PIA_PORT))
+                    record(rec="tx_data", t=time.monotonic() - t0, protocol=0x80, message=body.hex())
+                await trio.sleep(0.5)
+                if max(st["broadcast_ack_ids"], default=0) > 6:
+                    print(f"[raid] *** THE HOST ACKED OUR SECOND READY *** after {attempt + 1} sends")
+                    break
+            # The battle on 0x7C: raid_battle.Guest answers the host's messages; each port is its
+            # own reliable stream, resent until acked.
+            moves = [m for m in swsh_pokemon.read(st["our_pk8"])["moves"] if m]
+            move = moves[min(args.raid_move, len(moves)) - 1]
+            print(f"[raid] our Pokemon fights with move {move} (slot {args.raid_move} of {moves})")
+            guest = raid_battle.Guest(our_constant, slot=1, action=raid_battle.action(move))
+            done, seq, sent = 0, {0: 1, 1: 1}, {0: [], 1: []}
+            last_send = 0.0
+            while True:
+                fresh = False
+                while done < len(st["raid_rx7c"]):
+                    port, data = st["raid_rx7c"][done]
+                    done += 1
+                    for out_port, payload in guest.receive(port, data):
+                        sent[out_port].append((seq[out_port], payload))
+                        print(f"[raid] 0x7c/{out_port} seq {seq[out_port]} {payload.hex()[:80]}")
+                        record(rec="raid_tx", port=out_port, sequence=seq[out_port],
+                               payload=payload.hex())
+                        seq[out_port] += 1
+                        fresh = True
+                now = time.monotonic()
+                if now - last_send > 0.3 or fresh:
+                    last_send = now
+                    for p_ in sent:
+                        acked = st["ack_slot0"].get((0x7C, p_), 1)
+                        pending = [(s_, pl) for s_, pl in sent[p_] if s_ >= acked]
+                        low = pending[0][0] if pending else seq[p_]
+                        for s_, pl in pending[:16]:
+                            body = reliable4.build_data_message(pl, s_, lowest_pending=low)
+                            sock.sendto(wrap(keys, our_mac, our_constant, next_nonce(), body,
+                                             0x7C, args.connect_station_first, port=p_),
+                                        (host_ip, PIA_PORT))
+                await trio.sleep(0.03)
+
+        async def raid_clock_sender():
+            """A raid guest's clocks, as an emulated guest runs them from the mesh join: one
+            ClockProtocol (0x77) request and a SyncClockProtocol (0x1C) request every second."""
+            if not args.raid_join:
+                return
+            await accepted.wait()
+            sock.sendto(wrap(keys, our_mac, our_constant, next_nonce(),
+                             bytes.fromhex("00000000000000000000000000000000006f"), 0x77,
+                             args.connect_station_first, destination=1), (host_ip, PIA_PORT))
+            clock = sync_clock.SyncClock(time.monotonic(), interval=1.0)
+            while True:
+                for payload in clock.poll(time.monotonic()):
+                    sock.sendto(wrap(keys, our_mac, our_constant, next_nonce(), payload,
+                                     sync_clock.PROTOCOL, args.connect_station_first,
+                                     destination=1),
+                                (host_ip, PIA_PORT))
+                await trio.sleep(0.1)
+
         async def block_sender():
             """The second stream: `imReady` (`60ea000012020801`) on the broadcast window.
 
@@ -1454,7 +1819,7 @@ async def main_async(args):
                 return
             payload = bytes.fromhex(args.send2_data)
             trigger = bytes.fromhex(args.send2_trigger) if args.send2_trigger else None
-            deadline = time.monotonic() + args.send_seconds + args.send_after + args.send_wait
+            deadline = run_until(args.send_after + args.send_wait)
             while trigger is not None:
                 if st["said_by_proto"].get(args.send2_protocol) == trigger:
                     print(f"\n[tx] the console said {trigger.hex()} on "
@@ -1491,6 +1856,10 @@ async def main_async(args):
             if st["block_acked"] is None and st["block_out"]:
                 print(f"\n[tx] {st['block_out']} out on {args.send2_protocol:#04x}, not acked")
 
+        def mid_trade():
+            """The console has offered and the ladder has not finished: leaving now fails it."""
+            return st["offered_pk8"] is not None and not st["ladder_finished"]
+
         async def guarded(name, task):
             """Run one sender; an exception reaching the nursery would stop sending mid-trade."""
             try:
@@ -1504,6 +1873,8 @@ async def main_async(args):
             nursery.start_soon(guarded, "joiner", joiner)
             nursery.start_soon(guarded, "data_sender", data_sender)
             nursery.start_soon(guarded, "block_sender", block_sender)
+            nursery.start_soon(guarded, "raid_sender", raid_sender)
+            nursery.start_soon(guarded, "raid_clock_sender", raid_clock_sender)
             nursery.start_soon(guarded, "snapshot_sender", snapshot_sender)
             nursery.start_soon(guarded, "rpc_sender", rpc_sender)
             nursery.start_soon(guarded, "migration_sender", migration_sender)
@@ -1512,8 +1883,11 @@ async def main_async(args):
             # Drop the link on a stall: one held through a stalled ladder becomes a failed trade and
             # an hour's lockout; a dropped link is a plain communication error.
             hold_until = time.monotonic() + args.hold
-            while time.monotonic() < hold_until:
+            while (time.monotonic() < hold_until
+                   or mid_trade() and time.monotonic() < hold_until + args.grace):
                 await trio.sleep(0.25)
+                if st["host_leaving"] is not None:
+                    break
                 if stall_abort(st["confirm_last_step"], time.monotonic() - t0,
                                args.abort_on_stall, st["ladder_finished"]):
                     print(f"\n[tx] *** THE LADDER STALLED FOR {args.abort_on_stall:.1f} s - "
@@ -1522,6 +1896,8 @@ async def main_async(args):
                           f"{len(st['confirm_steps_seen'])} distinct steps")
                     break
             nursery.cancel_scope.cancel()
+        # Closed before the network is released.
+        sock.close()
 
         windows = " / ".join(
             f"{p:#04x}:{port} {w['in']} in {w['acks']} acked through {w['through']}"
@@ -1565,6 +1941,24 @@ async def main_async(args):
 
 
 LADDER_FINAL_PHASE = 4        # `0x010dbf40`: phase 4 -> state 13 -> 14, the teardown, no send
+
+
+def departure_step(body):
+    """What a hosting Sword's leave owes its client, from one Local Protocol message: ("ack", payload)
+    for an update session carrying the host-migration state, ("leave", None) for
+    START_HOST_MIGRATION, else None. Each waits up to 10 s unanswered (docs/swsh_session.md,
+    Leaving)."""
+    try:
+        kind, _size = lp.parse_header(body)
+        if kind == lp.START_HOST_MIGRATION:
+            return ("leave", None)
+        if kind == lp.UPDATE_SESSION:
+            us = lp.parse_update_session(body)
+            if us.host_migration_state:
+                return ("ack", lp.build_ack(us.sequence_id))
+    except ValueError:
+        pass
+    return None
 
 
 def stall_abort(last_step, now, limit, final_phase_seen=False):
@@ -1619,10 +2013,11 @@ _TRANSPORT = (
 PRESETS = {
     "capture": _TRANSPORT + " --hold 90",
     "trade": (_TRANSPORT + " --snapshot-port 1 --rpc-port-answers --rpc-pair --rpc-bodies "
-              "--selection-final-delta 9 --selection-offer --offer-slot 1 --offer-nickname PKCAMP "
+              "--selection-final-delta 9 --selection-offer --offer-slot 1 --offer-nickname POKELDN "
               "--open-content 30,50 --open-content-offer --box-commands 1 --box-on-accept 4 "
               "--box-period 0.35 --confirm-commands 0,1,2,3,0,1,2,3,0,1,2,3 "
-              "--confirm-final-delta 9 --abort-on-stall 15 --hold 240"),
+              "--confirm-final-delta 9 --abort-on-stall 15 --hold 240 --send-seconds 0 "
+              "--send-count 0 --answer-migration --update-mesh --leave-with-host"),
 }
 
 
@@ -1635,10 +2030,22 @@ def build_parser():
     ap.add_argument("--comm-id", default=None, help="hex; defaults to Sword's 0x0100abf008968000")
     ap.add_argument("--keys", default="~/.switch/prod.keys")
     ap.add_argument("--phy", default="auto")
+    ap.add_argument("--ip-join", action="store_true",
+                    help="join an emulated console hosting over ldn_mitm on the LAN; no radio, "
+                         "no root, no keys. Each of --scans waits --dwell seconds for an answer")
+    ap.add_argument("--host-ip", default="127.0.0.2", help="--ip-join: the console's address")
+    ap.add_argument("--our-ip", default=None, help="--ip-join: our own address on that LAN")
+    ap.add_argument("--scan-ip", default=None,
+                    help="--ip-join: the address a scan leaves from; default --our-ip")
     ap.add_argument("--ifname", default="ldnclient")
     ap.add_argument("--channels", default="1,6,11")
     ap.add_argument("--dwell", type=float, default=1.5)
-    ap.add_argument("--name", default="PkCamp")
+    ap.add_argument("--scans", type=int, default=8,
+                    help="scans for a matching search (--scene) before giving up")
+    ap.add_argument("--scene", type=lambda v: None if v == "any" else int(v), default=SCENE_ACCEPTING,
+                    help="the LDN scene id to seat in: 60001 a Link Trade search; any takes the first "
+                         "Sword network (a Max Raid den, docs/swsh_gift.md)")
+    ap.add_argument("--name", default="POKELDN")
     ap.add_argument("--listen-first", type=float, default=6.0,
                     help="seconds of listening before the first packet out, so the capture holds "
                          "the console's own rate to compare against")
@@ -1781,6 +2188,10 @@ def build_parser():
                          "MIGRATION_RESPONSE. `440001` arrives there only when the player "
                          "accepts, and the console goes silent on every window afterwards: the "
                          "last thing it asks for is two bytes of mesh, not application data")
+    ap.add_argument("--leave-with-host", action="store_true",
+                    help="when the hosting console leaves, ack its update session carrying the "
+                         "host-migration state and leave the network on its START_HOST_MIGRATION, "
+                         "as its own clients do; each step waits 10 s unanswered")
     ap.add_argument("--migration-answer", choices=("auto", "finish", "response"), default="auto",
                     help="what to send when the console migrates the mesh. \"auto\" sends "
                          "MIGRATION_FINISH when the start names US as the next host and a "
@@ -1961,10 +2372,14 @@ def build_parser():
     ap.add_argument("--offer-slot", type=lambda s: int(s, 0), default=0,
                     help="which party slot of --send-snapshot to offer back, 1-6; 0 offers "
                          "nothing and only records what the console offers us")
-    ap.add_argument("--offer-file", default=None, metavar="FILE",
+    ap.add_argument("--offer-file", action="append", default=[], metavar="FILE",
                     help="a .pk8 to put in --offer-slot in place of the snapshot's record: stored "
                          "or party form, encrypted or PKHeX's decrypted export. Its OT name and "
-                         "ids become the snapshot's unless --offer-file-as-is")
+                         "ids become the snapshot's unless --offer-file-as-is. Repeatable, one per "
+                         "trade on the session: the console's player picks again from the box; the "
+                         "last serves every later trade")
+    ap.add_argument("--fresh-pid", action="store_true",
+                    help="draw a new encryption constant and PID for every offered Pokemon")
     ap.add_argument("--offer-file-as-is", action="store_true",
                     help="keep the file's own OT name and trainer ids")
     ap.add_argument("--offer-species", type=lambda s: int(s, 0), default=None,
@@ -1991,7 +2406,7 @@ def build_parser():
     ap.add_argument("--save-offer", default=None, metavar="FILE",
                     help="write the PK8 we will offer to this file, before the radio is touched")
     ap.add_argument("--save-offered", default=None, metavar="FILE",
-                    help="write the PK8 the console offers to this file")
+                    help="write the PK8 the console offers to this file; trade N > 1 writes FILE-N")
     ap.add_argument("--rpc-clock-delta", type=lambda s: int(s, 0), default=5,
                     help="how far to advance a trade RPC's clock in our answer. 5 is nxldn-lab's "
                          "and is the one number in this path nothing here has measured")
@@ -2015,7 +2430,7 @@ def build_parser():
                          "from this session. A short "
                          "2965-byte payload is inflated first. The identity is rewritten by "
                          "--snapshot-name/-tid/-sid")
-    ap.add_argument("--snapshot-name", default="PkCamp")
+    ap.add_argument("--snapshot-name", default="POKELDN")
     ap.add_argument("--snapshot-tid", type=lambda s: int(s, 0), default=12345)
     ap.add_argument("--snapshot-sid", type=lambda s: int(s, 0), default=54321)
     ap.add_argument("--snapshot-port", default="0",
@@ -2034,14 +2449,26 @@ def build_parser():
                          "the fixed --send-data. --send-data is still the first payload, before "
                          "the console has said anything")
     ap.add_argument("--send-count", type=lambda s: int(s, 0), default=1,
-                    help="how many sequence ids of ours to send in all. One message does not "
-                         "hold the console's state; it sends its own heartbeat about 580 times in "
-                         "180 s")
+                    help="how many sequence ids of ours to send in all; 0 has no limit. One "
+                         "message does not hold the console's state; it sends its own heartbeat "
+                         "about 580 times in 180 s")
     ap.add_argument("--send-period", type=float, default=1.0,
                     help="the retransmit interval. A window retransmits until it is acked")
     ap.add_argument("--send-seconds", type=float, default=60.0,
-                    help="how long to keep retransmitting if nothing acknowledges it")
+                    help="how long to keep retransmitting if nothing acknowledges it; 0 sends "
+                         "until the run ends")
+    ap.add_argument("--raid-join", action="store_true",
+                    help="a Max Raid den guest: after the snapshot send PlayerInfo, BattleReady and "
+                         "SelectPokemon (the --offer-slot Pokemon); use with --scene 60006")
+    ap.add_argument("--raid-ready", type=float, default=None, metavar="SECONDS",
+                    help="press ready this many seconds after the host acked the lobby messages")
+    ap.add_argument("--raid-move", type=int, default=1, choices=(1, 2, 3, 4),
+                    help="the move slot our Pokemon uses every turn")
+    ap.add_argument("--raid-name", default="POKELDN", help="the name the raid lobby shows for us")
     ap.add_argument("--hold", type=float, default=30.0)
+    ap.add_argument("--grace", type=float, default=300.0,
+                    help="seconds past --hold to keep a session whose trade is under way: the "
+                         "console has offered and the ladder has not finished")
     ap.add_argument("--capture", default=None)
     return ap
 
@@ -2061,13 +2488,14 @@ def main(argv=None):
         build_parser().error(str(e))
     if args.offer_file:
         edits = offer_edits(args)
-        args.offer_file = pokemon_service.prepare_file("swsh", args.offer_file,
-            transform=lambda raw: swsh_pokemon.build_from(raw, **edits))
+        args.offer_file = [pokemon_service.prepare_file(
+            "swsh", path, fresh=args.fresh_pid,
+            transform=lambda raw: swsh_pokemon.build_from(raw, **edits)) for path in args.offer_file]
         args.offer_file_as_is = True
         for key in ("species", "ability", "level", "experience", "nickname", "ot", "ivs", "moves"):
             setattr(args, "offer_" + key, None)
     args.validate_offer = True
-    if needs_root():
+    if not args.ip_join and needs_root():
         build_parser().error("must run as root (LDN needs the raw radio)")
     try:
         return trio.run(main_async, args)
@@ -2075,7 +2503,8 @@ def main(argv=None):
         print(f"[cx] {type(e).__name__}: {e}")
         for sub in getattr(e, "exceptions", ()) or ():
             print(f"[cx]   caused by: {type(sub).__name__}: {sub}")
-        cleanup()
+        if not args.ip_join:
+            cleanup()
         raise
 
 

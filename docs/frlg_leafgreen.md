@@ -34,12 +34,12 @@ The measurements run inside the Mystery Gift menu, so the console never leaves i
 not in the table instead of falling back to FireRed.
 
 Every IWRAM and EWRAM address measured is identical (link-time globals of the same code); every ROM
-address above 0x080486C8 differs. That holds for fifteen symbols; the next is still measured.
+address above 0x080486C8 differs. Fifteen symbols confirm it; a new ROM symbol is measured, not predicted.
 
-## The delta is a property of a region
+## The delta by region
 
-The offset from a FireRed address to its LeafGreen twin is piecewise constant, in at least eight
-segments, and not monotonic (the four low segments each diverge four bytes less than the one below):
+The offset from a FireRed address to its LeafGreen twin is piecewise constant over at least eight
+segments and not monotonic (the four low segments each diverge four bytes less than the one below):
 
     +0x0   -0x2C   -0x28   -0x24   -0x20   -0x1C4   -0x124C   -0x1240   -0x12D8
 
@@ -65,7 +65,7 @@ window matching the old delta to the first matching the new one. `rom_map.LEAFGR
 holds them; a test asserts the boundary and segment tables agree. Above 0x0843C800 the cartridges
 hold different bytes (version-specific graphics), so the delta there is undefined by content.
 
-## The methods, in order of cost
+## Measurement methods
 
 ### Paired constants
 
@@ -96,8 +96,8 @@ place's address there. Two runs a point, anywhere in the ROM:
 | 0x086003E0 | 0x085FF108 | 0xE1926F4D | −0x12D8 |
 | 0x086803FC | 0x0867F124 | 0xC35D61AE | −0x12D8 |
 
-Each scan returned one match in a 2 MB window. Two agreeing points do not constrain the range
-between them; a control must. The script-layer scans:
+Each scan returned one match in a 2 MB window. Two agreeing points leave the range between them
+unconstrained, so a control point is needed. The script-layer scans:
 
 | needle | taken from | found on LeafGreen at | delta |
 |---|---|---|---|
@@ -140,11 +140,11 @@ delta at the target; a 16 KB handler window holds 834. `tools/frlg/cartridge_pai
 
 ### Dumping both cartridges at the same address
 
-This method closed the map. At a common address with delta d, the LeafGreen block
+At a common address with delta d, the LeafGreen block
 holds the FireRed block shifted by d; for |d| under a kilobyte, cross-correlation reads d directly.
 `memory-dump-scatter` sends the same 27 addresses to both consoles. Inside a block, testing which
-delta still matches window by window places a step to the byte: 346 KB of unmeasured boundary became
-2036 bytes across the five code steps, and all 272 specials have a LeafGreen address.
+delta still matches window by window places a step to the byte: the boundaries of the five code
+steps total 2036 bytes, and all 272 specials have a LeafGreen address.
 
 A wide gap may hide several steps: the 421 KB from −0x1C4 to −0x12D8 holds three. Graphics
 resembles itself, so each reading is scored against the alternatives: at 0x08442800 −0x124C scores
@@ -170,14 +170,15 @@ Every literal in [the seek stubs](frlg_rng.md) is a link-time IWRAM word shared 
 object to bind to: `initramscript` takes a map group, map number and object id, and `GetRamScript`
 runs the script instead of the object's own [field_control_avatar.c:458]. Cerulean Cave B1F is group
 1 map 74 [data/maps/map_groups.json]; Mewtwo is object 3 [data/maps/CeruleanCave_B1F/map.json].
-`rng-mon-hunt-both` bound there with `setwildbattle` species 150 level 70 replaced Mewtwo's script,
-started the battle at once, and produced a shiny Mewtwo.
+`rng-mon-hunt-both` bound there with `setwildbattle` species 150, level 70, replaces Mewtwo's script
+and starts an aimed Mewtwo battle at once (verified shiny on retail LeafGreen).
 
 - The stray-draw search works on LeafGreen; the stub reads `TID ^ SID` off `gSaveBlock2Ptr` at run
   time [asm/field/mon-seek-both.s:73].
 - The binding survives a power cycle, although `gSaveBlock1Ptr` is re-rolled on every load.
 - A buffer script sends no card and leaves the RAM script slot alone. A Wonder Card session takes it
-  back; an ordinary card restored Mewtwo's script through `InitRamScript_NoObjectEvent`.
+  back: an ordinary card rebinds the slot through `InitRamScript_NoObjectEvent`, and Mewtwo's own
+  script returns.
 
 While bound, the console reports holding no Wonder Card; the card stays intact
 ([the one RAM script slot](frlg_gift.md#the-one-ram-script-slot)).
@@ -185,22 +186,22 @@ While bound, the console reports holding no Wonder Card; the card stays intact
 ## A dumped region must not move
 
 A `memory-dump` of 0x03004220 (`gRngValue`, two turns per frame) dies mid-transmission with *erreur
-de connexion*: the CRC and the send happen on different frames. A repeat fails with a different CRC
-pair; the same 32 bytes from ROM read back fine. Mechanism and guard:
+de connexion*: the CRC and the send happen on different frames. A dump of a region that changes
+between frames fails its CRC; a ROM region of the same size does not. Mechanism and guard:
 [Code on the console](frlg_rom.md#repointing-the-consoles-outgoing-message).
 
-Starting 4 bytes higher reads the save-block pointers. Both moved by exactly 12 between two readings,
-one shared 4-aligned offset inside the 0..124 range `SetSaveBlocksPointers` rolls.
+Starting 4 bytes higher reads the save-block pointers. Both move together, by one shared 4-aligned
+offset inside the 0..124 range `SetSaveBlocksPointers` rolls [load_save.c:75].
 
-## The English build as an instrument
+## The English build
 
 `pret/pokefirered` builds both cartridges at REVISION 10, the Switch release's revision:
 
     make firered_switch     -> pokefirered_switch.gba    baa452d0b24629dd7782cfc07a8984085dde1311
     make leafgreen_switch   -> pokeleafgreen_switch.gba  62b9fc77549dbc67032eb6cbd0ea6ad3b825690f
 
-Both match the decomp's sha1 when built with binutils and `pret/agbcc` (about two minutes); a build
-that does not match is unusable. The ROM is never committed.
+Both match the decomp's sha1 when built with binutils and `pret/agbcc`; a build that does not match
+is unusable. The ROM is never committed.
 
 It is the English release: at the same address a French console and the English build agree on 3.7%
 of bytes, since French strings differ in length. It serves as a second cartridge pair from the same
@@ -227,7 +228,7 @@ keeps every name an address carries.
 
     ./.venv/bin/python tools/frlg/english_build.py --check
 
-A name from here is a deduction. `rom_map.CALLABLE` means called on hardware with an effect;
+A name from the English build is inferred. `rom_map.CALLABLE` means called on hardware with an effect;
 `worker_names` means the console's own body called it in source order. `pokeldn/frlg/rom/english_names.py`
 holds 7573 French function addresses named this way (`scripts/gen_english_names.py`), with the offset
 runs. `rom_functions` reads them last, marked `[english]`, so a deduction never overrules a body the
@@ -237,7 +238,7 @@ Of 177 unnamed call targets, 158 fall inside a measured offset run and are named
 between runs and go to `english_names.BRACKETED`: named with one of the two neighbouring offsets, only
 when it lands exactly on a function start and the other does not (`[english?]`). Two are left. Three
 targets reached from a dozen bodies each read as `__divsi3`, `__modsi3` and `__umodsi3`, agbcc's
-division helpers, as the worker-naming pass had predicted.
+division helpers.
 
 ### The English pair's own delta map
 
@@ -261,10 +262,10 @@ inside the brackets measured on hardware.
   `french delta = offsetFR - offsetLG + english delta`.
 - Regenerate `english_names.py` with `scripts/gen_english_names.py` after any new dump.
 
-## What did not work
+## Unusable references
 
-`gSongTable` (347 `{header, ms, me}` entries) packs 122 song headers inside 9 KB, so it measures one
-place, not many.
+`gSongTable` (347 `{header, ms, me}` entries) packs 122 song headers inside 9 KB, so it fixes one
+place only.
 
 FireRed's ROM data ends between 0x086ABE68 (the last song header) and 0x08800000: 0x08800000 reads
 all `0xFF`, 0x08E00000 all `0x00`, 0x08680000 is high-entropy data.

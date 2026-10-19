@@ -43,7 +43,7 @@ def test_wonder_card_advertisement_matches_the_proven_friend_control():
     (docs/frlg_gift.md)."""
     inactive, _active = build_wonder_card_app_data(DEFAULT_TRAINER, SESSION_ID)
     record = _record(inactive)
-    assert record.hex() == "2288cadfbdd5e1e4ffff7bf1000000009515000000000000"
+    assert record.hex() == "2288cac9c5bfc6bec8ff7bf1000000009515000000000000"
 
 
 def test_advertisement_declares_activity_wonder_card_and_is_joinable():
@@ -76,7 +76,7 @@ def test_trade_advertisement_is_unchanged_by_the_gift_host():
     """The trade host is proven on hardware and must stay bit-identical."""
     inactive, _active = build_trade_app_data(DEFAULT_TRAINER, SESSION_ID)
     record = _record(inactive)
-    assert record.hex() == "2288cadfbdd5e1e4ffff7bf1000000008415000000000000"
+    assert record.hex() == "2288cac9c5bfc6bec8ff7bf1000000008415000000000000"
     assert record[beacon.SEARCH_WORD_OFFSET] & beacon.SEARCH_ACTIVITY_MASK \
         == beacon.ACTIVITY_TRADE
 
@@ -96,7 +96,7 @@ def test_default_config_selects_the_self_contained_celebi_gift():
     assert charmap.decode(card[10:50]).startswith("CELEBI GIFT")
     assert int.from_bytes(card[2:4], "little") == wonder_card.SPECIES_CELEBI
     assert int.from_bytes(card[4:8], "little") == 3
-    assert charmap.decode(card[250:290]).endswith("MercuryEnigma")
+    assert charmap.decode(card[250:290]).endswith("POKELDN")
     assert 0 < len(script) <= gift_composer.MAX_RAM_SCRIPT_SIZE
     assert script != wonder_card.build_delivery_ram_script(item=None, flag_id=1003)
 
@@ -229,3 +229,54 @@ def test_the_cli_passes_the_expectation_through_to_the_engine():
 
     assert config.expect_console == "leafgreen"
 
+
+
+def _accepted_wonder_activities(rom):
+    """sAcceptedActivityIds_{WonderCard,WonderNews} [src/data/union_room.h:398-406] from the
+    cartridge's own table: nine ALIGNED(4) {activity, 0xFF} entries from SingleBattle on."""
+    import re
+    for match in re.finditer(rb"\x01\xff..\x02\xff..\x03\xff..\x04\xff..", rom, re.S):
+        if match.start() % 4 == 0:
+            entries = rom[match.start():match.start() + 36]
+            return entries[28], entries[32]
+    raise AssertionError("no sAcceptedActivityIds table")
+
+
+def _advertised_activity(argv):
+    import frlg_mg_host
+    from pokeldn.frlg.gift.host_mg_app import WonderNewsHostApplication
+    seen = {}
+
+    class FakeTransport:
+        NEEDS_RADIO = False
+
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+    parser = frlg_mg_host.build_parser()
+    config = frlg_mg_host.build_run_config(parser, parser.parse_args(argv))
+    cls = WonderNewsHostApplication if "--news" in argv else MysteryGiftHostApplication
+    app = cls(config, transport_factory=FakeTransport, log=lambda *_args: None)
+    app._build_components()
+    return _search_word(seen["app_data"]) & beacon.SEARCH_ACTIVITY_MASK
+
+
+@pytest.mark.parametrize("code", ["BPRE", "BPRF", "BPGD", "BPRS", "BPRJ", "BPGJ"])
+def test_the_advertised_activity_is_one_the_cartridge_lists_as_a_friend(code):
+    """A Japanese Friend list drops activity 21; its table holds 6 and 7."""
+    import pathlib
+    from pokeldn.frlg.rom import builds
+    build = builds.BUILDS[code]
+    rom = pathlib.Path(f"scratchpad/frlg_languages/"
+                       f"{'FireRed' if build.version == 'firered' else 'LeafGreen'}_{code[3].lower()}.gba")
+    if not rom.exists():
+        pytest.skip("no cartridge image on this machine")
+    card, news = _accepted_wonder_activities(rom.read_bytes())
+    assert _advertised_activity(["--buffer-script", "trainer-id-probe", "--version", build.version,
+                                 "--console-build", code]) == card
+    assert _advertised_activity(["--news", "--version", build.version, "--console-build", code]) == news
+
+
+def test_the_trainer_language_picks_the_numbering_when_any_cartridge_is_served():
+    assert _advertised_activity(["--buffer-script", "trainer-id-probe"]) == 21
+    assert _advertised_activity(["--buffer-script", "trainer-id-probe", "--language", "japanese"]) == 6

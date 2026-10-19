@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Join a searching Scarlet / Violet console's network and trade with it (docs/sv.md).
+"""Join a searching Scarlet / Violet console's network and trade with it (docs/sv.md), or join the
+Tera Raid it hosts with one of our Pokemon (`--raid-pokemon`, docs/sv_raid.md).
 
 The searching console alternates a few seconds hosting with scanning; this scans until it hosts.
 
@@ -17,6 +18,7 @@ import argparse
 import json
 import os
 import socket
+import struct
 import sys
 import time
 
@@ -27,17 +29,18 @@ if os.path.isdir(BUNDLED_LDN):
     sys.path.insert(0, BUNDLED_LDN)
 
 import trio
-import ldn
+from pokeldn.ldn import api as ldn, radios
 
 from pokeldn.host_support import open_output
 from pokeldn import pokemon as pokemon_service
 from pokeldn import sv
 from pokeldn.ldn import ldn_mitm, pia6, pia_connect, reliable5
-from pokeldn.sv import pokemon, port2, reference, streams, trade
-from pokeldn.ldn import game_channel
+from pokeldn.sv import pokemon, port2, raid, reference, streams, trade
+from pokeldn.ldn import channel_table, game_channel
 from pokeldn.ldn.transport import board_radio, find_ap_phy
 from pokeldn.host_support import resolve_keys, needs_root
-from pokeldn.ldn import show_done
+from pokeldn.ldn import show_done, trades_done
+from pokeldn.app import screen
 
 PROTO_NET = 0x2C
 PROTO_RTT = 0x58
@@ -54,6 +57,8 @@ NET_CONN_STATUS_ACK = 0x12
 # Net 0x50 and the joiner's 0x51 answer (docs/sv.md).
 NET_0x50 = 0x50
 NET_0x51 = 0x51
+# Sent only by NetDestroyNetworkJob (`0x69d310` from `0x6aca54`), every 0.3 s until every client has
+# left the LDN network or 4 s pass (`0x6acac8`; docs/sv.md, Leaving).
 ESTABLISHING_FLAGS = pia6.MESSAGE_FLAG_SKIP_SOURCE_CHECK
 # Fallback only: a retail host names the joiner's id in the footer of its first mesh-addressed
 # packet, and the joiner takes it (docs/sv.md).
@@ -62,6 +67,18 @@ OUR_STATION_INDEX = 1
 PROTO_CLOCK = 0x77
 CLOCK_REQUEST = bytes(18)
 CHANNEL_PORT2_OPEN = port2.build_join(0)
+# A raid guest, as a retail one did it (docs/sv_raid.md, Joining): the clock request marks byte 9;
+# the first Session update is answered only at its retransmission; the 0x7C acks wait 0.25 s;
+# port 2 joins 0.24 s after the channel table, the raid's keys follow 0.79 s after it.
+RAID_SCENE = 7
+RAID_CLOCK_REQUEST = bytes(9) + b"\x01" + bytes(8)
+RAID_UPDATE_HOLD = 1.0
+RAID_CHANNEL_ACK_DELAY = 0.25
+RAID_PORT2_DELAY = 0.24
+RAID_KEYS_DELAY = 0.79
+RAID_LOBBY_DELAY = 0.27           # after the identity
+RAID_NET_FLAGS = 0x11             # Net 0x12 and 0x51 wake the host's Net job under 0x11
+LEAVE_SENDS, LEAVE_REPEAT = 4, 0.5  # a leaving station's type 3 (docs/sv.md, Leaving)
 HOST_BITMAP = 0x01                # the destination mask a joiner writes: the host, station 0
 ACK_ENTRIES = 4  # a retail station's bulk ack carries four
 
@@ -215,6 +232,8 @@ def build_bulk_ack(high, our_next_seq, stream_id=0):
 def build_parser():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--print-packets", action="store_true",
+                    help="print every packet in and out; the --capture file keeps them either way")
     ap.add_argument("--code", default="",
                     help="join only a console searching with this Link Code; empty takes any")
     ap.add_argument("--comm-id", default=None,
@@ -236,7 +255,7 @@ def build_parser():
     ap.add_argument("--seconds", type=float, default=600.0, help="how long to keep trying")
     ap.add_argument("--hold", type=float, default=60.0,
                     help="how long to stay in one joined session before scanning again")
-    ap.add_argument("--name", default="PkCamp", help="the LDN node name we publish")
+    ap.add_argument("--name", default="POKELDN", help="the LDN node name we publish")
     ap.add_argument("--platform", type=int, default=sv.PLATFORM,
                     help="the station platform byte we publish; 1 is what a Switch 2 sends")
     ap.add_argument("--mac", default=None,
@@ -244,6 +263,14 @@ def build_parser():
                          "derives a station's constant id from its MAC, and the two consoles' are "
                          "Nintendo OUIs where the adapter's is not. The driver reload in the "
                          "launcher puts the adapter's own address back")
+    ap.add_argument("--scene-id", type=int, default=None,
+                    help="join only a network of this LDN scene: 4 a Link Trade, 7 a Tera Raid")
+    ap.add_argument("--raid-pokemon", metavar="FILE",
+                    help="join the Tera Raid lobby a console hosts and bring this party record, "
+                         "legal per PKHeX; our player readies, answers the start and leaves when "
+                         "the battle begins, its Pokemon fighting on for the console")
+    ap.add_argument("--raid-ready-delay", type=float, default=2.0,
+                    help="seconds in the raid lobby before our player readies")
     ap.add_argument("--scan-only", action="store_true",
                     help="report what the console advertises and join nothing")
     ap.add_argument("--session-join", action="store_true",
@@ -269,6 +296,8 @@ def build_parser():
                          "writes one from a station's own log, so a whole real identity can be "
                          "replayed rather than the host's mirrored back; by default the recorded "
                          "set in pokeldn.sv.reference")
+    ap.add_argument("--trainer-name", default="POKELDN",
+                    help="the player name record 1 of our identity carries, the one the trade screen shows")
     ap.add_argument("--no-identity", action="store_true",
                     help="send no station identity unless --record-set or --send-on-open names "
                          "one; by default the recorded one in pokeldn.sv.reference")
@@ -328,20 +357,31 @@ def build_parser():
                          "for the whole --hold")
     ap.add_argument("--leave-on-migration", type=float, default=None, metavar="SECONDS",
                     help="end the seat this many seconds after the console asks us to take the "
-                         "host role, and go back to scanning. A console that sends Session type 7 "
-                         "was seated late in its five-second host phase and sends nothing but "
-                         "NetStartHostMigration afterwards, so the seat is spent; without this "
-                         "the run holds it for the whole --hold")
+                         "host role (Session type 7), and go back to scanning. A console that sent "
+                         "it sent nothing but NetStartHostMigration afterwards in the seats "
+                         "measured; without this the run holds the seat for the whole --hold")
+    ap.add_argument("--stay-on-host-migration", action="store_true",
+                    help="hold the seat after the console's NetStartHostMigration (Net 0x40). By "
+                         "default the joiner leaves on the first one: the console is destroying "
+                         "its network and resends it until every client has left, for up to 4 s")
     ap.add_argument("--announce-timeout", type=float, default=None, metavar="SECONDS",
                     help="end a seat whose console has not announced on 0x80 port 2 this many "
                          "seconds after the seat, and go back to scanning. A seat can carry every "
                          "stream to completion and never be announced (docs/sv.md, Unresolved); "
                          "board seats that traded announced at 5.8 and 7.7 s")
+    ap.add_argument("--take-host", action=argparse.BooleanOptionalAction, default=True,
+                    help="when the console hands us the host role before the announcement (not a player leaving), leave "
+                         "its network and become the host with bin/sv_host.py on the same channel "
+                         "and code, as bin/pla_join.py does; needs --answer-migration")
     ap.add_argument("--answer-migration", action="store_true",
                     help="answer the host's type-7 leave-with-host-migration with a type-8 ack, "
                          "telling it we accept the host role it is handing over")
     ap.add_argument("--no-update-ack", action="store_true",
                     help="do not answer a Session type-5 station update with the type 6")
+    ap.add_argument("--join-delay", type=float, default=0.0, metavar="SECONDS",
+                    help="hold the Session join request this long after the seat. A console whose "
+                         "WaitMember (3 to 4 s) ends unjoined leaves with host migration, so a join "
+                         "accepted in its leave wait draws the type 7 (docs/sv.md, What decides a seat)")
     ap.add_argument("--join-repeat", type=float, default=2.0,
                     help="with --session-join, re-send it every N seconds (0 sends it once)")
     ap.add_argument("--join-player-id", default="arceus",
@@ -414,9 +454,39 @@ def describe_offer(body):
         return f"{len(body)} bytes that do not read as a record: {exc}"
 
 
+RAID_KEYS = {struct.pack("<II", key & 0xFF, key >> 8) for key in (raid.KEY_LOBBY, raid.KEY_BATTLE)}
+
+
+def split_raid_table(message):
+    """-> (the four-key table, the raid's two keys): a raid host's zlib table of six keys, which a
+    retail guest announces as two messages, the raid's keys 0.79 s after the rest."""
+    plain = streams.decompress(message["payload"]) if message["flags"] & reliable5.FLAG_ZLIB \
+        else message["payload"]
+    entries = channel_table.parse(plain)
+    return (channel_table.build([e for e in entries if e[0] not in RAID_KEYS]),
+            channel_table.build([e for e in entries if e[0] in RAID_KEYS]))
+
+
+def raid_guest(ap, args):
+    """The settings a raid guest runs under; our identity is the standard record set, named."""
+    if args.trade_offer:
+        ap.error("a raid guest offers no trade")
+    args.raid_pokemon = pokemon_service.prepare_file("sv", args.raid_pokemon, fresh=args.fresh_pid)
+    args.scene_id = RAID_SCENE if args.scene_id is None else args.scene_id
+    args.session_join = args.game_channel = args.net_ack = True
+    args.no_identity, args.port2_now = True, False
+    args.join_repeat, args.open_delay, args.record_delay = 0, 0.02, 0.44
+    args.join_player_name = args.trainer_name
+    args.record_set = args.record_set or reference.RECORDS
+    print(f"[sv] raid guest bringing "
+          f"{pokemon.describe(pokemon.load(Path(args.raid_pokemon).read_bytes()))}")
+
+
 def main(argv=None):
     ap = build_parser()
     args = ap.parse_args(argv)
+    if args.raid_pokemon:
+        raid_guest(ap, args)
     if args.trade_offer:
         args.trade_offer = [pokemon_service.prepare_file("sv", p, fresh=args.fresh_pid,
             transform=lambda raw: trade.load_offer(raw, args.offer_set)) for p in args.trade_offer]
@@ -470,6 +540,7 @@ def main(argv=None):
 
     deadline = time.time() + args.seconds
     scans = seats = 0
+    take = None
     try:
         while time.time() < deadline:
             scans += 1
@@ -494,6 +565,8 @@ def main(argv=None):
                     if args.code and sv.link_code(n.application_data) != args.code:
                         print(f"[sv] scan {scans}: its code is not {args.code}")
                         continue
+                    if args.scene_id is not None and n.scene_id != args.scene_id:
+                        continue
                     if n.num_participants < n.max_participants:
                         target = n
             if target is None:
@@ -513,7 +586,7 @@ def main(argv=None):
             async def seat():
                 # ldn.connect can block for minutes when the console's host phase ends under it; the
                 # scope bounds the association alone.
-                with trio.move_on_after(args.connect_timeout) as scope:
+                with trio.move_on_after(radios.join_timeout(args.connect_timeout)) as scope:
                     async with ldn.connect(param) as network:
                         scope.deadline = float("inf")
                         info = network.info()
@@ -534,8 +607,10 @@ def main(argv=None):
                         record(rec="seat", ssid=info.ssid.hex(), host_ip=host_ip,
                                host_mac=host_mac.hex(), our_ip=our_ip, our_mac=our_mac.hex(),
                                t=time.time())
-                        await run_session(args, keys, host_ip, host_mac, our_ip, our_mac, record)
+                        outcome.update(await run_session(args, keys, host_ip, host_mac,
+                                                         our_ip, our_mac, record))
 
+            outcome = {}
             try:
                 trio.run(seat)
                 seats += 1
@@ -547,13 +622,50 @@ def main(argv=None):
                 detail = "; ".join(f"{type(e).__name__}: {e}" for e in leaves(exc))
                 print(f"[sv] the seat ended: {detail}")
                 record(rec="seat_failed", detail=detail, t=time.time())
+            if trades_done():
+                print("[sv] the seat ended after a trade; closing")
+                break
+            if outcome.get("raided"):
+                print("[sv] our Pokemon is in the battle; closing")
+                break
+            if args.take_host and outcome.get("handed"):
+                take = (target.channel, deadline - time.time())
+                break
     except KeyboardInterrupt:
         print("\n[sv] interrupted")
     finally:
         if cap:
             cap.close()
     print(f"[sv] {scans} scan(s), {seats} seat(s)")
+    if take:
+        argv = host_argv(args, *take)
+        print("[sv] *** TAKING THE HOST ROLE *** " + " ".join(argv[2:]))
+        sys.stdout.flush()
+        os.execv(argv[0], argv)
     return 0
+
+
+def host_argv(args, channel, seconds):
+    """-> bin/sv_host.py's command line for the host role a console handed over: the app's own
+    host flags (pokeldn.app.catalog) on the seat's channel and code."""
+    from pokeldn.app import catalog
+    from pokeldn.app.runner import command
+    tool = next(t for t in catalog.SV.tools if t.key == "sv-host")
+    fixed = list(tool.fixed)
+    fixed[fixed.index("--channel") + 1] = str(channel)
+    fixed[fixed.index("--seconds") + 1] = str(int(max(seconds, 60)))
+    del fixed[fixed.index("--offer-out"):fixed.index("--offer-out") + 2]
+    code = next(f for f in tool.fields if f.flag == "--code")
+    argv = command("--run", "bin/sv_host.py", "--keys", args.keys, *fixed,
+                   *(["--code", args.code] if args.code else code.unset))
+    for path in args.trade_offer:
+        argv += ["--trade-offer", path]
+    if args.offer_out:
+        argv += ["--offer-out", args.offer_out]
+    if args.capture:
+        root, ext = os.path.splitext(args.capture)
+        argv += ["--capture", f"{root}_host{ext or '.jsonl'}"]
+    return argv
 
 
 def main_ip(args):
@@ -613,6 +725,9 @@ def main_ip(args):
                     tcp.close()
                 except OSError:
                     pass
+            if trades_done():
+                print("[sv] the seat ended after a trade; closing")
+                break
     except KeyboardInterrupt:
         print("\n[sv] interrupted")
     finally:
@@ -633,13 +748,21 @@ async def run_session(args, keys, host_ip, host_mac, our_ip, our_mac, record):
     joined_at = 0.0
     join_sequence = None
     pending_update = None       # a type-5 update that arrived before the join response
+    raiding = bool(args.raid_pokemon)
+    guest = raid.RaidGuest(Path(args.raid_pokemon).read_bytes(), args.raid_ready_delay) if raiding else None
+    first_update_at = None      # a raid guest leaves the first station list unanswered
+    raid_lobby_sent = raided = False
+    leaving = None              # a raid guest's type-3 leave: {"sends", "next", "answered"}
+    channel_acks = {}           # (port, ack id) -> when a raid guest's delayed 0x7C ack is due
     migration_sent = 0
     migration_at = None
+    handed = False
     identity = None
     if args.send_record:
         identity = streams.compress(Path(args.send_record).read_bytes())
     record_seq = 1
-    channel = {"opened": False, "table": None, "key80": False, "port2": False}
+    channel = {"opened": False, "table": None, "key80": False, "port2": False,
+               "keys": None, "keys_at": None, "port2_at": None}
     stage = None
     if args.trade_offer:
         stage = trade.JoinerTradeStage(
@@ -649,6 +772,7 @@ async def run_session(args, keys, host_ip, host_mac, our_ip, our_mac, record):
             confirm_delay=args.confirm_delay, commit_delay=args.commit_delay)
         for n, one in enumerate(stage.offers, 1):
             print(f"[sv] offer {n} of {len(stage.offers)}: {describe_offer(one)}")
+        screen.offer("sv", stage.offer)
     pending_trade = []          # (due, port, payload) the trade stage asked to send
 
     def schedule_trade(delay, port, payload):
@@ -666,7 +790,9 @@ async def run_session(args, keys, host_ip, host_mac, our_ip, our_mac, record):
     if args.record_set:
         for name in sorted(os.listdir(args.record_set)):
             if name.endswith(".bin"):
-                record_set.append((int(name[:-4]), Path(os.path.join(args.record_set, name)).read_bytes()))
+                seq, payload = int(name[:-4]), Path(os.path.join(args.record_set, name)).read_bytes()
+                record_set.append((seq, reference.named_record(payload, args.trainer_name) if seq == 1
+                                   else payload))
         print(f"[sv] the record set holds {len(record_set)} record(s), "
               f"sequence ids {record_set[0][0]}..{record_set[-1][0]}")
     set_sent = False
@@ -796,8 +922,22 @@ async def run_session(args, keys, host_ip, host_mac, our_ip, our_mac, record):
     opened = False
     last_rtt = 0.0
     pending_rtt = []            # (due, request payload, requester var)
+    host_leaving = False
     while time.monotonic() - t0 < args.hold:
         now = time.time()
+        # A leaving retail station sends the type 3 every 0.5 s until the type 4, four sends at
+        # most (`0x6db590`, `0x6db7b0`; docs/sv.md, Leaving).
+        if leaving is not None:
+            if leaving["answered"] or (leaving["sends"] >= LEAVE_SENDS and now >= leaving["next"]):
+                print("[sv] our player has left the raid"
+                      + ("" if leaving["answered"] else "; the host never answered our leave"))
+                record(rec="left_at_battle", answered=leaving["answered"], t=time.time())
+                break
+            if now >= leaving["next"] and leaving["sends"] < LEAVE_SENDS:
+                send(out(pia_connect.build_session_leave_v11(our_const, ours["var"], our_ip,
+                                                             random4=os.urandom(4)),
+                         host_var or 0, protocol=PROTO_SESSION), "session leave request")
+                leaving.update(sends=leaving["sends"] + 1, next=now + LEAVE_REPEAT)
         for due, request, requester in [e for e in pending_rtt if e[0] <= now]:
             send(out(streams.build_rtt_response(request, requester), requester,
                      protocol=PROTO_RTT), "rtt response")
@@ -827,7 +967,7 @@ async def run_session(args, keys, host_ip, host_mac, our_ip, our_mac, record):
                 not args.session_join or (joined_at and now - joined_at >= args.open_delay)):
             opened = True
             send_opening()
-        if args.session_join and host_var is not None and not joined and (
+        if args.session_join and host_var is not None and not joined and elapsed >= args.join_delay and (
                 join_sent == 0.0 or (args.join_repeat and now - join_sent >= args.join_repeat)):
             join_sent = now
             send_join()
@@ -855,6 +995,23 @@ async def run_session(args, keys, host_ip, host_mac, our_ip, our_mac, record):
                 channel["port2"] = True
                 send_channel(2, CHANNEL_PORT2_OPEN, "channel port 2 open")
                 print(f"[sv] -> {host_ip}: the port-2 join, without waiting for an announcement")
+            if raiding:
+                channel["port2_at"] = time.time() + RAID_PORT2_DELAY
+                channel["keys_at"] = time.time() + RAID_KEYS_DELAY if channel["keys"] else None
+        if raiding and not channel["port2"] and channel["port2_at"] and now >= channel["port2_at"]:
+            channel["port2"] = True
+            send_channel(2, CHANNEL_PORT2_OPEN, "channel port 2 open")
+            print(f"[sv] -> {host_ip}: the raid's port-2 join")
+        if raiding and channel["keys_at"] and now >= channel["keys_at"]:
+            channel["keys_at"] = None
+            send_channel(1, channel["keys"], "raid channel keys")
+            print(f"[sv] -> {host_ip}: the raid's keys 0x3380 and 0x3480 on 0x7c port 1")
+        for (port, ack_id), due in list(channel_acks.items()):
+            if now >= due:
+                del channel_acks[(port, ack_id)]
+                ack = game_channel.build_ack(ack_id, lowest_pending=our_seq.get((PROTO_RELIABLE, port), 1))
+                send(out(ack, host_var or 0, protocol=PROTO_RELIABLE, port=port,
+                         flags=streams.MESSAGE_FLAGS_ACK), "channel ack", port=port, to=host_ip)
         if record_set and joined and not set_sent and now - joined_at >= args.record_delay:
             set_sent = True
             for seq, payload in record_set:
@@ -870,6 +1027,23 @@ async def run_session(args, keys, host_ip, host_mac, our_ip, our_mac, record):
                 seq for seq, _ in record_set) + 1
             print(f"[sv] -> {host_ip}: our identity, {len(record_set)} records on 0x81 port 1, "
                   f"our next sequence there {our_seq[(streams.PROTOCOL_STREAM, streams.JOINER_INDEX)]}")
+        if (raiding and not raid_lobby_sent and set_sent and channel["opened"] and channel["port2"]
+                and not channel["keys_at"] and now - joined_at >= args.record_delay + RAID_LOBBY_DELAY):
+            raid_lobby_sent = True
+            raid_out = guest.lobby(now)
+            print(f"[sv] -> {host_ip}: our lobby state and Pokemon on 0x80:0")
+        else:
+            raid_out = guest.tick(now) if raiding else []
+        for flags, payload in raid_out:
+            key = (PROTO_BROADCAST_RELIABLE, 0)
+            seq = next_seq(*key)
+            body = reliable5.build_header(flags, seq, len(payload),
+                                          lowest_pending=identity_window.lowest(key, seq),
+                                          destination_bits=3,
+                                          bitmap=[streams.bitmap_for(streams.JOINER_INDEX)]) + payload
+            send(out(body, host_var or 0, protocol=key[0], port=key[1],
+                     flags=streams.MESSAGE_FLAGS_DATA), "raid", protocol=key[0], port=key[1], seq=seq)
+            identity_window.sent(key, seq, body, now)
         for key, seq, body in identity_window.due(now):
             body = reliable5.set_lowest_pending(
                 body, identity_window.lowest(key, our_seq.get(key, 1)))
@@ -958,8 +1132,11 @@ async def run_session(args, keys, host_ip, host_mac, our_ip, our_mac, record):
                    flags=msg.message_flags, src_var=header.src_var, dst_var=header.dst_var,
                    payload=msg.payload.hex(), t=time.time())
             if msg.protocol not in (PROTO_RTT,) or args.verbose_rtt:
-                print(f"[sv] <- {addr[0]} {_describe_msg(msg)}  {msg.payload.hex()[:160]}")
+                if args.print_packets:
+                    print(f"[sv] <- {addr[0]} {_describe_msg(msg)}  {msg.payload.hex()[:160]}")
             if msg.protocol == PROTO_NET and len(msg.payload) > 1:
+                if msg.payload[:2] == bytes([1, pia_connect.NET_START_HOST_MIGRATION]):
+                    host_leaving = True
                 req = pia_connect.parse_net_conn_request(msg.payload)
                 if req is not None:
                     stated_var, stated_const, seqid = req
@@ -968,20 +1145,26 @@ async def run_session(args, keys, host_ip, host_mac, our_ip, our_mac, record):
                         print(f"[sv] the console states host_var={host_var:#06x} "
                               f"host_const={host_const.hex()}")
                     if args.net_ack:
-                        send(out(pia_connect.build_net_response(seqid), 0,
-                                       protocol=PROTO_NET, flags=ESTABLISHING_FLAGS),
+                        send(out(pia_connect.build_net_response(seqid), 0, protocol=PROTO_NET,
+                                 flags=RAID_NET_FLAGS if raiding else ESTABLISHING_FLAGS),
                              "net conn response", seqid=seqid)
-                        print(f"[sv] -> {host_ip}: net 0x12 ack, seqid={seqid}")
+                        if args.print_packets:
+                            print(f"[sv] -> {host_ip}: net 0x12 ack, seqid={seqid}")
                 # The 0x50 carries its sequence at [4:8]; the 0x51 echoes it in the 0x12's shape.
                 if args.net_ack and len(msg.payload) >= 8 and msg.payload[0] == 1 \
                         and msg.payload[1] == NET_0x50:
                     seq50 = int.from_bytes(msg.payload[4:8], "big")
                     body = bytes([0x01, NET_0x51, 0, 0]) + seq50.to_bytes(4, "big")
-                    send(out(body, 0, protocol=PROTO_NET, flags=ESTABLISHING_FLAGS),
+                    send(out(body, 0, protocol=PROTO_NET,
+                             flags=RAID_NET_FLAGS if raiding else ESTABLISHING_FLAGS),
                          "net 0x51", seqid=seq50)
-                    print(f"[sv] -> {host_ip}: net 0x51 ack, seqid={seq50}")
+                    if args.print_packets:
+                        print(f"[sv] -> {host_ip}: net 0x51 ack, seqid={seq50}")
             if msg.protocol == PROTO_SESSION and msg.payload:
                 kind = msg.payload[0]
+                if (leaving is not None and kind == pia_connect.SESSION_LEAVE_RESPONSE
+                        and msg.payload[5:17] == pia_connect._location_id(our_const, ours["var"])):
+                    leaving["answered"] = True
                 print(f"[sv] the host spoke Session: {SESSION_MESSAGE_NAMES.get(kind, '?')}")
                 if kind == pia_connect.SESSION_JOIN_RESPONSE:
                     resp = pia_connect.parse_session_join_response_v11(msg.payload)
@@ -994,7 +1177,9 @@ async def run_session(args, keys, host_ip, host_mac, our_ip, our_mac, record):
                               f"join order {resp['join_order']}, sequence {resp['sequence_id']}")
                         record(rec="join_response", t=time.time(), **{
                             k: (v.hex() if isinstance(v, bytes) else v) for k, v in resp.items()})
-                        if resp["status"] == 1:
+                        if resp["status"] == 1 and raiding:
+                            join_sequence = resp["sequence_id"]
+                        elif resp["status"] == 1:
                             joined = True
                             joined_at = now
                             if not args.no_clock:
@@ -1019,6 +1204,21 @@ async def run_session(args, keys, host_ip, host_mac, our_ip, our_mac, record):
                                stations=[{k: (v.hex() if isinstance(v, bytes) else v)
                                           for k, v in st.items() if k != "players"}
                                          for st in upd["stations"]])
+                        if raiding:
+                            # A retail raid guest leaves the update that came with the join
+                            # response unanswered and acknowledges its retransmission.
+                            if joined:
+                                send_update_ack(upd)
+                            elif first_update_at is None:
+                                first_update_at = now
+                            elif now - first_update_at >= RAID_UPDATE_HOLD:
+                                joined, joined_at = True, now
+                                join_sequence = upd["sequence_id"]
+                                send_update_ack(upd)
+                                if not args.no_clock:
+                                    send(out(RAID_CLOCK_REQUEST, host_var or 0, protocol=PROTO_CLOCK),
+                                         "clock request")
+                            continue
                         # A retail Scarlet seats a joiner with this update alone, no join response;
                         # a joiner waiting for a type 1 sends nothing for the rest of the session.
                         if not joined and any(st["variable_id"] == ours["var"]
@@ -1056,6 +1256,8 @@ async def run_session(args, keys, host_ip, host_mac, our_ip, our_mac, record):
                         send(out(ack, host_var or 0, protocol=PROTO_SESSION),
                              "migration ack", to=host_ip)
                         print(f"[sv] -> {host_ip}: start-host-migration ack (type 8)")
+                        # Before the announcement it is the seat decision; after, the player leaving.
+                        handed = handed or not channel["port2"]
             if msg.protocol == PROTO_CLOCK:
                 print(f"[sv] <- the host answered the clone clock: {msg.payload.hex()}")
             if not args.no_rtt and msg.protocol == PROTO_RTT and msg.payload and msg.payload[0] == 0:
@@ -1073,8 +1275,9 @@ async def run_session(args, keys, host_ip, host_mac, our_ip, our_mac, record):
                     print(f"[sv] 0x7c did not parse: {exc}")
                     continue
                 if cm["flags"] & reliable5.FLAG_APPLICATION_DATA:
-                    print(f"[sv] <- CHANNEL 0x7c:{msg.port} seq {cm['sequence_id']} "
-                          f"{reliable5.flag_names(cm['flags'])} {cm['payload'].hex()}")
+                    if args.print_packets:
+                        print(f"[sv] <- CHANNEL 0x7c:{msg.port} seq {cm['sequence_id']} "
+                              f"{reliable5.flag_names(cm['flags'])} {cm['payload'].hex()}")
                     record(rec="channel", src=addr[0], port=msg.port, seq=cm["sequence_id"],
                            flags=cm["flags"], payload=cm["payload"].hex(), t=time.time())
                     if args.game_channel and cm["flags"] & reliable5.FLAG_IS_INITIALIZED \
@@ -1082,6 +1285,8 @@ async def run_session(args, keys, host_ip, host_mac, our_ip, our_mac, record):
                         # Held until the opening has gone: a pair's joiner never announces its table
                         # before it.
                         channel["table"] = cm["payload"]
+                        if raiding:
+                            channel["table"], channel["keys"] = split_raid_table(cm)
                     elif args.game_channel and msg.port == 1 and channel["opened"] \
                             and stage is None \
                             and not (cm["flags"] & reliable5.FLAG_IS_INITIALIZED):
@@ -1089,7 +1294,10 @@ async def run_session(args, keys, host_ip, host_mac, our_ip, our_mac, record):
                         seq = send_channel(1, cm["payload"], "channel table update")
                         print(f"[sv] -> {host_ip}: mirrored the channel table update "
                               f"({len(cm['payload'])} bytes), our sequence {seq}")
-                    if not args.no_channel_ack:
+                    if raiding and not args.no_channel_ack:
+                        channel_acks.setdefault((msg.port, cm["sequence_id"] + 1),
+                                                time.time() + RAID_CHANNEL_ACK_DELAY)
+                    elif not args.no_channel_ack:
                         # Our own next sequence: a higher one walks the peer's receive base past our
                         # later messages, which are then discarded at 0x6f03cc (docs/pia.md).
                         ack = game_channel.build_ack(
@@ -1117,18 +1325,20 @@ async def run_session(args, keys, host_ip, host_mac, our_ip, our_mac, record):
                             body = stage.host_offers[offers_seen]
                             offers_seen += 1
                             print(f"[sv] {host_ip}: offers {describe_offer(body)}")
-                            if args.offer_out:
-                                path = (args.offer_out if offers_seen == 1
-                                        else f"{args.offer_out}.{offers_seen}")
-                                pokemon_service.save_received("sv", path, body)
-                                print(f"[sv] the host's offer written to {path}")
                         if stage.trades > trades_done:
                             trades_done = stage.trades
+                            if args.offer_out and stage.host_offers:
+                                # Written once the trade completes; an offer can still be withdrawn.
+                                path = pokemon_service.trade_path(args.offer_out, trades_done)
+                                pokemon_service.save_received("sv", path, stage.host_offers[-1])
+                                print(f"[sv] the received record written to {path}")
                             show_done()
+                            screen.received("sv", (stage.host_offers or [None])[-1])
                             record(rec="trade_done", n=trades_done, t=time.time())
                             if stage.done:
                                 print(f"[sv] TRADE {trades_done} COMPLETE; no record left to offer")
                             else:
+                                screen.offer("sv", stage.offer)
                                 print(f"[sv] TRADE {trades_done} COMPLETE; offering "
                                       f"{describe_offer(stage.offer)} next")
                                 if args.offer_after_open is not None:
@@ -1145,7 +1355,8 @@ async def run_session(args, keys, host_ip, host_mac, our_ip, our_mac, record):
                 key = (msg.protocol, msg.port)
                 peer_lowest[key] = max(peer_lowest.get(key, 1), rm["lowest_pending"])
                 if (rm.get("is_ack") and not rm["truncated"]
-                        and key == (streams.PROTOCOL_STREAM, streams.JOINER_INDEX)):
+                        and key in ((streams.PROTOCOL_STREAM, streams.JOINER_INDEX),
+                                    (PROTO_BROADCAST_RELIABLE, 0))):
                     entries = reliable5.parse_ack_payload(rm["payload"])["entries"]
                     if len(entries) > streams.JOINER_INDEX:
                         entry = entries[streams.JOINER_INDEX]
@@ -1167,9 +1378,10 @@ async def run_session(args, keys, host_ip, host_mac, our_ip, our_mac, record):
                             note = f" zlib -> {len(body)}B"
                         except Exception as exc:
                             note = f" zlib failed: {exc}"
-                    print(f"[sv] <- RECORD 0x{msg.protocol:02x}:{msg.port} seq {rm['sequence_id']} "
-                          f"{reliable5.flag_names(rm['flags'])} {len(rm['payload'])}B{note}")
-                    print(f"       {body.hex()[:400]}")
+                    if args.print_packets:
+                        print(f"[sv] <- RECORD 0x{msg.protocol:02x}:{msg.port} seq {rm['sequence_id']} "
+                              f"{reliable5.flag_names(rm['flags'])} {len(rm['payload'])}B{note}")
+                        print(f"       {body.hex()[:400]}")
                     if (args.game_channel and msg.protocol == PROTO_BROADCAST_RELIABLE
                             and msg.port == 2 and body[:1] == bytes([port2.TYPE_ANNOUNCE])
                             and not channel["port2"]):
@@ -1206,6 +1418,13 @@ async def run_session(args, keys, host_ip, host_mac, our_ip, our_mac, record):
                     held_off = repeat and time.time() - last_ack.get(key, 0.0) < args.repeat_ack_gap
                     if not args.no_ack and not held_off:
                         ack_due[key] = None
+                    if raiding and key == (PROTO_BROADCAST_RELIABLE, 0):
+                        guest.on_message(body)
+                        if body[:4] == raid.BATTLE:
+                            # Acknowledged below, then we leave: the console carries our Pokemon
+                            # into the battle as its own (docs/sv_raid.md, Joining).
+                            raided = True
+                            break
                 if key not in last_ack:
                     last_ack[key] = 0.0
         # One ack per stream per packet, after every message: a packet carries up to 14 records.
@@ -1214,9 +1433,18 @@ async def run_session(args, keys, host_ip, host_mac, our_ip, our_mac, record):
             send(out(our_ack(key), host_var or 0, protocol=protocol, port=port,
                      flags=ack_shape["flags"]), "reliable ack", protocol=protocol, port=port)
             last_ack[key] = time.time()
+        if raided and leaving is None:
+            print("[sv] the battle begins; our player leaves and its Pokemon stays in the raid")
+            leaving = {"sends": 0, "next": time.time(), "answered": False}
+        if host_leaving and not args.stay_on_host_migration:
+            print("[sv] the console is destroying its network (NetStartHostMigration); "
+                  "leaving the seat")
+            record(rec="left_on_host_migration", t=time.time())
+            break
     sock.close()
     print(f"[sv] seat over: {seen} datagram(s) in, {authed} authenticated. messages by protocol: "
           + " ".join(f"0x{p:02x}={n}" for p, n in sorted(counts.items())))
+    return {"handed": handed, "raided": raided}
 
 
 if __name__ == "__main__":

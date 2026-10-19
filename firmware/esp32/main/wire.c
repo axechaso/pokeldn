@@ -6,15 +6,16 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* S3 and C3 use native USB Serial/JTAG; ESP32 uses UART0. Connect the matching USB port.
+/* S3, C3 and C6 use native USB Serial/JTAG; ESP32 uses UART0. Connect the matching USB port.
    docs/hardware_esp32.md, Supported boards. */
-#if CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32C3
+#if CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C6
 #define WIRE_USB 1
 #include "driver/usb_serial_jtag.h"
 #else
 #define WIRE_USB 0
 #include "driver/uart.h"
 #endif
+#include "ble.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -42,7 +43,12 @@ typedef struct {
    Scarlet burst and dropped 337 messages. The floor keeps room for the driver's RX buffers.
    docs/hardware_esp32.md, The serial ceiling. */
 #define WIRE_QUEUE_LENGTH 384
+#if POKELDN_BLE
+/* The BLE controller leaves under 64 KB once the softAP is up; STATUS heap_min shows the margin. */
+#define WIRE_HEAP_FLOOR (32 * 1024)
+#else
 #define WIRE_HEAP_FLOOR (64 * 1024)
+#endif
 #define WIRE_UART_EVENTS 64
 
 static QueueHandle_t s_out;
@@ -50,7 +56,11 @@ static QueueHandle_t s_out;
 static QueueHandle_t s_uart_events;
 #endif
 static wire_handler_t s_handler;
+/* Set when the host watchdog judges the host gone: messages are discarded, not dropped, until the
+   host speaks again; a dead host's queue would otherwise count a drop per 500 ms write. */
+static atomic_bool s_host_away;
 static atomic_uint s_dropped, s_rx_bad, s_rx_fifo_ovf, s_rx_buffer_full, s_rx_frame_err, s_events_full;
+static atomic_uint s_consumed_total;   /* every host byte taken since boot */
 static uint32_t s_consumed, s_credited;   /* the reader task's own; the handler runs on it */
 /* Maxima for STATUS: a LOG line is refused at the heap floor, which is when the reader stalls.
    docs/hardware_esp32.md, The serial ceiling. */
@@ -82,6 +92,7 @@ static uint32_t crc32(const uint8_t *p, size_t n)
 bool wire_send_wait(uint8_t type, const void *head, size_t head_len, const void *body,
                     size_t body_len, uint32_t ticks)
 {
+    if (atomic_load(&s_host_away)) return true;
     const size_t length = 1 + head_len + body_len;
     if (length > WIRE_MAX_PAYLOAD + 1) return false;
     const uint32_t heap = esp_get_free_heap_size();
@@ -120,6 +131,9 @@ void wire_log(const char *format, ...)
 }
 
 uint32_t wire_dropped(void) { return atomic_load(&s_dropped); }
+
+void wire_set_host_away(bool away) { atomic_store(&s_host_away, away); }
+uint32_t wire_consumed(void) { return atomic_load(&s_consumed_total); }
 uint32_t wire_rx_bad(void) { return atomic_load(&s_rx_bad); }
 uint32_t wire_rx_fifo_ovf(void) { return atomic_load(&s_rx_fifo_ovf); }
 uint32_t wire_rx_buffer_full(void) { return atomic_load(&s_rx_buffer_full); }
@@ -128,12 +142,17 @@ uint32_t wire_events_full(void) { return atomic_load(&s_events_full); }
 
 int wire_stats(char *text, size_t size)
 {
-    return snprintf(text, size,
+    int n = snprintf(text, size,
         "refused_heap=%u refused_queue=%u heap_min=%u queue_max=%u read_max_us=%u "
         "handler_max_us=%u handler_max_type=%#x write_max_us=%u",
         atomic_load(&s_refused_heap), atomic_load(&s_refused_queue), atomic_load(&s_heap_min),
         atomic_load(&s_queue_max), atomic_load(&s_read_max_us), atomic_load(&s_handler_max_us),
         atomic_load(&s_handler_max_type), atomic_load(&s_write_max_us));
+#if POKELDN_BLE
+    if (n > 0 && (size_t)n < size)
+        n += snprintf(text + n, size - n, " ble_itvl_us=%u", (unsigned)ble_interval_us());
+#endif
+    return n;
 }
 
 /* A CREDIT jumps the queue and carries the count current when the writer reaches it: behind a
@@ -186,6 +205,7 @@ static void write_usb(const uint8_t *p, size_t n)
 {
     const int64_t started = esp_timer_get_time();
     while (usb_serial_jtag_write_bytes(p, n, pdMS_TO_TICKS(20)) != (int)n) {
+        if (atomic_load(&s_host_away)) break;
         if (esp_timer_get_time() - started > 500000) {
             atomic_fetch_add(&s_dropped, 1);
             break;
@@ -218,6 +238,7 @@ static void writer(void *arg)
         }
         memcpy(frame, m->bytes, n);
         free(m);
+        if (atomic_load(&s_host_away)) continue;
 #if !WIRE_USB
         /* uart_write_bytes spins on a full TX ring (IDF 6.1 uart.c:1662) and this task outranks
            the reader on its core, which it starved in the middle of esp_wifi_internal_tx: 111 ms
@@ -245,6 +266,25 @@ static void writer(void *arg)
         }
         encoded[code_at] = code;
         encoded[out++] = 0;
+        if (ble_linked()) {
+#if POKELDN_BLE
+            /* One notification per frame capped the link at its event rate: frames gather here and
+               leave together once the queue is empty or the batch would pass a notification. */
+            static uint8_t batch[2048];
+            static size_t held;
+            if (held + out > sizeof(batch)) {
+                if (!ble_write(batch, held)) atomic_fetch_add(&s_dropped, 1);
+                held = 0;
+            }
+            memcpy(batch + held, encoded, out);
+            held += out;
+            if (!uxQueueMessagesWaiting(s_out) || held >= 244) {
+                if (!ble_write(batch, held)) atomic_fetch_add(&s_dropped, 1);
+                held = 0;
+            }
+#endif
+            continue;
+        }
 #if WIRE_USB
         write_usb(encoded, out);
 #else
@@ -302,7 +342,7 @@ static void deliver(const uint8_t *encoded, size_t used)
     if (took > 50000) wire_log("slow command 0x%02x: %u ms", frame[0], (unsigned)(took / 1000));
 }
 
-/* Dual-core targets install the host link on core 1 to separate Wi-Fi interrupts; C3 uses core 0.
+/* Dual-core targets install the host link on core 1 to separate Wi-Fi interrupts; C3 and C6 use core 0.
    Moving classic UART interrupts to core 0 lost 500 host commands in 7 s under a receive flood.
    docs/hardware_esp32.md, The serial ceiling. */
 static void reader(void *arg)
@@ -337,19 +377,25 @@ static void reader(void *arg)
     bool overflow = false;
     for (;;) {
         const int64_t turn = esp_timer_get_time();
+        int n;
+#if POKELDN_BLE
+        if (ble_linked()) n = ble_read(chunk, sizeof(chunk), pdMS_TO_TICKS(20)); else
+#endif
+        {
 #if WIRE_USB
         /* The USB driver returns whatever is buffered as soon as there is any, so one call does both. */
-        const int n = usb_serial_jtag_read_bytes(chunk, sizeof(chunk), pdMS_TO_TICKS(20));
+        n = usb_serial_jtag_read_bytes(chunk, sizeof(chunk), pdMS_TO_TICKS(20));
 #else
         /* uart_read_bytes waits its timeout again for every ring item until `length` is met: a
            host trickling 21-byte commands every 15 ms was read 461 ms late. Wait for one byte,
            then take what is buffered. docs/hardware_esp32.md, The serial ceiling. */
         size_t buffered = 0;
         uart_get_buffered_data_len(WIRE_UART, &buffered);
-        const int n = buffered
+        n = buffered
             ? uart_read_bytes(WIRE_UART, chunk, buffered < sizeof(chunk) ? buffered : sizeof(chunk), 0)
             : uart_read_bytes(WIRE_UART, chunk, 1, pdMS_TO_TICKS(20));
 #endif
+        }
         raise_max(&s_read_max_us, esp_timer_get_time() - turn);
         /* Idle, the reader repeats its count every 100 ms: a host whose window stays shut under
            a repeated count knows the rest was lost on the line, and a silent board is busy. */
@@ -358,7 +404,8 @@ static void reader(void *arg)
             send_credit();
         }
         for (int i = 0; i < n; ++i) {
-            ++s_consumed;   /* before the handler, so a HELLO's reset excludes its own delimiter */
+            ++s_consumed;
+            atomic_fetch_add(&s_consumed_total, 1);   /* before the handler, so a HELLO's reset excludes its own delimiter */
             if (chunk[i]) {
                 if (used < sizeof(encoded)) encoded[used++] = chunk[i]; else overflow = true;
                 continue;
@@ -378,5 +425,11 @@ void wire_start(wire_handler_t handler)
 {
     s_handler = handler;
     s_out = xQueueCreate(WIRE_QUEUE_LENGTH, sizeof(message_t *));
+#if WIRE_USB
+    /* USB drains faster than the writer encodes: at 888 KB/s the writer never sleeps and a reader
+       below it was not scheduled for 54 s. docs/hardware_esp32.md, The USB host link. */
+    xTaskCreatePinnedToCore(reader, "wire_rx", 6144, NULL, 21, NULL, WIRE_CORE);
+#else
     xTaskCreatePinnedToCore(reader, "wire_rx", 6144, NULL, 19, NULL, WIRE_CORE);
+#endif
 }

@@ -7,6 +7,7 @@ import queue
 import random
 import struct
 import threading
+import time
 
 from pokeldn.ldn import esp32
 
@@ -22,21 +23,61 @@ class _HostStream:
 
     def read(self, n: int) -> bytes:
         try:
-            data = self._inbox.get(timeout=0.02)
+            data = self._take(self._inbox.get(timeout=0.02))
         except queue.Empty:
             return b""
         while len(data) < n:
             try:
-                data += self._inbox.get_nowait()
+                data += self._take(self._inbox.get_nowait())
             except queue.Empty:
                 break
         return data
+
+    def _take(self, sent: tuple[int | None, bytes]) -> bytes:
+        return sent[1]
 
     def write(self, data: bytes) -> None:
         self._board._from_host(data)
 
     def close(self) -> None:
         pass
+
+
+class UartPort(_HostStream):
+    """pyserial's `Serial` on a classic board's UART: the board keeps its line rate across opens
+    (wire.c sets it at boot and on BAUD), and bytes sent at another rate arrive as noise."""
+
+    def __init__(self, board: "SimulatedBoard"):
+        super().__init__(board)
+        board.stream = self
+        if board.line_rate is None:
+            board.line_rate = 115200
+        self.baudrate = 115200
+        self.dtr = self.rts = True   # pyserial asserts both on open unless told otherwise
+        self._credit_at = 0.0
+
+    def open(self) -> None:
+        pass
+
+    def flush(self) -> None:
+        pass
+
+    def read(self, n: int) -> bytes:
+        data = super().read(n)
+        if not data and time.monotonic() - self._credit_at > 0.1:
+            self._credit_at = time.monotonic()
+            # Idle, the firmware repeats its CREDIT every 100 ms (wire.c reader): the one after a
+            # BAUD leaves at the new rate, before the host has switched.
+            self._board._emit(esp32.MSG_CREDIT, struct.pack("<I", getattr(self._board, "_consumed", 0) & 0xFFFFFFFF))
+        return data
+
+    def _take(self, sent: tuple[int | None, bytes]) -> bytes:
+        rate, data = sent
+        return data if rate == self.baudrate else b"\x55" * len(data)
+
+    def write(self, data: bytes) -> None:
+        # Noise with no 0x00 leaves a partial frame in the board's decoder.
+        self._board._from_host(data if self.baudrate == self._board.line_rate else b"\xff" * len(data))
 
 
 class Air:
@@ -63,6 +104,7 @@ class SimulatedBoard:
         self.sta_mac = mac or bytes([0x24, 0x6F, 0x28] + random.sample(range(256), 3))
         self.ap_mac = self.sta_mac[:5] + bytes([(self.sta_mac[5] + 1) & 0xFF])
         self.mode = IDLE
+        self.refuse_joins = 0        # STA_JOINs answered as a retail join failure, 0xc9
         self.channel = 1
         self.bssid = b""
         self.ssid = b""
@@ -70,16 +112,22 @@ class SimulatedBoard:
         self.stations: dict[bytes, "SimulatedBoard"] = {}   # AP: mac -> station board
         self.ap: "SimulatedBoard | None" = None              # STA: the joined access point
         self.stream = _HostStream(self)
+        self.line_rate: int | None = None   # a classic board's UART rate; None for native USB
         self._reader = esp32.FrameReader()
         self.sent_raw: list[bytes] = []
         self.led_looks: list[bytes] = []
+        self.displays: list[bytes] = []
+        self.version = ""                 # the firmware version HELLO reports, "" for none
+        self.host_silent_after = 5.0      # the firmware's HOST_SILENT_US
+        self._host_seen = 0.0
+        self._watched = False
         air.attach(self)
 
     def host_stream(self) -> _HostStream:
         return self.stream
 
     def _emit(self, msg_type: int, payload: bytes = b"") -> None:
-        self.stream._inbox.put(esp32.encode_frame(msg_type, payload))
+        self.stream._inbox.put((self.line_rate, esp32.encode_frame(msg_type, payload)))
 
     def _result(self, command: int, code: int = 0) -> None:
         self._emit(esp32.MSG_RESULT, bytes([command]) + struct.pack("<i", code))
@@ -95,14 +143,23 @@ class SimulatedBoard:
                         self._consumed = 0
                         self._emit(esp32.MSG_CREDIT, struct.pack("<I", 0))
                     self._command(msg_type, payload)
-        self._emit(esp32.MSG_CREDIT, struct.pack("<I", self._consumed))
+        self._emit(esp32.MSG_CREDIT, struct.pack("<I", self._consumed & 0xFFFFFFFF))
 
     def _command(self, t: int, p: bytes) -> None:
+        self._host_seen = time.monotonic()
         if t == esp32.CMD_HELLO:
+            self._watched = False
+            text = "pokeldn-radio simulated" + (f" version={self.version}" if self.version else "")
             self._emit(esp32.MSG_INFO, bytes([esp32.PROTOCOL_VERSION]) + self.sta_mac + self.ap_mac
-                       + b"\x03" + b"pokeldn-radio simulated")
+                       + b"\x03" + text.encode())
+        elif t == esp32.CMD_ALIVE and self.version:
+            if not self._watched:
+                self._watched = True
+                threading.Thread(target=self._watch_host, daemon=True).start()
         elif t == esp32.CMD_BAUD:
-            self._result(t)
+            self._result(t)   # at the old rate
+            if self.line_rate is not None:
+                self.line_rate = struct.unpack("<I", p)[0]
         elif t == esp32.CMD_CHANNEL:
             if self.mode != IDLE:
                 self._result(t, 0x103)
@@ -117,6 +174,10 @@ class SimulatedBoard:
                 self.sta_mac = mac
             self._result(t)
             ap = self.air.access_point(self.bssid, self.channel, self.ssid)
+            if ap is not None and self.refuse_joins:
+                self.refuse_joins -= 1
+                self._emit(esp32.MSG_LINK, b"\x00" + struct.pack("<H", 0xC9) + self.sta_mac)
+                return
             if ap is None:
                 self._emit(esp32.MSG_LINK, b"\x00" + struct.pack("<H", esp32.LINK_TIMEOUT) + self.sta_mac)
                 return
@@ -151,6 +212,9 @@ class SimulatedBoard:
         elif t == esp32.CMD_LED:
             self.led_looks.append(p)
             self._result(t, 0 if len(p) == 6 and p[0] < len(esp32.LED_PATTERNS) else 0x102)
+        elif t == esp32.CMD_DISPLAY:
+            self.displays.append(p)
+            self._result(t)
         elif t == esp32.CMD_BENCH:
             total, size = struct.unpack("<IH", p)
             self._result(t)
@@ -159,6 +223,16 @@ class SimulatedBoard:
             self._emit(esp32.MSG_BENCH, struct.pack("<II", 0xFFFFFFFF, 0))
         else:
             self._result(t, 0x106)
+
+    def _watch_host(self) -> None:
+        """The firmware's host watchdog: a host silent past host_silent_after leaves the network."""
+        while self._watched:
+            time.sleep(0.02)
+            with self.air.lock:
+                if self._watched and self.mode != IDLE and time.monotonic() - self._host_seen > self.host_silent_after:
+                    self._watched = False
+                    self._go_idle()
+                    self._emit(esp32.MSG_LOG, b"host silent: left the network")
 
     def _go_idle(self) -> None:
         if self.mode == STA and self.ap is not None:

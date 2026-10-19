@@ -38,6 +38,7 @@ from pokeldn.ldn import ldn_mitm, pia6
 from pokeldn.ldn.transport import board_radio, find_ap_phy
 from pokeldn.pla import data_exchange, joiner, trade_box
 from pokeldn.pla import pokemon as pla_pokemon
+from pokeldn.app import screen
 
 STALE_VIFS = ["ldn", "ldn-mon", "ldn-tap", "ldnclient"]
 
@@ -121,7 +122,7 @@ def make_socket(ifname, our_ip=None):
 def build_offer(args, exchange):
     """-> the encrypted party record: a file, or the reference under our name."""
     if args.offer:
-        offer = pla_pokemon.encrypt(pla_pokemon.load(Path(os.path.expanduser(args.offer)).read_bytes()))
+        offer = pla_pokemon.encrypt(pla_pokemon.load(Path(os.path.expanduser(args.offer[0])).read_bytes()))
     else:
         offer = trade_box.build_our_record(**data_exchange.read_record(exchange))
     if args.fresh_pid:
@@ -133,10 +134,12 @@ async def run_session(args, keys, sock, host_ip, our_ip, our_mac, offer, exchang
     """Wait in trio, never in select() (docs/hardware_esp32.md, The userspace stack)."""
     session = joiner.JoinerSession(keys, our_ip, our_mac, offer, exchange,
                                    player_id=bytes.fromhex(args.join_player_id),
-                                   drive=args.drive, net_answer=not args.no_net_answer, log=print)
+                                   drive=args.drive, net_answer=not args.no_net_answer,
+                                   join_delay=args.join_delay, log=print,
+                                   next_offers=getattr(args, "next_offers", ()))
     end = time.monotonic() + args.hold
     traded_at = None
-    seen = authed = 0
+    seen = authed = written = 0
 
     def send(packets, note=""):
         for pkt in packets:
@@ -145,6 +148,9 @@ async def run_session(args, keys, sock, host_ip, our_ip, our_mac, offer, exchang
 
     try:
         while time.monotonic() < end and not session.host_left:
+            if session.migration_asked is not None and session.traded:
+                print("[pla] the console is leaving after the trade")
+                break
             if args.take_host and session.migration_asked is not None:
                 print("[pla] leaving the seat to take the host role")
                 break
@@ -179,16 +185,25 @@ async def run_session(args, keys, sock, host_ip, our_ip, our_mac, offer, exchang
                     print(f"[pla] the joiner raised on a message, still seated: "
                           f"{type(exc).__name__}: {exc}")
             send(session.poll())
-            if session.traded and traded_at is None:
+            while written < len(session.trades):
+                written += 1
                 traded_at = time.monotonic()
-                if args.offer_out and session.received is not None:
-                    with open_output(args.offer_out, "wb") as fh:
-                        fh.write(session.received)
-                    print(f"[pla] wrote the record the console traded, {args.offer_out}")
-            if traded_at is not None and time.monotonic() - traded_at >= args.after_trade:
+                received = session.trades[written - 1]
+                path = pokemon_service.trade_path(args.offer_out, written)
+                if path and received is not None:
+                    with open_output(path, "wb") as fh:
+                        fh.write(received)
+                    print(f"[pla] wrote the record the console traded, {path}")
+            if (traded_at is not None and args.hold_after_trade is not None
+                    and not session.next_offers
+                    and time.monotonic() - traded_at >= args.hold_after_trade):
                 send(session.leave(), note="leave")
-                print("[pla] left the session after the trade")
+                print(f"[pla] left the session {args.hold_after_trade:.0f}s after the trade")
                 break
+        else:
+            if session.seated and not session.host_left:
+                send(session.leave(), note="leave")
+                print("[pla] --hold is over: left the session")
     finally:
         if args.collect:
             os.makedirs(args.collect, exist_ok=True)
@@ -250,12 +265,14 @@ def main_ip(args, offer, exchange, record):
             tcp.close()
         if session.traded:
             break
+        if args.take_host and session.migration_asked is not None:
+            return {"take_host": None, "remaining": deadline - time.time()}
     print(f"[pla] {attempts} scan(s), {joined} join(s)")
     return 0
 
 
 def main_radio(args, offer, exchange, record):
-    import ldn
+    from pokeldn.ldn import api as ldn
 
     if needs_root():
         print("[pla] joining needs the raw radio; re-run under sudo, or set POKELDN_RADIO")
@@ -326,14 +343,14 @@ def main_radio(args, offer, exchange, record):
 
 async def seat(args, keys_file, target, phy, offer, exchange, record):
     """-> the session, or None if the association did not complete within --connect-timeout."""
-    import ldn
+    from pokeldn.ldn import api as ldn, radios
 
     keys = pla.session_keys(target.ssid)
     param = ldn.ConnectNetworkParam()
     param.keys, param.network, param.password = keys_file, target, pla.PASSPHRASE
     param.name, param.app_version = args.name.encode(), target.app_version
     param.phyname, param.ifname = phy, args.ifname
-    with trio.move_on_after(args.connect_timeout) as scope:
+    with trio.move_on_after(radios.join_timeout(args.connect_timeout)) as scope:
         async with ldn.connect(param) as network:
             scope.deadline = float("inf")
             host = list(getattr(network.info(), "participants", []) or [])[0]
@@ -391,27 +408,31 @@ def build_parser():
     ap.add_argument("--connect-timeout", type=float, default=6.0)
     ap.add_argument("--mac", default=None, help="give the board this station MAC first")
     ap.add_argument("--code", default="00000000", help="the eight digits; '' joins any code")
-    ap.add_argument("--name", default="PkCamp", help="the LDN node name we publish")
+    ap.add_argument("--name", default="POKELDN", help="the LDN node name we publish")
     ap.add_argument("--seconds", type=float, default=900.0, help="the whole run")
     ap.add_argument("--hold", type=float, default=600.0, help="how long one seat is held")
-    ap.add_argument("--player-name", default="PkCamp",
+    ap.add_argument("--player-name", default="POKELDN",
                     help="the name in our data exchange record; the console shows it")
     ap.add_argument("--player-id", default="504b4c44",
                     help="hex, four bytes: the player id in our data exchange record")
+    ap.add_argument("--gender", type=int, choices=(0, 1), default=0,
+                    help="0 male, 1 female: the gender in our data exchange record; its look follows")
     ap.add_argument("--join-player-id", default=pia6.DEFAULT_PLAYER_ID.hex(),
                     help="hex, sixteen bytes: the player id in the session join request")
     ap.add_argument("--fresh-pid", action="store_true",
                     help="offer the record under a new PID and encryption constant, drawn once per "
                          "run, shiny state kept, so a save that took it before takes it again")
-    ap.add_argument("--offer", default=None,
+    ap.add_argument("--offer", action="append", default=[],
                     help="the record to trade away, stored or party, encrypted or not; the "
-                         "default is the reference Azelf under our player name")
+                         "default is the reference Azelf under our player name. Repeatable: one per "
+                         "trade in order, on this seat or in the host role once taken")
     ap.add_argument("--offer-out", default=None,
                     help="write the record the console traded to this file")
     ap.add_argument("--collect", default=None,
                     help="write every record the console showed or offered to this directory")
-    ap.add_argument("--after-trade", type=float, default=5.0,
-                    help="seconds to stay seated after the trade before leaving")
+    ap.add_argument("--hold-after-trade", type=float, default=None, metavar="SECONDS",
+                    help="leave this long after the last queued trade; by default the seat is kept until the "
+                         "console's player backs out or --hold ends")
     ap.add_argument("--drive", action="store_true",
                     help="act as the player too: offer once the host shows, confirm once it "
                          "offers, then selector 7; without it the console's player leads")
@@ -419,6 +440,10 @@ def build_parser():
     ap.add_argument("--no-net-answer", action="store_true",
                     help="send the Session join request with no Net 0x12 answer to the host's 0x11; "
                          "the 0x12 is what a console answers by asking for host migration")
+    ap.add_argument("--join-delay", type=float, default=0.0, metavar="SECONDS",
+                    help="hold the Session join request this long after the host's first Net "
+                         "0x11. A join the console accepts after its WaitMember draws the type 7 "
+                         "that hands us the host role (docs/pla.md, Joining a console's network)")
     ap.add_argument("--take-host", action=argparse.BooleanOptionalAction, default=True,
                     help="when the console hands us the host role, leave its network and become "
                          "the host with bin/pla_host.py on the same code and channel")
@@ -428,14 +453,17 @@ def build_parser():
 def host_argv(args, channel, seconds):
     """-> bin/pla_host.py's command line for the host role a console handed over."""
     from pokeldn.app.runner import command
+    where = ["--ip-host", "--our-ip", args.our_ip] if args.ip_join else ["--channel", str(channel)]
     argv = command("--run", "bin/pla_host.py", "--keys", args.keys, "--code", args.code,
-            "--channel", str(channel), "--seconds", str(int(max(seconds, 60))),
+            *where, "--seconds", str(int(max(seconds, 60))),
             "--player-name", args.player_name, "--session-update", "--sustain", "--clock",
             "--data-exchange", "--game-channel", "--trade-box")
-    if args.offer:
-        argv += ["--trade-box-record", args.offer]
+    for path in args.offer:
+        argv += ["--trade-box-record", path]
     if args.fresh_pid:
         argv += ["--fresh-pid"]
+    if args.offer_out:
+        argv += ["--offer-out", args.offer_out]
     if args.collect:
         argv += ["--trade-box-collect", args.collect]
     if args.capture:
@@ -447,18 +475,19 @@ def host_argv(args, channel, seconds):
 def main(argv=None):
     ap = build_parser()
     args = ap.parse_args(argv)
-    if args.offer and args.offer != "echo":
-        args.offer = pokemon_service.prepare_file("pla", args.offer, fresh=getattr(args, "fresh_pid", False))
-        if hasattr(args, "fresh_pid"):
-            args.fresh_pid = False
+    args.offer = [pokemon_service.prepare_file("pla", path, fresh=args.fresh_pid) for path in args.offer]
+    args.fresh_pid = False
     try:
         sys.stdout.reconfigure(line_buffering=True)
     except (AttributeError, ValueError):
         pass
     exchange = data_exchange.build_record(player_id=bytes.fromhex(args.player_id),
-                                          name=args.player_name)
+                                          name=args.player_name, gender=args.gender)
     offer = pokemon_service.validate("pla", build_offer(args, exchange))
+    args.next_offers = [pokemon_service.validate("pla", pla_pokemon.encrypt(pla_pokemon.load(
+        Path(os.path.expanduser(path)).read_bytes()))) for path in args.offer[1:]]
     print(f"[pla] offering {trade_box.describe(offer)}")
+    screen.offer("pla", offer)
     cap = open_output(args.capture, "w") if args.capture else None
 
     def record(**row):
@@ -467,9 +496,7 @@ def main(argv=None):
             cap.flush()
 
     try:
-        if args.ip_join:
-            return main_ip(args, offer, exchange, record)
-        result = main_radio(args, offer, exchange, record)
+        result = (main_ip if args.ip_join else main_radio)(args, offer, exchange, record)
         if isinstance(result, dict) and "take_host" in result:
             argv = host_argv(args, result["take_host"], result["remaining"])
             print("[pla] *** TAKING THE HOST ROLE *** " + " ".join(argv[2:]))

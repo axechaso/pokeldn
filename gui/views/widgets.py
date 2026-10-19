@@ -2,16 +2,18 @@ import asyncio
 import os
 import re
 import threading
+import time
 from collections import deque
 from typing import Callable
 
 import flet as ft
 
-from gui import theme as t
+from gui import drop, theme as t
+from pokeldn.app.i18n import t as tr
 
 
 class PixelActivity(ft.Container):
-    def __init__(self, label: str = "Loading"):
+    def __init__(self, label: str = tr('widgets.loading_dc3808', 'Loading')):
         positions = [(6, 0), (12, 0), (12, 6), (12, 12), (6, 12), (0, 12), (0, 6), (0, 0)]
         self._pixels = [ft.Container(width=3, height=3, left=x, top=y, bgcolor=t.BLUE,
                                      opacity=1 if i == 0 else 0.2)
@@ -35,7 +37,36 @@ class PixelActivity(ft.Container):
             phase = (phase + 1) % len(self._pixels)
             for i, pixel in enumerate(self._pixels):
                 pixel.opacity = max(0.18, 1 - ((phase - i) % 8) * 0.22)
-            self.update()
+            try:
+                self.update()
+            except RuntimeError as error:
+                # An async list can replace its loading icon between the wake-up and update.
+                if "must be added to the page" not in str(error):
+                    raise
+                return
+
+
+class Check:
+    """A pixel checkbox and its label; `value` is whether it is checked."""
+
+    def __init__(self, label: str, tooltip: str = "", on_change=None, value: bool = False, size: int = 12):
+        self.value, self.on_change = value, on_change
+        self.icon = t.pixel_icon("checkbox", color=t.MUTED)
+        self._show()
+        self.control = ft.Container(ft.Row([self.icon, t.text(label, size, t.TEXT)], spacing=8, tight=True),
+                                    on_click=self._flip, tooltip=tooltip or None, padding=ft.Padding(2, 4, 2, 4),
+                                    border_radius=8)
+
+    def _show(self) -> None:
+        self.icon.src = f"icons/{'checkbox-on' if self.value else 'checkbox'}.svg"
+        self.icon.color = t.BLUE if self.value else t.MUTED
+
+    def _flip(self, _e) -> None:
+        self.value = not self.value
+        self._show()
+        self.control.update()
+        if self.on_change:
+            self.on_change(self.value)
 
 
 class CodeBlock:
@@ -45,9 +76,9 @@ class CodeBlock:
         self.control = ft.Container(ft.Row([
             ft.Container(content if content is not None else self.text, expand=True,
                          padding=ft.Padding(0, 6, 0, 6)),
-            t.icon_button("copy", self._copy, "Copy code"),
+            t.icon_button("copy", self._copy, tr('widgets.copy_code_49a005', 'Copy code')),
         ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.START),
-            bgcolor=t.BG, border_radius=8, padding=10, border=ft.Border.all(1, t.BORDER))
+            bgcolor=t.BG, border_radius=10, padding=10)
 
     async def _copy(self, e) -> None:
         await self.app.copy(self.text.value)
@@ -71,31 +102,69 @@ def fenced_blocks(source: str):
         yield source[cursor:], None
 
 
+HEADING = re.compile(r"(?m)^ {0,3}#{1,6}[ \t]+(.+?)[ \t#]*$")
+
+
+def anchor(heading: str) -> str:
+    """The id kramdown gives a heading on the docs site: letters first, ASCII words joined by hyphens."""
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", heading)
+    text = re.sub(r"^[^a-zA-Z]+", "", text)
+    return re.sub(r"[^a-z0-9 -]", "", text.lower()).replace(" ", "-")
+
+
+def heading_sections(source: str):
+    """(anchor, heading, markdown) per heading, outside fenced examples, with the text before the first
+    heading under ('', ''). Repeated anchors take kramdown's -1, -2 suffixes."""
+    seen: dict[str, int] = {}
+    current, heading, parts = "", "", []
+    for block, code in fenced_blocks(source):
+        cursor = 0
+        for match in HEADING.finditer(block) if code is None else ():
+            parts.append(block[cursor:match.start()])
+            yield current, heading, "".join(parts)
+            heading, base = match[1], anchor(match[1])
+            current = f"{base}-{seen[base]}" if base in seen else base
+            seen[base] = seen.get(base, 0) + 1
+            parts, cursor = [], match.start()
+        parts.append(block[cursor:])
+    yield current, heading, "".join(parts)
+
+
 class MarkdownDocument:
     def __init__(self, app, on_link):
         self.app, self.on_link = app, on_link
         self.control = ft.Column(spacing=14, horizontal_alignment=ft.CrossAxisAlignment.STRETCH)
 
     def set_value(self, value: str) -> None:
-        self.control.controls = [self._markdown(source) if code is None else
-                                 CodeBlock(self.app, code, self._markdown(source)).control
-                                 for source, code in fenced_blocks(value)]
+        """Each heading starts its own control keyed by its anchor, so a link or a search result scrolls to it."""
+        controls = []
+        for key, _, section in heading_sections(value):
+            first = True
+            for source, code in fenced_blocks(section):
+                if not source.strip():
+                    continue
+                control = self._markdown(source) if code is None else CodeBlock(self.app, code, self._markdown(source)).control
+                if first and key:
+                    control.key = ft.ScrollKey(key)
+                first = False
+                controls.append(control)
+        self.control.controls = controls
 
     def _markdown(self, value: str) -> ft.Markdown:
         return ft.Markdown(
             value, selectable=True, extension_set=ft.MarkdownExtensionSet.GITHUB_WEB,
             code_theme=ft.MarkdownCodeTheme.ATOM_ONE_DARK, on_tap_link=self.on_link,
             md_style_sheet=ft.MarkdownStyleSheet(
-                p_text_style=ft.TextStyle(size=14, color="#D4D6DB", height=1.55),
-                h1_text_style=ft.TextStyle(size=26, weight=ft.FontWeight.W_700, color=t.TEXT),
+                p_text_style=ft.TextStyle(size=14, color=t.SOFT, height=1.55),
+                h1_text_style=ft.TextStyle(size=26, weight=ft.FontWeight.W_600, color=t.TEXT),
                 h2_text_style=ft.TextStyle(size=19, weight=ft.FontWeight.W_600, color=t.TEXT),
                 h3_text_style=ft.TextStyle(size=16, weight=ft.FontWeight.W_600, color=t.TEXT),
                 a_text_style=ft.TextStyle(color=t.BLUE),
-                code_text_style=ft.TextStyle(font_family=t.MONO, size=12.5, color=t.TEXT, bgcolor=t.FIELD),
-                codeblock_decoration=ft.BoxDecoration(bgcolor=t.BG, border_radius=8),
+                code_text_style=ft.TextStyle(font_family=t.MONO, size=12, color=t.TEXT, bgcolor=t.FIELD),
+                codeblock_decoration=ft.BoxDecoration(bgcolor=t.BG, border_radius=10),
                 codeblock_padding=0,
                 table_head_text_style=ft.TextStyle(size=13, weight=ft.FontWeight.W_600, color=t.TEXT),
-                table_body_text_style=ft.TextStyle(size=13, color="#D4D6DB"),
+                table_body_text_style=ft.TextStyle(size=13, color=t.SOFT),
                 table_cells_padding=ft.Padding(8, 6, 8, 6),
                 block_spacing=14,
             ))
@@ -104,43 +173,62 @@ class MarkdownDocument:
 def on_ui(page: ft.Page, fn: Callable[[], None]) -> None:
     """Runs fn on the page's event loop; control updates are not safe from worker threads."""
     async def call():
-        fn()
+        try:
+            fn()
+        except RuntimeError as error:
+            # A worker that answers after its view was replaced (another tool picked) updates nothing.
+            if "must be added to the page" not in str(error):
+                raise
     page.run_task(call)
 
 
 class Log:
-    """A monospace log that takes lines from any thread and redraws at most four times a second."""
+    """A monospace log that takes lines from any thread and redraws at most four times a second (once
+    on a phone)."""
 
     MAX = 1500
+    # On a phone the run shares the interface's interpreter, and each redraw diffs every line kept:
+    # an iPhone run fell from 41 to 12 link slots per second (examples/ios/README.md).
+    PHONE = os.environ.get("POKELDN_PLATFORM") in ("android", "ios")
+    if PHONE:
+        MAX = 300
+    FLUSH = 1.0 if PHONE else 0.25
 
-    def __init__(self, page: ft.Page, placeholder: str = ""):
+    def __init__(self, page: ft.Page, placeholder: str = "", private=None):
+        """`private`: a callable that returns the names to mask from the start (the user's trainer), or
+        None while Settings shows full logs; each clear starts a new run's Redactor."""
         self.page = page
+        self.private = private
         self.lines: deque[str] = deque(maxlen=self.MAX)
         self.pending: list[str] = []
         self.lock = threading.Lock()
         self.flush_scheduled = False
+        self.redactor = None
+        self._new_redactor()
         self.list = ft.ListView(expand=True, spacing=1, auto_scroll=True, padding=ft.Padding(12, 10, 12, 10))
         self.placeholder = t.text(placeholder, 12, t.FAINT)
-        self.control = ft.Container(ft.Stack([self.list, ft.Container(self.placeholder, padding=12)],
+        self.control = ft.Container(ft.Stack([t.fade(self.list, 16), ft.Container(self.placeholder, padding=12)],
                                              expand=True),
-                                    expand=True, bgcolor=t.BG, border_radius=10,
-                                    border=ft.Border.all(1, t.BORDER))
+                                    expand=True, bgcolor=ft.Colors.with_opacity(0.45, "#000000"),
+                                    border_radius=12)
 
     @staticmethod
     def _line(line: str) -> ft.Text:
         lower = line.lower()
         color = t.RED if ("traceback" in lower or "error" in lower or "failed" in lower) else \
             t.GREEN if ("complete" in lower or "success" in lower) else \
-            t.BLUE if line.startswith("[app]") else "#B9BCC4"
-        return ft.Text(line, size=11.5, color=color, font_family=t.MONO, selectable=True)
+            t.BLUE if line.startswith("[app]") else t.SOFT
+        return ft.Text(line, size=11, color=color, font_family=t.MONO, selectable=True)
 
     def add(self, line: str) -> None:
+        if self.redactor is not None:
+            line = self.redactor(line)
         with self.lock:
             self.pending.append(line)
             if self.flush_scheduled:
                 return
             self.flush_scheduled = True
-        threading.Timer(0.25, lambda: on_ui(self.page, self._flush)).start()
+        threading.Timer(self.FLUSH, lambda: on_ui(self.page, self._flush)).start()
 
     def _flush(self) -> None:
         with self.lock:
@@ -152,7 +240,13 @@ class Log:
         self.list.update()
         self.placeholder.update()
 
+    def _new_redactor(self) -> None:
+        from pokeldn.app.redact import Redactor
+        names = self.private() if self.private else None
+        self.redactor = Redactor(names) if names is not None else None
+
     def clear(self) -> None:
+        self._new_redactor()
         self.lines.clear()
         self.list.controls = []
         self.placeholder.visible = True
@@ -165,12 +259,30 @@ class PathField:
     """A path text field with a browse button, for a file or a folder."""
 
     def __init__(self, picker: ft.FilePicker, start_dir: Callable[[], str], value: str = "",
-                 mode: str = "file", exts: tuple = (), on_change: Callable[[str], None] | None = None):
+                 mode: str = "file", exts: tuple = (), on_change: Callable[[str], None] | None = None,
+                 *, single_line: bool = False, droppable: bool = True):
+        """`droppable=False` leaves file drops to an enclosing target."""
         self.picker, self.start_dir, self.mode, self.exts = picker, start_dir, mode, exts
         self.on_change = on_change
-        self.field = t.field(value=value, mono=True, expand=True, on_change=lambda e: self._changed(e.control.value))
+        # A single-line field does not fill its height; the padding brings it to the button row's 34 px.
+        options = {"height": t.CONTROL_HEIGHT, "fit_parent_size": False, "max_lines": 1, "multiline": False,
+                   "content_padding": ft.Padding(12, 11, 12, 11)} if single_line else {}
+        self.field = t.field(value=value, mono=True, expand=True,
+                             on_change=lambda e: self._changed(e.control.value), **options)
         icon = "folder" if mode == "dir" else "file"
-        self.control = ft.Row([self.field, t.icon_button(icon, self._browse, "Browse")], spacing=6)
+        row = ft.Row([self.field, t.icon_button(icon, self._browse, tr('widgets.browse_3227aa', 'Browse'))], spacing=6,
+                     vertical_alignment=ft.CrossAxisAlignment.CENTER)
+        self.control = (drop.target(ft.Container(row, border_radius=t.CONTROL_RADIUS), self._dropped)
+                        if droppable else row)
+
+    def _dropped(self, paths: list[str]) -> None:
+        """The first dropped file this field takes; a folder field takes a file's folder."""
+        if self.mode == "dir":
+            path = next((p if os.path.isdir(p) else os.path.dirname(p) for p in paths), "")
+        else:
+            path = next((p for p in paths if not self.exts or drop.suffix(p) in self.exts), "")
+        if path:
+            self.set(path)
 
     def _changed(self, value: str) -> None:
         if self.on_change:
@@ -187,16 +299,120 @@ class PathField:
                 file_type=ft.FilePickerFileType.CUSTOM if self.exts else ft.FilePickerFileType.ANY)
             path = files[0].path if files else None
         if path:
-            self.field.value = path
-            self.field.update()
-            self._changed(path)
+            self.set(path)
+
+    def set(self, path: str) -> None:
+        self.field.value = path
+        self.field.update()
+        self._changed(path)
 
 
 def open_folder(path: str) -> None:
     import subprocess
     import sys
     os.makedirs(path, exist_ok=True)
+    from pokeldn.app import android
+    if android.active():   # no file manager to show it in: the folder goes, zipped, where the player saves it
+        android.save_folder(path)
+        return
     if sys.platform == "win32":
         os.startfile(path)
     else:
         subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", path])
+
+
+class DigitCode:
+    """An eight-digit console code as eight boxes: a digit moves to the next box, Backspace on an empty
+    box clears the previous one (page_key), a pasted code fills from the box it lands in. The value
+    keeps a cleared box as a space; command.code_error refuses anything but the full code."""
+
+    focused: 'DigitCode | None' = None     # the code whose box has the focus; page key events go to it
+
+    def __init__(self, value: str, on_change: Callable[[str], None], length: int = 8):
+        self.on_change, self.length = on_change, length
+        self.digits = [c if c.isdigit() else " " for c in str(value or "")[:length].ljust(length)]
+        self.at, self.cleared = 0, (None, 0.0)
+        self.boxes = [self._box(n) for n in range(length)]
+        half = length // 2
+        self.control = ft.Row([*self.boxes[:half], ft.Container(width=6), *self.boxes[half:]],
+                              spacing=6, tight=True)
+
+    def _box(self, n: int) -> ft.TextField:
+        return t.field(value=self.digits[n].strip(), mono=True, width=36, text_align=ft.TextAlign.CENTER,
+                       content_padding=ft.Padding(0, 8, 0, 8), keyboard_type=ft.KeyboardType.NUMBER,
+                       on_change=lambda e, n=n: self._typed(n, e.control.value),
+                       on_focus=lambda e, n=n: self._focused(n), on_blur=self._blurred)
+
+    @property
+    def value(self) -> str:
+        return "".join(self.digits).rstrip()
+
+    def _typed(self, n: int, text: str) -> None:
+        # No input_filter: Flet's refuses a whole paste over one space, so "1234 5678" is cleaned here.
+        typed = list(text)
+        if len(typed) > 1 and self.digits[n] in typed:
+            typed.remove(self.digits[n])    # the caret sat beside the old digit: keep the new one
+        new = [c for c in typed if c.isdigit()]
+        if not typed:
+            self.digits[n] = " "
+            self.cleared = (n, time.monotonic())
+        elif not new:
+            pass                            # a letter: the box keeps its digit
+        else:
+            for k, c in enumerate(new[:self.length - n]):
+                self.digits[n + k] = c
+            self.at = min(n + len(new), self.length - 1)
+        self._commit()
+
+    def key(self, key: str) -> None:
+        n = self.at
+        if key == "Backspace" and not self.digits[n].strip() and n > 0:
+            # The same Backspace that just emptied this box is not a second one.
+            if self.cleared[0] == n and time.monotonic() - self.cleared[1] < 0.2:
+                return
+            self.at = n - 1
+            self.digits[self.at] = " "
+            self._commit()
+        elif key == "Arrow Left" and n > 0:
+            self.at = n - 1
+            self._focus()
+        elif key == "Arrow Right" and n < self.length - 1:
+            self.at = n + 1
+            self._focus()
+
+    def _commit(self) -> None:
+        for box, digit in zip(self.boxes, self.digits):
+            box.value = digit.strip()
+        self.on_change(self.value)
+        self._focus()
+
+    def _focused(self, n: int) -> None:
+        self.at = n
+        DigitCode.focused = self
+        box = self.boxes[n]
+        box.selection = ft.TextSelection(0, len(box.value or ""))
+        box.update()
+
+    def _blurred(self, e) -> None:
+        if DigitCode.focused is self:
+            DigitCode.focused = None
+
+    def _focus(self) -> None:
+        try:
+            page = self.control.page
+        except RuntimeError:            # not on a page yet
+            return
+        self.control.update()
+        page.run_task(self.boxes[self.at].focus)
+
+
+KEY_TARGET: list = [None]    # the shown view that takes keys, such as the controller
+
+
+def page_key(e) -> None:
+    """The page's key handler (gui/main.py): Backspace and arrows reach the focused code, the rest the
+    view in KEY_TARGET."""
+    if DigitCode.focused is not None:
+        DigitCode.focused.key(e.key)
+    elif KEY_TARGET[0] is not None:
+        KEY_TARGET[0].key(e)

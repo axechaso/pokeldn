@@ -1,7 +1,7 @@
 ---
 title: Scarlet and Violet
 nav_order: 9
-has_children: false
+has_children: true
 ---
 
 # Scarlet and Violet
@@ -11,6 +11,9 @@ Pia linked into `main`. Both trade with a retail console in both roles: `bin/sv_
 the console's offline Link Trade search, `bin/sv_join.py` joins the console's network.
 A retail Violet joins a host advertising Scarlet's local communication id, and its own search
 network advertises Scarlet's id too (`0x0100a3d008c5c000`, application version 21, scene 4).
+
+Both launchers also run a local Tera Raid in either role ([Tera Raids](sv_raid.md)), and the host
+trades an official gift Pokemon to a console ([Simulated Mystery Gifts](gift_simulated.md)).
 
 Addresses are offsets into the decompressed `main` of update 4.0.0 (`tools/switch/nso_read.py`):
 text `0x0..0x343fc90`, rodata from `0x3440000`, data from `0x4383000`.
@@ -23,16 +26,16 @@ text `0x0..0x343fc90`, rodata from `0x3440000`, data from `0x4383000`.
 | header size | 0x1C, GCM tag 8 bytes |
 | LDN passphrase | `W3GoSMEn7RIIUQ89rzqBHGhGferRNb7K18ZBq2aNuj8Us9RO9Q9JYyGOZlLy8MYL`, data `0x44dfd0a` |
 | Pia game key | `p1frXqxmeCZWFv0X`, data `0x44dfcfe`, immediately before the passphrase |
-| LDN local communication id | the cartridge's title id (neither id is a constant in the image; the NACP lists both) |
+| LDN local communication id | Scarlet's `0x0100a3d008c5c000` on both versions (neither id is a constant in the image; the NACP lists both) |
 
 Passphrase and game key equal Sword/Shield's and Legends Arceus's.
 
 ## What a searching console advertises
 
-The Link Trade search alternates hosting (new SSID each time) and scanning on a cycle of about five
-seconds, hopping between channels 1, 6 and 11.
+The Link Trade search alternates hosting (new SSID each time) and scanning, hopping between
+channels 1, 6 and 11; a host phase measures about five seconds.
 
-    local_communication_id  the cartridge's title id
+    local_communication_id  0x0100a3d008c5c000, Scarlet's, on both versions
     ldn protocol            1            advertisement version 4
     scene_id                4            app_version 21
     security_mode           1            accept_policy ALL
@@ -48,15 +51,15 @@ The application data is the 0x5C Pia system property block and 40 game bytes:
 | user password | sixteen zero bytes with no link code |
 | player limit enabled | 1, number of players 1, then 2 once a station is seated |
 | player name | one byte, a space, UTF-8 |
-| the 40 game bytes | zero, or `fb149700` at game `+0x21`, alternating every few seconds; a second console associates on either |
+| the 40 game bytes | zero, or a nonzero value at game `+0x21` (`fb149700` seen), alternating every few seconds; a second console associates on either |
 
 `pokeldn.sv.build_advertise_data` reproduces both beacons byte for byte.
 
 ## The protocols the game runs
 
 A passive capture of a retail pair shows Net, RTT, 0x80 and 0x81, all to the broadcast address of
-the session's `/24` with the recipient's variable id in the plaintext footer; the other six are
-unicast, 802.11ax between two Switch 2 consoles, and never captured.
+the session's `/24` with the recipient's variable id in the plaintext footer. The other six are
+unicast (802.11ax between two Switch 2 consoles) and absent from captures.
 
 The game's setup `0x17ff030` creates, in order: Reliable `0x7C` and BroadcastReliable `0x80` on
 port 0, Unreliable `0x68`, Reliable and BroadcastReliable on ports 1 and 2, `[0x44dfcd0]`
@@ -77,7 +80,8 @@ when the network factory enables NAT traversal (`0x6d3138`), which a local netwo
 | `0x98` | Session | 0 |
 | `0xA4` | MonitoringData | 0 |
 
-A retail Legends Arceus lists the same ten versions in its join request. A retail pair's opening:
+A retail Legends Arceus lists the same ten versions in its join request. A retail pair's opening
+(times from one capture):
 
     +0.00   the joiner associates
     +0.06   host: Net 0x11 (station list), 0.12 s later Net 0x50
@@ -101,11 +105,12 @@ The layout is Legends Arceus's, with four station slots of 21 bytes:
     ...                 four stations: migration state, ranking (host 0, joiner 1, empty 0xff),
                         one byte, 16 address bytes, big-endian u16 port (12345)
 
-`01 40 00 00` is a bare NetStartHostMigration: a retail host sends it when the session moves to the
-other console; a console joined to `bin/sv_host.py` sends it about eight seconds in, repeatedly.
+`01 40 00 00` is a bare NetStartHostMigration, sent by a host handing its role over. A retail
+Scarlet hosting from its search repeats it on a seat it hands to its joiner
+([What decides a seat](#what-decides-a-seat)).
 
 A host must write four station slots (Pia's count, not the game's limit of two). With two, the
-joining game sends nothing and disconnects at 5.00 s (4.98 to 5.01 s over 49 joins), a retail
+joining game sends nothing and disconnects 5 s after association (4.98 to 5.01 s over 49 joins), a retail
 console answering Net 0x11 with ICMP port 12345 unreachable; with four it answers Net 0x12 and sends
 its Session join request. Opening flags 0x31 (retail) or 0x01 make no difference.
 
@@ -125,8 +130,7 @@ message and sends records on the port of its station index (as `pokeldn.pla.data
 | joiner, index 1 | 0x81 ports 0 and 4 | 0x81 port 1 |
 
 The open payload is `0000000000f38800000000` on ports 0 and 1, `00 <port> 00 00 0ff0 0800000000` on
-4 and 5: a StreamData kind 0 posting a receive of 0xF388 (transfer 0) or 0xFF008 (4 and 5; 62 of
-each in 124 kind-0 messages across 47 captures). The 0xFF008 transfer is never sent in a trade.
+4 and 5: a StreamData kind 0 posting a receive of 0xF388 (transfer 0) or 0xFF008 (4 and 5). The 0xFF008 transfer is never sent in a trade.
 `pokeldn.sv.streams` builds all of it; `tests/test_sv.py` pins it to retail bytes.
 
 ### The Pia message flags
@@ -194,16 +198,36 @@ A station's block is 0xF388 (62,344) bytes: 45 chunks of 1384 and one of 64, ids
 byte `floor(k * 1384 * 100 / 62344)` (2, 4, 6, 8, 0x0b, ..., 0x37 at 25, 0x52 at 37, 0x64 at 46). The
 first chunk carries the partner shown on screen:
 
-    +0x0b  5   unread
-    +0x13  26  the player name, UTF-16 little-endian, NUL-padded
+    +0x0b  4   trainer id, then secret id
+    +0x0f  1   version: 50 Scarlet, 51 Violet
+    +0x10  1   gender
+    +0x11  1   language
+    +0x12  1   ball-throw style, 1 the original
+    +0x13  26  the player name, UTF-16 little-endian, NUL-padded; --trainer-name on both launchers
     +0x2d  22  the account identifier, ASCII, `u-` and twenty characters
-    +0x53  1   5
+    +0x53  8   story progress, little-endian: 1 the main story cleared, 4 The Indigo Disk cleared
 
-Chunks 2 to 24 are high-entropy; 25 to 46 are zero. A station sends its whole set at once: ids 1,
-25, 26 to 36 and 46 in the first packet, 2, 37 and 38 to 45 in the second, then 3 to 24 one per
-packet (41 of 48 retail sets). The identical zero chunks travel behind a presence byte of 0x00, every
-header field inherited ([Message framing](pia.md#message-framing)). 46 of 52 retail sets went out
-within 0.19 s. `pokeldn.sv.streams.decompress` reads them.
+The block is built on the stack at `0xa52f88`..`0xa530a0`: the trainer from the save, then the
+throw style from another save block (`0xa53054`), then the account identifier (`0x1a61a00`), and last
+the progress word, the return of a script function the game keeps at `0x473a040` (called at
+`0xa5309c`). Native `f20A702BD` (`0x877560`) installs it; in the 3.0.1 script dump
+`BattleNetworkNetReceiver` passes a function that starts from 0, sets 1 when
+`FSYS_SCENARIO_GAME_CLEAR` is set and ors in 4 when `FSYS_SCENARIO_GAME_CLEAR_SU2` is. The retail
+Scarlet sent 5, the retail Violet 0 with an all-zero account identifier, and the reference sends 1.
+
+The game's script reads a station's player through native getters registered in this order:
+`PlayerId`, `RomCode`, `Sex`, `LanguageId`, the throw style, `NameStrBuf` (`RegisterPlayerData` and
+the battle setup in the 3.0.1 script dump; the throw style is the slot the save's own `ballThrowId`
+fills). On two retail saves, a Scarlet and a Violet, the id pair, version, language and name matched
+the Pokemon each save had caught, and still named the save while it offered one it had received. A
+gift made for the receiving player reads them (`reference.identity_trainer`,
+[Made for the receiving player](gift_simulated.md#made-for-the-receiving-player)).
+
+Chunks 2 to 24 are high-entropy; 25 to 46 are zero. A station sends its whole set at once, usually
+ids 1, 25, 26 to 36 and 46 in the first packet, 2, 37 and 38 to 45 in the second, then 3 to 24 one
+per packet (41 of 48 retail sets). The identical zero chunks travel behind a presence byte of 0x00,
+every header field inherited ([Message framing](pia.md#message-framing)). A set usually leaves
+within 0.2 s (46 of 52 retail sets within 0.19 s). `pokeldn.sv.streams.decompress` reads them.
 
 `pokeldn.sv.reference` ships a station's 44 records and its two identity fragments on 0x7C port 0,
 recorded from an emulated Scarlet whose player is `Player`, account identifier unset. `bin/sv_host.py`
@@ -220,8 +244,9 @@ held. `pokeldn.sv.streams.ack_position` builds this (pinned in `tests/test_sv.py
 A host resends every unacknowledged record on the RTT deadline with flag 0x40, one round per packet,
 lowest id first, shrinking as acks arrive. A message walk that stops at a presence byte of 0x00 reads
 only each round's first record and takes 19 rounds; `--ack-highest` moves `lowest_pending` from 1 to
-38 at once. Unacknowledged, a host floods at HT MCS3: 435 to 494 records a second, about 3% of the
-air and the whole 150 KB/s of a board's serial line
+38 at once. Unacknowledged, a host resends every pending record each round; at a small RTT that is
+several hundred records a second (435 to 494 at HT MCS3, about 3% of the air), enough to
+fill the 150 KB/s of a board's serial line
 ([the serial ceiling](hardware_esp32.md#the-serial-ceiling)). Round interval, `[window+0x80] +
 1.4 x RTT` rounded up to the frame, against the joiner's answer delay:
 
@@ -235,10 +260,12 @@ air and the whole 150 KB/s of a board's serial line
 A record's interval converges on it as the RTT ring fills (0.19 s with 4 to 5 answers, 0.10 s with
 8 to 18, 0.082 s with 20). Constructor `0x6eeea8`, send buffer `0x6e6e94`, enqueue `0x6f1994` and
 send loop `0x6f0638` under unicorn send 46 records in one pass and nothing more before the deadline.
-The host's processing sets the pace: with every frame acked within 7 ms, its `lowest_pending` left 1
-only 0.73 to 0.81 s after the set, its ack masks advancing in steps of about 0.19 s. It sends its set
-about 0.1 s after the joiner's stream open and record set (`--open-delay`, `--record-delay`), and
-floods depending on the RTT answers it then holds:
+A host's own processing sets the pace: its `lowest_pending` leaves 1 about 0.5 to 1.0 s after the
+set whatever the ack delay (0.73 to 0.81 s with every frame acked within 7 ms), its ack masks
+advancing in steps of about 0.19 s. It sends its set about 0.1 s after the joiner's stream open and
+record set (`--open-delay`, `--record-delay`). RTT answers it holds before then bring the round
+interval below that latency, and it resends records the joiner already holds; answering RTT 0.3 s
+late avoids it. On retail seats:
 
 | RTT answers before the set | answer delay | seats | records resent before `lowest_pending` left 1 | left 1 after |
 |---|---|---|---|---|
@@ -247,35 +274,32 @@ floods depending on the RTT answers it then holds:
 | 0 | 0.3 s | 4 | none | 0.91 to 1.01 s |
 | 1 to 7 | 0.3 s | 9 | none | 0.50 to 0.58 s |
 
-Later rounds resent 158 to 272 records per seat, those a presence-0x00 walk left unacknowledged. A
-few prompt RTT answers bring the interval under the host's 0.8 s ack latency; `--rtt-delay 0.3`
-answers 0.3 s late, and twelve seats of twelve were announced (10.23 to 13.66 s in) and traded, two
-after the console's post-trade host migration (`--leave-on-migration 3`). `--announce-timeout
-SECONDS` leaves an unannounced seat and scans again. `bin/sv_join.py` acks a new record at once, a
-repeat at most once per 50 ms per stream (`--repeat-ack-gap`: 38 packets for 91 repeats against
-about 150), one ack per stream per packet.
+`--rtt-delay 0.3` answers RTT requests 0.3 s late, which keeps the round interval above the host's
+ack latency. `--leave-on-migration N` ends a seat N seconds after the console sends Session type 7,
+and `--announce-timeout SECONDS` leaves an unannounced seat; both scan again. `bin/sv_join.py` acks
+a new record at once, a repeat at most once per 50 ms per stream (`--repeat-ack-gap`), one ack per
+stream per packet.
 
 With no RTT sample the 0x81 streams never retransmit
-([Protocol 0x81](pia.md#protocol-0x81-the-stream-broadcast-reliable-transfer-pia-6)): in four seats
-answering no RTT request, an unacknowledged record stayed pending. Three seats lost full-header
-records on the air; all four also dropped bundled messages through the old presence-0x00 parser:
+([Protocol 0x81](pia.md#protocol-0x81-the-stream-broadcast-reliable-transfer-pia-6)): a record lost
+on the air stays pending, the host's `lowest_pending` stops at its id, and the peer is never
+announced.
 
-| seat | host ids lost on the air | host `lowest_pending` | seat ended |
-|---|---|---|---|
-| 0 | 11 | 11 from 1.51 s | 22.72 s |
-| 1 | none | 26 from 2.86 s (26 came behind presence 0x00) | 22.68 s |
-| 2 | 19 | 19 from 2.86 s | 20.49 s |
-| 3 | 18, 23 | 18 from 1.46 s | 20.02 s |
-
-RTT samples enable retransmission; the announcement job has no RTT gate. With the corrected
-parser, a loss-free emulated Scarlet 4.0.0 host announces and completes a trade without RTT requests or
-answers. A missing identity record holds the BoxTrade job in state 1 (`+0xb8`); the finished-slot
+RTT samples enable retransmission; the announcement job has no RTT gate. A loss-free emulated
+Scarlet 4.0.0 host announces and completes a trade with no RTT requests or answers. A missing identity record holds the BoxTrade job in state 1 (`+0xb8`); the finished-slot
 count at `0x1e51ae8` remains 1 against a required 2 until retransmission completes the set.
 
-### What a passive capture misses
+Both launchers retry pending identity records. Dropped initializer and middle-record cases complete
+through the launchers in `tests/test_sv_identity_loss.py`. The patched emulator completed trades
+with those losses; a retail console completed two trades per role with pending identity records
+retried and acknowledged, followed by clean departure.
+The earlier unannounced seat whose acknowledgement reached 47 has no independent air capture
+establishing which outgoing chunk, if any, was lost.
 
-Both consoles pack several MSDUs into one A-MSDU frame; unpacking the subframes took one capture from
-313 readable Pia packets to 3667.
+### A-MSDU frames in a capture
+
+Both consoles pack several MSDUs into one A-MSDU frame. A passive capture must unpack the subframes
+or it loses most Pia packets (313 readable without, 3667 with, in one capture).
 
 ## The link code
 
@@ -285,9 +309,35 @@ under the same game key ([docs/pla.md](pla.md)). The game bytes carry the code i
 its length as a u32 at +0x24. `pokeldn.sv.build_advertise_data(code=...)` reproduces a retail
 console searching with 12345678 byte for byte.
 
-A searching console joins only a host advertising its code (`bin/sv_host.py --code`). A console
-hosting under a code accepts a joiner advertising none. `bin/sv_join.py --code` joins only a console
-searching with that code.
+A searching console joins only a host advertising its code (`bin/sv_host.py --code`). A retail
+console hosting under a code accepted a joiner advertising none. `bin/sv_join.py --code` joins only
+a console searching with that code.
+
+Only the searching console checks the code, on the networks it scans. Its selector `0x26e955c`
+(called from `0x272d838` before the join) skips a network with no password when searching with a
+code (`0x26e95f4`) and a network with a password when searching without one (`0x26e960c`). It then
+hashes the game bytes from +0x00 to the first NUL and its own code with FNV-1a 64 (prime
+`0x100000001b3`, offset basis `0xcbf29ce484222645` loaded at `0x26e96c8`, not the standard
+basis) and skips the network unless the two are equal (`0x26e972c`). It reads neither the password's
+value nor the length at +0x24.
+
+A host compares nothing a joiner sends. The LDN association uses the fixed passphrase and the
+Session join request has no password field. Pia's password check on a connecting station, result 7
+in the Net 0x32 handler `0x69ec50` (`0x69ee5c`, `0x69ee70`), needs a Net 0x32, and its only sender
+`0x69d42c` is gated on protocol vfunc 48: 0 in `LdnProtocol` (`0x6a2fac`), 1 in `LanProtocol`
+(`0x6ba278`). On the joining side the LDN connect runs Pia's network check `0x6a22c4` with its
+password comparison (`0x6a24a4`) switched off (`0x6b0d90`).
+
+A joined console does not check the code again. The Net 0x50 handler `0x69ea3c` validates the system
+property size (0x5c), the application data size (at most 0x124) and four Pia identity fields
+(`0x69d9d8`), copies the bytes into the network property (`0x69d8a4`) and acks with Net 0x51; it
+compares no byte of the system property or the game bytes. Over LDN the copy lands in the cached
+advertise data and the next `nn::ldn::GetNetworkInfo` (`0x6b30d4`) overwrites it. The game reads the
+first 0x28 game bytes of a session only in the selector and in UpdateSessionSetting (`0x26e63b8`),
+which rewrites its own session; two other readers (`0x268e988`, `0x268e9bc`) read only past +0x28. The
+joining console keeps its code as its own Pia station password (join object vfunc `0x274bdb8`,
+setter `0x6a208c`), which it advertises only when it hosts. A Link Trade's port-2 type 1 comes from
+the BoxTrade job's state 2 (`0x1e51b68`): kind 1, the static empty name `[0x46d3e30]`, no data.
 
 ## Where the code is
 
@@ -313,7 +363,7 @@ classes).
 | `0x46d6ca0`, `0x46d6ca8` | the drain `0xe44cf0`'s singleton, set up at `0xe44ac0` |
 | `0x1e685a4` | the trade channel's port-0 receiver: kind (tagged integer), step, then kinds 0 to 5 via table `0x3c5bb82`; 1 identity (`0x1e6864c`, parsed into `+0xae0`), 2 offer (`0x1e686cc`: 344-byte blob parsed by `0x1db949c`, wrapped by `0xeee8fc` and `0xe13ad8`, stored at `+0xb8` by `0x1e684fc`, state `+0xc4` = 3), 3 confirmation (`0x1e68768`, step against `+0xe2`), 4 cancel (`0x1e68678`), 5 commit (`0x1e68780`, state `+0xc0` masked to 4) |
 
-## The Session protocol is there and is never in a capture
+## The Session protocol
 
 `nn::pia::session::SessionProtocol` (id vfunc `0x6d9f3c` returns 0x98) sits next to `JoinMeshJob`,
 `CreateMeshJob`, `LeaveMeshJob`, `JoinSessionJob` and `SessionPacketReader`/`Writer`; the mesh join
@@ -365,12 +415,13 @@ a 13-byte type 6 (`0x6d80a4`): type, constant id, two zero bytes, applied sequen
 
 The join request above seats the station: a retail Scarlet host accepts in 16 ms, sends a 41-byte
 join response (status 1, no route bytes) and a route-less station update, and streams its identity
-on 0x81 port 0, once per record. A host that does not count the joiner's acks floods it instead
-(about 350 records a second, up to seventy retransmits each; against an emulated Scarlet on a
-lossless LAN, 676 retransmits per record in 59 s), so airtime is not the cause. On some seats the
-host also sends a Session type 7 about 22 ms after the accept (`LeaveMeshWithHostMigrationJob`,
-handing the host role to the joiner), once a second until a type 8 answers; answering it is
-untested.
+on 0x81 port 0, once per record. A host that does not accept the joiner's acks resends every record
+until the seat ends ([The flag that makes the host count an
+acknowledgement](#the-flag-that-makes-the-host-count-an-acknowledgement)): about 350 records a second
+on retail, up to seventy retransmits each, and 676 retransmits per record in 59 s against an emulated
+Scarlet on a lossless LAN. A host may also send Session type 7 (`LeaveMeshWithHostMigrationJob`),
+handing the host role to the joiner, once a second until a type 8 answers
+([What decides a seat](#what-decides-a-seat)).
 
 ### The flag that makes the host count an acknowledgement
 
@@ -378,19 +429,20 @@ A message with flag bit 5, ZLIB (`[msg+0x29]`, `0x6efc80`), is inflated in `0x6e
 zlib inflate `0x2801d0`) before the station resolve; a failure returns 0x2C03 (`0x6efd5c`). A plain
 bulk ack under flags 0xA0 fails there (600 of 600 on the emulated console). Retail 0xA0 acks carry
 zlib bodies: all 1,774 in three retail joiner captures inflate to 99 bytes; a 38-byte body starting
-`484b62606008` reproduces with the records' 4 KB window, level-5 sync-flush framing. Under flags 0x00 the same 99 bytes take the other path: the host sent each record once
-(6.3 a second, then none, against 115 to 257 a second under plain 0xA0). Both retail stations flag
-bulk acks 0xA0 and send them to the LDN broadcast of their /24; `bin/sv_join.py` compresses the
-body when it sets bit 5 (`--ack-flags`, `--ack-entries`, `--ack-dest-bits`, `--ack-sweep`).
+`484b62606008` reproduces with the records' 4 KB window, level-5 sync-flush framing. Under flags 0x00
+the same 99 bytes take the other path: the host sends each record once (6.3 a second, then none,
+against 115 to 257 a second under plain 0xA0). Both retail stations flag bulk acks 0xA0 and send them
+to the LDN broadcast of their /24; `bin/sv_join.py` compresses the body when it sets bit 5
+(`--ack-flags`, `--ack-entries`, `--ack-dest-bits`, `--ack-sweep`).
 
 ### The first record on a stream carries INITIALIZED
 
 A station's first record carries INITIALIZED with START, END and ZLIB, flags 0x1F; later records
 0x17. A first record sent as 0x17 is never acknowledged (198 sends); as 0x1F it is acknowledged
-within 90 ms. With both fixes a joiner's identity is byte-identical to a pair joiner's in all 44
-records apart from the source variable id and nonce, and emulated and retail hosts acknowledge it to
-47 (mask `feffffffff01`, `field_0x50` following), send their records once, and issue a type-5
-station update listing both stations with their player blocks.
+within 90 ms. With zlib bulk acks and INITIALIZED on the first record, a joiner's identity is
+byte-identical to a pair joiner's in all 44 records apart from the source variable id and nonce.
+Emulated and retail hosts acknowledge it to 47 (mask `feffffffff01`, `field_0x50` following), send
+their records once, and issue a type-5 station update listing both stations with their player blocks.
 
 ## Hosting for a console
 
@@ -399,32 +451,32 @@ Besides four station slots in Net 0x11, a host must send:
 | the host sends | what it must be |
 |---|---|
 | the Session join response | 41 bytes: no route bytes, station index 1, join order 1, sequence id 0, four random bytes at +8 (Arceus's 43-byte form is retransmitted against) |
-| the Session type-1 join ack | nothing; a console sent one leaves within two seconds |
-| the Session type-5 station list | twice: with the join response under sequence id 0, then about 1.5 to 2 s later under the next id |
+| the Session type-1 join ack | nothing; a retail console sent one left within two seconds |
+| the Session type-5 station list | twice: with the join response under sequence id 0, then under the next id (a retail host: 1.5 to 2 s later) |
 | each station in that list | 79 bytes: location id, address and port, station index, big-endian u16 join order, NAT byte, IPv6 flag, 32-byte token, counts, player records. No route bytes (Arceus's is 81) |
 | the player name in it | one space (0x20) |
 | every Session reply's message flags | 0x00 |
-| the ack on Reliable 0x7C | the one-entry form, no destination bitmap; unacknowledged, the channel table is resent a thousand times in ninety seconds |
+| the ack on Reliable 0x7C | the one-entry form, no destination bitmap; unacknowledged, the console resends the channel table without end (a thousand times in ninety seconds measured) |
 | every data message on Reliable 0x7C | a nine-byte header, destination_bits 0, no bitmap |
 | Net 0x11 | once; a repeat is a fresh connection request at a seated station |
 | Net 0x50, the update property | 0.2 s after the 0x11, every 500 ms until the station's 0x51, with the forty game advertise bytes at +0x82 |
-| RTT | its own request every 410 ms, besides answers |
-| the whole opening | inside 0.3 s: join response, both station lists, channel table, both stream opens, clock answer, Net 0x50 and all 44 records |
+| RTT | its own requests besides answers (a pair's host: every 410 ms) |
+| the opening | join response, the first station list, channel table, both stream opens, clock answer, Net 0x50 and all 44 records right after the seat (a retail host: within 0.3 s); the key-0x80 open before the console's trade screen draws ([Opening the channel](#opening-the-channel)) |
 
-The forty game advertise bytes are per session (`648cf4`, `8170f0` at +0x21 in two sessions, the rest
-zero). With `--channel 6`, `--player-name RyuPlayer` and `--host-player-id
+The forty game advertise bytes change per session: zero, or a nonzero value at +0x21 (`648cf4`,
+`8170f0` and `fb149700` seen), the rest zero. With `--channel 6`, `--player-name RyuPlayer` and `--host-player-id
 00000000000000010000000000000000` the NetworkInfo matches a live emulated Scarlet host's apart from
-the session id. The console then holds one join for the host's lifetime, against sixteen to
-fifty-seven when a session fails above the seat.
+the session id. With these settings the console's first join holds; a session that fails above the
+seat draws repeated joins (sixteen to fifty-seven measured).
 
-### The sender's own lowest pending is what closes the gap at 5 and 6
+### Lowest pending and the gap at 5 and 6
 
 A station's ids 5 and 6 are never sent (44 records on the wire), and the rest go out of order (a
 pair's host: 1, 2, 3, 46, 4, 7, 8, 19, 9, 15, 10, 16...). Every record declares
 `lowest_pending` 1, destination bits 3, bitmap `[2]`, stream id 0. The gap is closed by the sender's
 next bulk ack on the same stream, whose `lowest_pending` steps from 1 to 47; the peer then acks the
 set to 47 with an empty mask. Left at 1, the peer answers `ack_id` 5, mask `feffffffff01`, all
-session. Renumbering 1 to 44 also works but uses ids no retail sender uses.
+session. Ids 1 to 44 with no gap are accepted too; no retail sender uses them.
 
 A sender may advance `lowest_pending` only past acknowledged records. Advancing directly to 47
 after the initial burst can hide a lost identity chunk: the peer acknowledges 47 while the
@@ -437,8 +489,7 @@ The outgoing data and bulk-ack headers declare the lowest record still pending, 
 set is fully acknowledged. This preserves intentional gaps 5 and 6 while retaining actual losses.
 
 Loss of the first INITIALIZED record leaves all 44 records unacknowledged, requiring the whole
-set to be retried. A missing middle record is retried on its own. Both sender roles complete
-repeated retail trades over the ESP32 with this window.
+set to be retried. A missing middle record is retried on its own.
 
 ## The game's own protocol, from a pair
 
@@ -604,8 +655,8 @@ chunk received); state 7 clears a flag
 ([Protocol 0x81](pia.md#protocol-0x81-the-stream-broadcast-reliable-transfer-pia-6)). The 0x97E08
 class has the same pair, `0x1e60284` and `0x1e615e8`.
 
-On the wire the type 7 followed the console's last send of its own set by 0.020 to 0.106 s in 37 of
-40 announced seats (0.545, 0.864 and 3.902 s in the others).
+On the wire the type 7 follows the console's last record of its own set, usually within 0.11 s
+(0.020 to 0.106 s in 37 of 40 announced seats; 0.545, 0.864 and 3.902 s in the others).
 
 The relay is a 0x388-byte object (vtable `0x44e56f8`), singleton `[0x46da9c0]` = `0x4739430`,
 created by `0x165a200` from `0x1659b70` only when none exists (`0x1659b18`). Its station-event
@@ -626,7 +677,14 @@ receiver `0x1945404`, type 4 by the type-0xB receiver `0x279be18`.
 
 The own-leave path at `0x12fbc3c..0x12fbc4c` completes a client's pending type-2 request with
 result 5 (`+0x40..+0x43 = 02 00 01 05`). The next creator can replace that completed request
-without restarting the game, including after a disconnect before type-9 acceptance.
+without restarting the game, including after a disconnect before type-9 acceptance. A leave event
+for the master's id alone does not complete the request: `0x12fbc70..0x12fbc84` calls only
+`0x12fbef0`. The client's BoxTrade job still ends at 15 s with result 4, because state 5 tests the
+clock (`0x1e51c74..0x1e51ca4`, base `+0x108` set at `0x1e51c6c`) before it polls the request through
+its weak reference `+0xf8` (`0x18ab588`, `0x18ab614`). Neither the timeout path `0x1e51d50` nor the
+job destructor `0x1e51740`, which only releases the weak reference through `0x18ccdb4`, touches the
+relay's request. It stays pending at relay `+0xb8`, and `0x2799b10` and `0x18ab83c` refuse, until
+the type-9 or type-0x0D receiver or the client's own leave event completes it.
 
 The relay lives until the application exits, so a request pending at `+0xb8` survives every seat,
 search and menu until a completer runs. Its holder `0x4739430` (GOT `0x46da9c0`, guard `0x4739440`
@@ -658,13 +716,14 @@ vtable `0x44e6be0`, on the path from `0x92d648` (slot 5 of `0x443ffd0`) that end
 Port 1 is the channel table (the Arceus mechanism): a station sends on a key only once its peer has
 announced it. A joiner's table is byte for byte the host's; until it arrives the host stays on its
 search screen. The host's key-0x80 open must come first: a joiner whose trade screen draws before it
-never sends its first game message and A on a Pokemon gives no menu. A retail console opens key 0x80
-9.15 s after the seat; a host opening at 6.0 s gets the menu, at 11.0 s none. The 0x7C reliable
+never sends its first game message and A on a Pokemon gives no menu. The 0x7C reliable
 header is nine bytes, no bitmap, sequence and lowest pending both the message's own; an open is
 flags 0x0F, a later update 0x07.
 
 The channel must open before the trade screen draws. A later open leaves an emulated Scarlet
-4.0.0 trade box without a selection cursor; the required delay depends on the peer.
+4.0.0 trade box without a selection cursor; the deadline depends on the peer. A retail console that
+opened its own key 0x80 9.15 s after the seat drew the menu for a host open at 6.0 s and not at
+11.0 s.
 
 ### The trade
 
@@ -676,7 +735,7 @@ Port 0 carries the game: a four-byte header and a body.
 | 9.31 | host | the same | |
 | 58.2 | host | `80000200` + 348 bytes | the offered Pokemon |
 | 67.6 | joiner | `80000200` + 348 bytes | |
-| | either | `8000040100` | the player backed out of the wait; the station leaves the network after it (retail) |
+| | either | `8000040100` | the cancel (receiver `0x1e68678`): the player backed out of the wait |
 | 112.7 | host | `80000300` | |
 | 116.0 | joiner | `80000300` | |
 | 117.5 | joiner | `80000500` | |
@@ -708,17 +767,20 @@ messages 3 and 4; its ack of the host's offer reads `ack_id` 6, `lowest_pending`
 
 ### A confirmation sent before the station's own offer
 
-A host that sends `80000300` while its `80000200` is still queued crashes the console (black screen,
-system error); the record itself is stored unchecked. `--offer-after-open` on both launchers hangs
+Never send the confirmation `80000300` while the offer `80000200` is still queued: a retail console
+sent them in that order crashed (black screen, system error), the record itself stored unchecked. `--offer-after-open` on both launchers hangs
 the offer on the peer's key-0x80 announcement, and neither queues a trade message ahead of one
 already queued for the same station and port.
 
-### Two trades in one seat
+The trade animation follows the console's last step `8001010e` and carries no trade message. After
+its status `b90101b902b90280800100` the console sends no application data until the player backs out.
+
+### Several trades in one seat
 
 Key 0x0080 stays open; key 0x0180 opens and closes per trade. A second trade repeats the cycle with
 sequences running on (host offer 16, confirmation 17, commit 18, steps 19 to 26) and no new
-association, Session exchange or identity. `TradeStage` and `JoinerTradeStage` take a list of
-records; `--trade-offer` is repeatable.
+association, Session exchange or identity. `TradeStage` and `JoinerTradeStage` take a list of records, one per trade; `--trade-offer` is
+repeatable. Retaining a seat after the console requests host migration remains unverified.
 
 ### The first game message, and what it carries
 
@@ -732,9 +794,10 @@ inflations concatenated:
     04
 
 The blob is 850 little-endian three-byte values, mostly 1, the rest bitmasks (`0x0fffff`,
-`0x0002ff`, `0x00003f`, 0), per-station: 38 entries differ between a retail console and a pair host
-(entry 36: `0x040000` against `0x0fffff`). What the index counts is unknown. A pair host's four
-fragments replayed work on retail.
+`0x0002ff`, `0x00003f`, 0), per-station: the values differ between stations (38 entries between a retail console and a pair
+host; entry 36: `0x040000` against `0x0fffff`). What the index counts is unknown. It carries none of
+the trainer's fields: neither id pair nor name appears in a retail console's. A pair host's four
+fragments, replayed, are accepted by a retail console.
 
 ### The record a trade message carries
 
@@ -778,15 +841,15 @@ A record rebuilt from 344 zero bytes and the fields `read` reports comes out byt
 (`tests/test_sv_pokemon.py`). Species is the internal index, which parts from the National Dex at
 917 [`PKHeX.Core/PKM/Util/Conversion/SpeciesConverter.cs:92`]. A wrong block order survives the
 checksum; a record reading as a coherent Pokemon pins it. `bin/sv_host.py` prints both offers,
-`--offer-out FILE` writes the console's, and `--trade-offer` takes a 344-byte record (plain or
+`--offer-out FILE` writes the console's (offer N after the first to `FILE` with `-N` before the
+extension), and `--trade-offer` takes a 344-byte record (plain or
 encrypted), the 348-byte body or the 352-byte message.
 
-### A record composed here
+### Composed records
 
-A record composed from zero bytes by `pokemon.build` (a shiny Imposter Ditto) trades into a retail
-Scarlet save with every summary field as composed, as does one edited with `bin/sv_host.py
---offer-set` (nickname, nicknamed flag, personality value, IVs). Nothing is checked before the trade
-screen draws it; the host writes the checksum. The summary's trainer id is
+A record composed from zero bytes by `pokemon.build`, or edited with `bin/sv_host.py --offer-set`
+(nickname, nicknamed flag, personality value, IVs), trades into a retail Scarlet save with every
+summary field as composed. The trade screen draws a composed record with no legality check; the host writes the checksum. The summary's trainer id is
 `(TID16 | SID16 << 16) % 1000000` (12345 and 54321 draw as 993401, 8131 and 64817 as 855043); the
 characteristic line comes from the encryption constant and the IVs.
 
@@ -805,21 +868,22 @@ level 100, from zero stat fields; HP 99/99 sent at level 1 arrives as 12.
 
 ### What a joiner sends, in order
 
-A pair's joiner before the game's first message:
+A pair's joiner before the game's first message, times from one capture:
 
 | time | message |
 |---|---|
-| 0.17 | Net 0x12, echoing the sequence of the host's 0x11 |
 | 0.04 | the Session join request |
+| 0.17 | Net 0x12, echoing the sequence of the host's 0x11 |
 | 0.38 | Net 0x51, echoing the sequence of the host's 0x50 |
 | 1.63 | the Session type 6, acknowledging the station update |
-| 1.82 | Clone Clock 0x77, eighteen zero bytes; the host answers 1, sixteen bytes, a trailing byte |
 | 1.68 | the eleven bulk acknowledgements and the stream opens on 0x81 ports 0 and 4 |
 | 1.68 | the channel table on 0x7C port 1 |
+| 1.82 | Clone Clock 0x77, eighteen zero bytes; the host answers 1, sixteen bytes, a trailing byte |
 | 2.03 | its own 44 records on 0x81 port 1 |
 | 2.43 | the open on 0x7C port 2 |
 
-Sent the 0x12 and the 0x51, a console's Net traffic falls from 212 messages a seat to 2.
+Unanswered, a console repeats Net 0x11 and 0x50; the 0x12 and the 0x51 stop them (212 Net messages
+in a seat without, 2 with).
 
 ### The joiner's side of the trade
 
@@ -848,22 +912,27 @@ past the joiner's later messages, which are discarded at `0x6f03cc`.
 --trade-offer` (`--send-on-open` for the identity fragments gated on the key-0x80 open).
 `tests/test_sv.py` drives it with the host's half of the pair's messages and pins the joiner's half.
 
-### What a trade rewrites, measured on a record that came back
+### What a trade rewrites
 
-A composed record traded onto a console and offered back differs in 27 bytes, seven fields:
+A composed record traded onto a retail console and offered back differs in 27 bytes, seven fields:
 
 | field | as sent | as it came back |
 |---|---|---|
 | `current_handler` | 0 | 1 |
 | `ht_name` | empty | the console player's name |
-| `ht_language` | 0 | 3 |
+| `ht_language` | 0 | the receiving console's language (3, French) |
 | `ht_friendship` | 0 | 50 |
 | `nickname` | empty | the species name in the console's language |
-| `current_hp` | 0 | 237 |
+| `current_hp` | 0 | the computed maximum HP (237, a level-100 Ditto) |
 | `stats` | zero | the six the game computes |
 
 Everything else is kept as sent. An empty name comes back as the species name, as in the Sword
 Mystery Gift record (`docs/swsh_gift.md`).
+
+A record whose original trainer is the receiving save's keeps handler 0 and no handler name, as in
+Legends Z-A ([What the trade writes into a received record](za.md#what-the-trade-writes-into-a-received-record)).
+A Mystery Gift Pokemon made for a retail Violet's trainer, from a Pokemon that save caught
+([Made for the receiving player](gift_simulated.md#made-for-the-receiving-player)), came back from it so.
 
 ### Joining a searching console: a trade, and what decides the seat
 
@@ -874,10 +943,24 @@ type-3 join, sends the four identity messages after the console opens key 0x80, 
 
 #### What decides a seat
 
-With the joiner's whole opening delivered, some seats end in host migration: about eight seconds in
-the console sends Session type 7 naming the joiner, then only `01400000` about twice a second. At
-the LDN level the new host must create the network, as Legends Arceus does when the joiner hosts on
-the same code (`docs/pla.md`). The others run the game; the console sends, in order:
+A retail console hosting from its search either runs the game or hands the host role to its joiner.
+The game hosts once after 3 to 7 browse attempts (`RandomMatchingSeq` `0x26e182c`, counter
+`rand%5+4`) and waits for a member for 3000 + rand%1000 ms, plus 5000 ms per member that joins
+(WaitMember, `0x26df898`). A wait that times out ends in JoinRandomRecover `0x26f507c`, which
+leaves the session. A host leaving with another station in it runs `LeaveMeshWithHostMigrationJob`
+(started only from mesh leave `0x6d4040`): it sends Session type 7 to the station with the lowest
+Net ranking (`0x6a012c`), then NetStartHostMigration `01400000`, every 0.3 s for up to 4 s
+([Leaving](#leaving)). A joiner whose join is accepted inside WaitMember sees the game run; one
+accepted after it, during the leave, gets the type 7 a frame or two after the accept. The joiner's
+opening plays no part. `--join-delay 5` drew the type 7 on the first seat with a retail Scarlet; a
+console player backing out after the announcement sends it too.
+
+The console that handed the role over destroys its network and browses again. `--take-host`
+(default) makes `bin/sv_join.py`, on a type 7 received before the announcement, run
+`bin/sv_host.py` on the seat's channel and code with the app's host flags, as `bin/pla_join.py`
+does for Legends Arceus; a retail Scarlet joined that host and completed a trade.
+
+Running the game, the console sends, in order:
 
 | | |
 |---|---|
@@ -889,16 +972,70 @@ the same code (`docs/pla.md`). The others run the game; the console sends, in or
 | the announcement | on 0x80 port 2, zlib, 167 bytes inflated: a type 7 with kind 1, capacity 2 and the console's station id |
 
 A joiner answers the announcement with the type-3 join (`--port2-now` sends it with the channel
-table instead). The station update alone seats a joiner; one that waits for the join response sends
-nothing all session.
+table instead). A retail console seated a joiner with the station update alone, before any join
+response; a joiner that waits for the join response sends nothing all session.
+
+## Leaving
+
+A console that quits a seat runs one of two Pia jobs, by its role. Each waits on its peer and gives
+up on a timer.
+
+A joined console runs `LeaveMeshJob`. SendLeaveRequest `0x6db590` sends the Session type-3 leave
+request (the layout in [docs/pla.md](pla.md#leaving)) and sets a 500 ms deadline (`0x6db6a0`);
+WaitLeaveResponse `0x6db7b0` resends on expiry and completes after the fourth send (`[job+0x6c]` past
+2, `0x6db8e8`) or as soon as `[job+0x69]` is set. The Session dispatcher (`0x6d4960`, table
+`0x3c0cd3b`, types 0 to 0xA) hands type 4 to `0x6d7b10`, which sets `[job+0x69]` for a 17-byte
+message whose bytes 5 to 16 are the station's own location id:
+
+    04 | u32 random | location id (12), copied from the request
+
+A host's type-3 handler `0x6d7894` writes exactly that (type byte at `0x6d7a50`, a fresh xorshift
+draw from `0x6c70a8`, sent at `0x6d7ad8`) once it finds the station by constant id and variable id.
+Unanswered, a retail console sends four leave requests 0.49 to 0.54 s apart and deauthenticated
+2.04 s after the first (one traced session). Answered, it sends one leave request and
+deauthenticates 0.04 s after it.
+`bin/sv_host.py` answers the first (`--no-leave-response` leaves it unanswered);
+`tests/test_sv_departure.py` runs the answer through `0x6d7b10` under unicorn.
+
+A console hosting from its search hands the host role on. `LeaveMeshWithHostMigrationJob` sends
+Session type 7 to the next host and resends it every second (`0x6df050`) until a type 8 names that
+station (`0x6ded94`), giving up after 5 s (`0x6defb8`). The type 7 (writer `0x6d8de0`) is 34 bytes:
+
+    07 | host location id (12) | 00 | host IPv4, port | next host's location id (12) | u16
+
+The last u16 is the job's `+0xe0` (`0x6d8ea8`), 0 or 1 in three retail ones. Then `NetDestroyNetworkJob`, in its
+host-migration form, waits until every client has received the connection-status update (4 s at
+most, `0x6ac68c`), sends NetStartHostMigration `01400000` (written only by `0x69d310`, called only
+from `0x6aca54`) every 300 ms (`0x6aca98`) until the network's station count is 1 (`0x6acaf4`) or a
+deadline passes (4 s, or 2 s when the update wait timed out, `0x6ac984`), and destroys the LDN
+network. On the wire the update is Net 0x11 with is-migrating set; after a joiner's Net 0x12 the first
+NetStartHostMigration followed 45 ms later. Which job a client starts on NetStartHostMigration is
+untraced; `NetHostMigrationJob` opens with DisconnectNetwork or EmulateDisconnection (`0x6a93c4`).
+
+A joiner that answers the type 7 at once and holds the seat draws NetStartHostMigration 12 to 14
+times from the console, the last 3.5 to 4.1 s after the type 7; the console's network went down
+4.3 s after the type 7 in the one seat traced, after LDN broadcasts of ethertype `88b7`. A joiner that
+leaves 3.0 s after the type 7 sees the console's advertisements gone within 0.5 s, before the
+console's own 4 s deadline. `bin/sv_join.py` leaves the seat at the first NetStartHostMigration
+(`--stay-on-host-migration` holds it); it is off the network 0.14 s after the type 7, with one
+NetStartHostMigration sent.
+
+After a completed trade, both launchers exit when the console leaves. A seat that completes no trade
+lets `bin/sv_join.py` resume scanning ([Ending a run](architecture.md#ending-a-run)).
 
 ## Unresolved
 
-- Whether the two older unannounced retail seats lost an outgoing identity chunk. Both sets
-  reached acknowledgement 47, but the sender advanced its own `lowest_pending` before receiving
-  acknowledgement. That acknowledgement alone cannot establish StreamData completion. Dropping
-  one outgoing chunk reproduces the symptom in the emulator; the older captures do not establish
-  which chunk reached the retail receiver.
-- Whether a master-only leave event, without the client's own leave event, can hold a type-2
-  request across the client's 15 s timeout. The master-only branch drains the relay's queues
-  through `0x12fbef0` while preserving `+0xb8`.
+- Which gate held a console joined to `bin/sv_host.py` that acknowledged the announcement and sent no
+  port-2 join. The join is produced only by BoxTrade state 4 (`0x1e51c40`). Before it, state 1 waits
+  with no timer for two finished identity blocks (`0x1e51ae4`), and state 4 waits up to 15 s for a
+  relay slot of kind 1 that only a type 7 creates (`0x1e51c10`); a leave event of the master's or the
+  console's own id clears that slot (`0x12fbc68`, `0x12fbc84`). The 0x80 window acknowledges the
+  announcement before the game's poller reads it, so the acknowledgement separates neither. The one
+  recorded instance predates the host's identity retries. `bin/sv_host.py --announce` names the gate
+  20 s after its announcement when no `0x7c` port 2 message has arrived: a line ending `the state-1
+  gate` lists the identity records still unacknowledged ([The first record on a stream carries
+  INITIALIZED](#the-first-record-on-a-stream-carries-initialized)), one ending `the state-4 gate`
+  has all of them acknowledged; the capture keeps it as a `port2_gate` row.
+- What a console does between its player backing out and its first departure message: none of the
+  captures marks the button press. In one joiner seat the cancel `8000040100` preceded the type 7
+  by 1.5 s.

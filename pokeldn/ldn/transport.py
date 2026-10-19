@@ -14,7 +14,7 @@ import time
 import traceback
 from pathlib import Path
 
-from pokeldn.ldn import userspace_ip
+from pokeldn.ldn import radios, userspace_ip
 
 ETH_P_IP = 0x0800
 PROTO_UDP = 17
@@ -239,8 +239,13 @@ class LiveTransport:
     def __init__(self, password=None, nickname="EMU", keys_path="~/.switch/prod.keys",
                  local_comm_id=None, scene_id=None, app_version=None,
                  phyname="phy0", ifname="ldnclient", log=print,
-                 scan_channels=(1, 6, 11), scan_dwell=0.6, beacon_debug=None):
+                 scan_channels=(1, 6, 11), scan_dwell=0.6, beacon_debug=None,
+                 exact_comm_id=False, network="FRLG"):
+        """`exact_comm_id` joins only a network with `local_comm_id`, never the only joinable one;
+        `network` names it in the player's messages."""
         self.info = getattr(log, "info", log)
+        self.exact_comm_id = exact_comm_id
+        self.network = network
         self.password = password if password else GBA_APP_PASSPHRASE
         self.nickname = nickname
         self.keys_path = keys_path
@@ -274,7 +279,8 @@ class LiveTransport:
 
     def start(self, timeout=30, attempts=3, settle=1.5):
         """Join, retrying through radio busy, association timeouts and stale vifs."""
-        last_err = None
+        timeout = radios.join_timeout(timeout)
+        errors = []
         for attempt in range(1, attempts + 1):
             free_radio({self.phyname}, self.log)
             self._err = None
@@ -283,11 +289,11 @@ class LiveTransport:
             self._thread = threading.Thread(target=self._run_ldn, daemon=True)
             self._thread.start()
             if not self._ready.wait(timeout):
-                last_err = f"LDN join timed out after {timeout}s (attempt {attempt}/{attempts})"
-                self.log(f"[live] {last_err}")
+                errors.append(f"timed out after {timeout}s")
+                self.log(f"[live] LDN join timed out after {timeout}s (attempt {attempt}/{attempts})")
                 self._stop.set()
             elif self._err:
-                last_err = self._err
+                errors.append(self._err)
             else:
                 tune_iface(self.iface, self.our_ip, self.broadcast, self.log)
                 disable_power_save(self.iface, self.info)
@@ -303,12 +309,13 @@ class LiveTransport:
                          f"(attempt {attempt + 1}/{attempts})...")
                 time.sleep(settle)
         light_cleanup(self.log)
-        raise RuntimeError(f"LDN join failed after {attempts} attempt(s):\n{last_err}")
+        detail = "\n".join(f"attempt {n}: {e}" for n, e in enumerate(errors, 1))
+        raise RuntimeError(f"LDN join failed after {attempts} attempt(s):\n{detail}")
 
     def _run_ldn(self):
         try:
             import trio
-            import ldn
+            from pokeldn.ldn import api as ldn
         except ImportError as e:                     # pragma: no cover
             self._err = f"missing dep for live mode: {e}"
             self._ready.set()
@@ -316,7 +323,7 @@ class LiveTransport:
 
         async def main():
             keys = ldn.load_keys(self.keys_path)
-            self.info("Scanning for the FRLG network...")
+            self.info(f"Scanning for the {self.network} network...")
             # A Switch beacons every 102 ms; ldn.scan's default 110 ms dwell sees about one per
             # channel and misses the network.
             networks = await ldn.scan(keys, phyname=self.phyname,
@@ -331,13 +338,14 @@ class LiveTransport:
                          f"accept_policy={getattr(n, 'accept_policy', '?')}")
             net = next((n for n in joinable
                         if n.local_communication_id == self.LOCAL_COMMUNICATION_ID), None)
-            if net is None and len(joinable) == 1:
+            if net is None and len(joinable) == 1 and not self.exact_comm_id:
                 net = joinable[0]
                 self.log(f"[live] no comm-id match; using the only joinable network "
                          f"(comm_id=0x{net.local_communication_id:016x})")
             if net is None:
-                self._err = (f"no joinable FRLG network (saw {len(networks)}, "
-                             f"{len(joinable)} joinable) - set --comm-id from the list above")
+                self._err = (f"no joinable {self.network} network (saw {len(networks)}, "
+                             f"{len(joinable)} joinable)"
+                             + ("" if self.exact_comm_id else " - set --comm-id from the list above"))
                 self._ready.set()
                 return
             self.LOCAL_COMMUNICATION_ID = net.local_communication_id
@@ -551,15 +559,15 @@ def list_phys():
 
 
 def board_radio():
-    """True when POKELDN_RADIO puts the LDN calls on the ESP32 board: no phy, no vif, no iw."""
-    return os.environ.get("POKELDN_RADIO", "").startswith("esp32:")
+    """True for a userspace radio: no kernel phy, vif or iw (pokeldn.ldn.radios)."""
+    return radios.selected() is not None
 
 
 def find_ap_phy(log=print):
     """First phy advertising AP mode (`--phy auto`); phy numbers change when the adapter reloads."""
     if board_radio():
-        log("[host] --phy auto -> esp32 (POKELDN_RADIO)")
-        return "esp32"
+        log(f"[host] --phy auto -> {radios.selected()} (POKELDN_RADIO)")
+        return radios.selected()
     for phy in list_phys():
         try:
             out = subprocess.check_output(["iw", "phy", phy, "info"],
@@ -673,7 +681,7 @@ def preflight_host(phyname, log=print, _iw_output=None):
     """`iw phy` 'Supported interface modes' is the driver's capability (MT7601U: managed and
     monitor only, IFTYPE_AP is EOPNOTSUPP). Raises RuntimeError with the verdict."""
     if _iw_output is None and board_radio():
-        log("[host] preflight: the ESP32 board hosts (POKELDN_RADIO)")
+        log(f"[host] preflight: the {radios.selected()} radio hosts (POKELDN_RADIO)")
         return True
     if _iw_output is None:
         try:
@@ -769,7 +777,8 @@ class HostTransport:
             self.info(message)
         if preflight:
             preflight_host(self.phyname, self.log)
-        last_err = None
+        timeout = radios.join_timeout(timeout)
+        errors = []
         for attempt in range(1, attempts + 1):
             free_radio({self.phyname}, self.log)
             self._err = None
@@ -778,11 +787,11 @@ class HostTransport:
             self._thread = threading.Thread(target=self._run_host, daemon=True)
             self._thread.start()
             if not self._ready.wait(timeout):
-                last_err = f"LDN host bring-up timed out after {timeout}s (attempt {attempt}/{attempts})"
-                self.log(f"[host] {last_err}")
+                errors.append(f"timed out after {timeout}s")
+                self.log(f"[host] LDN host bring-up timed out after {timeout}s (attempt {attempt}/{attempts})")
                 self._stop.set()
             elif self._err:
-                last_err = self._err
+                errors.append(self._err)
             else:
                 self._assert_vifs()
                 tune_iface(self.iface, self.our_ip, self.broadcast, self.log)
@@ -797,7 +806,9 @@ class HostTransport:
                 self.log(f"[host] retrying AP bring-up in {settle}s (attempt {attempt + 1}/{attempts})...")
                 time.sleep(settle)
         light_cleanup(self.log)
-        raise RuntimeError(f"LDN host bring-up failed after {attempts} attempt(s):\n{last_err}")
+        # Every attempt's error: a later one can be a leftover of the first (a port still held).
+        detail = "\n".join(f"attempt {n}: {e}" for n, e in enumerate(errors, 1))
+        raise RuntimeError(f"LDN host bring-up failed after {attempts} attempt(s):\n{detail}")
 
     def set_app_data_later(self, data):
         """Swap the advertisement's application data from another thread; the host loop applies it
@@ -808,7 +819,7 @@ class HostTransport:
     def _run_host(self):
         try:
             import trio
-            import ldn
+            from pokeldn.ldn import api as ldn
         except ImportError as e:                        # pragma: no cover
             self._err = f"missing dep for host mode: {e}"
             self._ready.set()
@@ -844,11 +855,14 @@ class HostTransport:
                        else "LDN software")
             rx_mode = ("driver-decrypted retained-CCMP normalization"
                        if self.accept_decrypted_ccmp else "standard CCMP")
-            self.info(f"Wi-Fi compatibility active: TX={tx_mode}; RX={rx_mode}.")
+            if radios.selected() == "ldnrs":
+                self.info("USB Wi-Fi through ldnrs; the daemon manages wireless encryption.")
+            else:
+                self.info(f"Wi-Fi compatibility active: TX={tx_mode}; RX={rx_mode}.")
             self.info("Creating the LDN network (hosting)...")
             async with ldn.create_network(param) as network:
                 self._network = network
-                if self.tracer is not None:
+                if self.tracer is not None and radios.selected() != "ldnrs":
                     from pokeldn.ldn import ldntrace
                     ldntrace.attach(network, self.tracer, self.log)
                 info = network.info()

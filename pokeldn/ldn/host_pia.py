@@ -19,6 +19,9 @@ HOST_CARRY_DEPTH = 4
 # The console goes silent ~0.5 s after accepting the card (its save); sending into it blocks the
 # host or floods the console (docs/frlg_link.md).
 QUIET_GATE_SECONDS = 0.25
+# A quiet console still gets one retransmission this often: with HostSession's hole guard holding new
+# frames, dropping every resend left a FireRed room silent on both sides (docs/frlg_link.md, Leaving the room).
+QUIET_RETRANSMIT_SECONDS = 1.0
 HOST_VBLANK_SECONDS = 1.0 / 59.727
 RELIABLE_BATCH_MAX = 9
 PIA_COMPRESS_MIN = 62
@@ -231,6 +234,7 @@ class HostPeerProtocol:
         self.next_protocol_tick = None
         self.reliable_messages_in = 0
         self.reliable_messages_out = 0
+        self.leave_requests_in = 0
         self._out = []
         self._reliable_carry = []
 
@@ -318,8 +322,14 @@ class HostPeerProtocol:
     def _send_reliable(self, outputs):
         if not outputs or self.pia_crypto is None or self.guest_var is None or self.guest_ip is None:
             return
-        if self._console_quiet(time.monotonic()):
-            outputs = [o for o in outputs if not getattr(o, "retransmitted", False)]
+        now = time.monotonic()
+        if self._console_quiet(now):
+            fresh = [o for o in outputs if not getattr(o, "retransmitted", False)]
+            if (len(fresh) < len(outputs)
+                    and now - getattr(self, "_last_quiet_retransmit", 0.0) >= QUIET_RETRANSMIT_SECONDS):
+                self._last_quiet_retransmit = now
+                fresh = [next(o for o in outputs if getattr(o, "retransmitted", False))] + fresh
+            outputs = fresh
             if not outputs:
                 return
         else:
@@ -416,6 +426,33 @@ class HostPeerProtocol:
             self.next_protocol_tick = now
             self.info("Switch finalized the Pia Session with type 6 Update Session ACK. "
                       "Session join checkpoint complete; starting RTT liveness.")
+        elif parsed["type"] == pia_connect.SESSION_LEAVE_REQUEST:
+            self._answer_leave_request(header, payload, src_ip)
+
+    def _answer_leave_request(self, header, payload, src_ip):
+        # Unanswered, the leaver resends every 500 ms and leaves LDN after the fourth
+        # (docs/frlg_link.md, Leaving the Pia session).
+        if (self.guest_var is None or header.src != self.guest_var
+                or payload[13:15] != (self.guest_var & 0xFFFF).to_bytes(2, "big")):
+            self.log("[host] Session leave request from an unknown station; ignoring it")
+            return
+        try:
+            response = pia_connect.build_session_leave_response(payload, os.urandom(4))
+        except ValueError:
+            self.log(f"[host] malformed Session leave request ({len(payload)} bytes); ignoring it")
+            return
+        self.leave_requests_in += 1
+        # On the guest's unicast counter: a retail FireRed ignored four type 4s numbered 560-573
+        # after unicast packets up to 6203 (docs/frlg_link.md, Leaving the Pia session).
+        data = build_message(
+            self.network, self.pia_crypto, pia_connect.PROTO_SESSION, response,
+            dst_var=self.guest_var, src_var=PIA_HOST_VAR, pktid=self.reliable_packet_id,
+            compress=False, footer_var=self.guest_var, nonce_source=self.nonces)
+        self.reliable_packet_id = self.reliable_packet_id + 1 \
+            if self.reliable_packet_id < 0xFFFF else 1
+        self._send(data, src_ip)
+        if self.leave_requests_in == 1:
+            self.info("Switch is leaving the Pia session (Session type 3); answered with type 4.")
 
     def _receive_rtt(self, payload, src_ip, now):
         parsed = pia_connect.parse_rtt(payload)

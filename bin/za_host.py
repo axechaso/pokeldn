@@ -21,9 +21,15 @@ from pokeldn import pokemon as pokemon_service
 from pokeldn import config, za
 from pokeldn.za import host as za_host
 from pokeldn.za import streams
+from pokeldn.online import session as online
+from pokeldn import receiver_gift
 from pokeldn.ldn.ldn_mitm_host import IpHostTransport
 from pokeldn.ldn.transport import HostTransport, board_radio, find_ap_phy
 from pokeldn.host_support import resolve_keys, needs_root
+
+
+# The departure's longest path (docs/za.md, A host leaving), plus a second.
+CLOSE_LIMIT = (za_host.MIGRATION_WAIT + za_host.STATUS_WAIT + za_host.HANDOVER_SPAN + 1.0)
 
 
 def build_parser():
@@ -38,11 +44,14 @@ def build_parser():
     ap.add_argument("--capture", default=None, help="every datagram as one JSON line")
     ap.add_argument("--player-name", default=" ",
                     help="the LDN node name; a searching console advertises one space")
+    ap.add_argument("--trainer-name", default="POKELDN",
+                    help="the player name our identity carries, the one the trade screen shows")
     ap.add_argument("--game-dir", default=za.reference.DIR,
                     help="where identity10.bin, identity11b.bin and selection.bin live; by "
                          "default the ones pokeldn.za.reference ships")
-    ap.add_argument("--trade-offer", default=None,
-                    help="the 354-byte offer message: the preview, then our pick")
+    ap.add_argument("--trade-offer", action="append", default=[],
+                    help="the 354-byte offer message: the preview, then our pick. Repeatable, one "
+                         "per trade in the seat; the last serves every later trade")
     ap.add_argument("--fresh-pid", action="store_true",
                     help="send the offer under a new PID and encryption constant, shiny state kept, "
                          "so a save that took this record before takes it again")
@@ -50,7 +59,8 @@ def build_parser():
                     help="make our pick this many seconds after the preview, without waiting for "
                          "the console's; the default answers the console's pick")
     ap.add_argument("--offer-out", default=None,
-                    help="write the console's last offer message here, hex")
+                    help="write the Pokemon the console picks here; trade N > 1 writes FILE-N. "
+                         "A preview, the console's cursor on its box, is not written")
     ap.add_argument("--ip-host", action="store_true",
                     help="host an emulated console over ldn_mitm, with no radio")
     ap.add_argument("--our-ip", default=None)
@@ -58,19 +68,22 @@ def build_parser():
                     help="hex; the default is the title's. An emulated Z-A advertises and scans "
                          "for ffffffffffffffff over ldn_mitm")
     ap.add_argument("--hold-after-trade", type=float, default=None,
-                    help="optional seconds to keep the seat after the console's fourth step; "
-                         "by default the host waits for the console to leave")
+                    help="optional seconds to keep the seat once the console is back on its box after a "
+                         "trade, then hand the console the session and close; by default the host "
+                         "waits for the console to leave")
+    online.add_arguments(ap)
+    receiver_gift.add_arguments(ap, "--trade-offer")
     return ap
 
 
 def load_payloads(args):
-    identity = za.reference.load("identity10", args.game_dir)
-    # The nine-byte message after the identity on protocol 11, stored with the joiner's prefix.
-    tail = za.reference.load("identity11b", args.game_dir)[streams.PREFIX_SIZE:]
+    identity = za.reference.named(za.reference.load("identity10", args.game_dir), args.trainer_name)
+    # The 1403 checksum of the identity, sent after it on protocol 11.
+    tail = za.reference.sync_message(identity)
     selection = za.reference.load("selection", args.game_dir)
-    offer = None
-    if args.trade_offer:
-        with open(args.trade_offer, "rb") as fh:
+    offers = []
+    for n, path in enumerate(args.trade_offer, start=1):
+        with open(path, "rb") as fh:
             offer = fh.read()
         if len(offer) != za.pokemon.OFFER_SIZE:
             raise SystemExit(f"--trade-offer is {len(offer)} bytes, an offer is "
@@ -81,11 +94,22 @@ def load_payloads(args):
             _hdr, plain, _tr = za.pokemon.parse_offer(offer)
         except ValueError as e:
             # a record whose checksum fails is a Bad Egg to the game; sent as it is
-            print(f"[za-host] offering a record that does not decrypt ({e}): a Bad Egg")
+            print(f"[za-host] trade {n} offers a record that does not decrypt ({e}): a Bad Egg")
         else:
-            print(f"[za-host] offering {za.pokemon.read(plain)}, pid {plain[0x1C:0x20][::-1].hex()} "
-                  f"ec {plain[:4][::-1].hex()}")
-    return identity, tail, selection, offer
+            print(f"[za-host] trade {n} offers {za.pokemon.read(plain)}, "
+                  f"pid {plain[0x1C:0x20][::-1].hex()} ec {plain[:4][::-1].hex()}")
+        offers.append(offer)
+    return identity, tail, selection, offers
+
+
+def gift_offer(offer):
+    """-> a gift made for the receiving player during the trade (pokeldn.receiver_gift), after the checks
+    load_payloads gives each --trade-offer; ValueError for one that fails them. A record that does not decrypt
+    is a Bad Egg to the game: a --trade-offer goes so, a gift does not."""
+    if len(offer) != za.pokemon.OFFER_SIZE:
+        raise ValueError(f"an offer is {za.pokemon.OFFER_SIZE} bytes, not {len(offer)}")
+    za.pokemon.parse_offer(offer)
+    return offer
 
 
 def describe_offer(body):
@@ -99,18 +123,23 @@ def describe_offer(body):
 def main(argv=None):
     ap = build_parser()
     args = ap.parse_args(argv)
+    if args.online and args.trade_offer:
+        print("[za-host] --online offers the partner's Pokemon; --trade-offer is ignored")
+        args.trade_offer = []
     renew_offer = args.fresh_pid
-    if args.trade_offer and args.trade_offer != "echo":
-        args.trade_offer = pokemon_service.prepare_file("za", args.trade_offer, fresh=getattr(args, "fresh_pid", False))
-        if hasattr(args, "fresh_pid"):
-            args.fresh_pid = False
+    args.trade_offer = [pokemon_service.prepare_file("za", path, fresh=args.fresh_pid)
+                        for path in args.trade_offer]
+    args.fresh_pid = False
     try:
         sys.stdout.reconfigure(line_buffering=True)
     except (AttributeError, ValueError):
         pass
     if not args.ip_host and needs_root():
         ap.error("hosting over the radio needs root or POKELDN_RADIO; or pass --ip-host")
-    identity, tail, selection, offer = load_payloads(args)
+    identity, tail, selection, offers = load_payloads(args)
+    # A gift made for the receiving player stands in for an online partner, one per console
+    # (pokeldn.receiver_gift).
+    receiving = None if args.online else receiver_gift.setup("za", args, offers, gift_offer, fresh=renew_offer)
     phy = None
     if not args.ip_host:
         phy = find_ap_phy(log=print) if args.phy == "auto" else args.phy
@@ -145,54 +174,93 @@ def main(argv=None):
     record(rec="host", ssid=transport.ssid.hex(), our_ip=transport.our_ip,
            our_mac=bytes(transport.our_mac).hex(), app_data=app_data.hex(), t=time.time())
 
+    partner = online.partner("za", args, code=args.code, name=args.trainer_name)
     sessions = {}
-    done_at = None
-    trades_seen = 0
+    state = {"done_at": None, "back_at": None, "trades": 0, "closing": None}
     deadline = time.time() + args.seconds
+
+    def pump():
+        seated = {p[1] for p in list(transport.participants)}
+        for ip in seated - set(sessions):
+            if state["closing"] is not None:
+                continue
+            print(f"[za-host] a console is seated at {ip}")
+            record(rec="seat", ip=ip, t=time.time())
+            sessions[ip] = za_host.HostSession(
+                ssid=transport.ssid, our_ip=transport.our_ip, our_mac=transport.our_mac,
+                guest_ip=ip, code=args.code, identity=identity, identity_tail=tail,
+                selection=selection, offer=offers, offer_at=args.offer_at,
+                log=print, record=record,
+                renew_offer=(lambda raw: pokemon_service.offer_bytes("za",
+                    pokemon_service.prepare("za", raw, fresh=True))) if renew_offer else None,
+                partner=partner if receiving is None else receiver_gift.ReceiverGift(
+                    "za", *receiving, notify=receiver_gift.pop_up(f"gift-{ip}")))
+        for ip in set(sessions) - seated:
+            s = sessions.pop(ip)
+            print(f"[za-host] the console at {ip} left; {s.console_offers} offer(s), "
+                  f"{s.steps} step(s)")
+            record(rec="left", ip=ip, t=time.time())
+        transport.wait_readable(0.01)
+        for payload, src_ip in transport.recv():
+            s = sessions.get(src_ip)
+            if s is not None:
+                before, done = s.console_offer, s.trades
+                s.receive(payload, src_ip)
+                if s.console_offer is not None and s.console_offer is not before:
+                    print(f"[za-host] the console offers {describe_offer(s.console_offer)}")
+                    if state["done_at"] is not None and state["back_at"] is None:
+                        state["back_at"] = time.time()
+                if args.offer_out and s.trades > done and s.console_pick is not None:
+                    # Written once the trade completes; a pick can still be withdrawn.
+                    pokemon_service.save_received(
+                        "za", pokemon_service.trade_path(args.offer_out, s.trades), s.console_pick)
+        for s in list(sessions.values()):
+            for data, ip in s.tick():
+                transport.send(data, ip)
+            if s.trades != state["trades"]:
+                state["trades"], state["done_at"], state["back_at"] = s.trades, time.time(), None
+
+    def close(why):
+        """A seated console is handed the session before the network goes (docs/za.md, A host
+        leaving); closing on it unannounced draws "Error Number: 6"."""
+        print(f"[za-host] {why}; closing")
+        state["closing"] = time.time()
+        for s in sessions.values():
+            s.leave()
+
+    def closed():
+        return (not sessions or all(s.departed for s in sessions.values())
+                or time.time() - state["closing"] > CLOSE_LIMIT)
+
     try:
-        while time.time() < deadline:
-            seated = {p[1] for p in list(transport.participants)}
-            for ip in seated - set(sessions):
-                print(f"[za-host] a console is seated at {ip}")
-                record(rec="seat", ip=ip, t=time.time())
-                sessions[ip] = za_host.HostSession(
-                    ssid=transport.ssid, our_ip=transport.our_ip, our_mac=transport.our_mac,
-                    guest_ip=ip, code=args.code, identity=identity, identity_tail=tail,
-                    selection=selection, offer=offer, offer_at=args.offer_at,
-                    log=print, record=record,
-                    renew_offer=(lambda raw: pokemon_service.offer_bytes("za",
-                        pokemon_service.prepare("za", raw, fresh=True))) if renew_offer else None)
-            for ip in set(sessions) - seated:
-                s = sessions.pop(ip)
-                print(f"[za-host] the console at {ip} left; {s.console_offers} offer(s), "
-                      f"{s.steps} step(s)")
-                record(rec="left", ip=ip, t=time.time())
-            if done_at is not None and not sessions:
-                print("[za-host] the console left after the trade; closing")
-                break
-            transport.wait_readable(0.01)
-            for payload, src_ip in transport.recv():
-                s = sessions.get(src_ip)
-                if s is not None:
-                    before = s.console_offer
-                    s.receive(payload, src_ip)
-                    if s.console_offer is not None and s.console_offer is not before:
-                        print(f"[za-host] the console offers {describe_offer(s.console_offer)}")
-                        if args.offer_out:
-                            pokemon_service.save_received("za", args.offer_out, s.console_offer)
-            for s in list(sessions.values()):
-                for data, ip in s.tick():
-                    transport.send(data, ip)
-                if s.trades != trades_seen:
-                    trades_seen, done_at = s.trades, time.time()
-            if (done_at is not None and args.hold_after_trade is not None
-                    and time.time() - done_at > args.hold_after_trade):
-                print("[za-host] the trade is complete; closing")
-                break
+        try:
+            while True:
+                pump()
+                if state["closing"] is not None:
+                    if closed():
+                        break
+                elif state["done_at"] is not None and not sessions:
+                    print("[za-host] the console left after the trade; closing")
+                    break
+                elif time.time() >= deadline:
+                    close(f"{args.seconds:.0f}s are up")
+                # Leaving during the trade animation draws Error 6: count from the console's
+                # first preview after the trade, its cursor back on the box (docs/za.md, Hosting).
+                elif (state["back_at"] is not None and args.hold_after_trade is not None
+                        and time.time() - state["back_at"] > args.hold_after_trade):
+                    close("the trade is complete")
+        except KeyboardInterrupt:
+            print("\n[za-host] interrupted")
+            if state["closing"] is None and sessions:
+                close("a second Ctrl-C closes at once")
+                while not closed():
+                    pump()
     except KeyboardInterrupt:
-        print("\n[za-host] interrupted")
+        print("\n[za-host] interrupted again")
     finally:
         transport.stop()
+        if partner:
+            partner.close()
         if cap:
             cap.close()
     for ip, s in sessions.items():

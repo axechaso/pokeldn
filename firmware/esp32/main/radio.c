@@ -1,8 +1,10 @@
 /* pokeldn radio: an ESP32 as the LDN radio of a host on USB serial. LDN has no 4-way handshake:
    the host derives the CCMP key and the board installs it. Message set: docs/hardware_esp32.md. */
 #include <stdatomic.h>
+#include <stdio.h>
 #include <string.h>
 
+#include "esp_app_desc.h"
 #include "esp_chip_info.h"
 #include "esp_event.h"
 #include "esp_mac.h"
@@ -10,13 +12,17 @@
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
 
+#include "display.h"
 #include "led.h"
 #include "private_wifi.h"
+#include "usbwatch.h"
+#include "ble.h"
 #include "wire.h"
 
 #define PROTOCOL_VERSION 1
@@ -24,8 +30,12 @@
 enum {
     CMD_HELLO = 0x01, CMD_BAUD = 0x02, CMD_CHANNEL = 0x03, CMD_STA_JOIN = 0x04, CMD_STOP = 0x05,
     CMD_AP_START = 0x06, CMD_AP_KICK = 0x07, CMD_ETH_TX = 0x08, CMD_RAW_TX = 0x09,
-    CMD_SNIFF = 0x0A, CMD_STATUS = 0x0B, CMD_BENCH = 0x0C, CMD_LED = 0x0D,
+    CMD_SNIFF = 0x0A, CMD_STATUS = 0x0B, CMD_BENCH = 0x0C, CMD_LED = 0x0D, CMD_DISPLAY = 0x0E,
+    CMD_ALIVE = 0x0F,
 };
+/* A host that sent CMD_ALIVE and then nothing for this long is gone: the board leaves the network,
+   so the console does not keep a seat nobody answers. docs/hardware_esp32.md, The host watchdog. */
+#define HOST_SILENT_US 5000000
 enum {
     MSG_INFO = 0x81, MSG_RESULT = 0x82, MSG_RX_MGMT = 0x84, MSG_RX_ETH = 0x85, MSG_LINK = 0x86,
     MSG_STA_JOINED = 0x87, MSG_STA_LEFT = 0x88, MSG_STATUS = 0x89, MSG_BENCH = 0x8A,
@@ -63,6 +73,7 @@ static atomic_uint s_rx_mgmt, s_rx_eth, s_tx_eth, s_tx_eth_failed, s_tx_raw, s_t
 static atomic_uint s_tx_acked, s_tx_unacked;
 static atomic_uint s_rx_sniff;   /* frames RX_SNIFF carried: the LED's activity while sniffing */
 static atomic_int s_ap_stations;
+static atomic_uint s_presses;   /* BOOT presses: each wakes the screen */
 static atomic_uint s_led_alarm;   /* a join that failed or a key refused: the LED's warning */
 static atomic_uint s_tx_eth_retried;   /* ETH_TX calls that found the driver's queue full */
 static atomic_int s_tx_eth_last_err;
@@ -91,6 +102,27 @@ static wifi_interface_t current_interface(void)
     return atomic_load(&s_mode) == MODE_AP ? WIFI_IF_AP : WIFI_IF_STA;
 }
 
+/* The PHY byte pair of RX_SNIFF and RX_CENSUS: sig_mode (0 legacy, 1 HT, 3 VHT), then mcs|cwb<<7.
+   An HE chip reports cur_bb_format and the HT-SIG instead (esp_wifi_he_types.h); its rate field
+   is the L-SIG rate code for an OFDM frame. docs/hardware_esp32.md, Supported boards. */
+static uint8_t rx_sig_mode(const wifi_pkt_rx_ctrl_t *c)
+{
+#if CONFIG_SOC_WIFI_HE_SUPPORT
+    return c->cur_bb_format == RX_BB_FORMAT_HT ? 1 : c->cur_bb_format == RX_BB_FORMAT_VHT ? 3 : 0;
+#else
+    return c->sig_mode;
+#endif
+}
+
+static uint8_t rx_mcs_cwb(const wifi_pkt_rx_ctrl_t *c)
+{
+#if CONFIG_SOC_WIFI_HE_SUPPORT
+    return c->cur_bb_format == RX_BB_FORMAT_HT ? (c->he_siga1 & 0x7f) | (c->he_siga1 & 0x80) : 0;
+#else
+    return c->mcs | (c->cwb << 7);
+#endif
+}
+
 /* Census: u32 receive time, i8 RSSI, i8 noise floor, u8 rx_state (0 good), u8 packet type,
    u8 sig_mode, u8 rate, u8 mcs|cwb<<7, u16 sig_len, then the frame's first 16 bytes. */
 static void census_send(const wifi_promiscuous_pkt_t *packet, wifi_promiscuous_pkt_type_t type)
@@ -101,8 +133,8 @@ static void census_send(const wifi_promiscuous_pkt_t *packet, wifi_promiscuous_p
     uint8_t head[13];
     memcpy(head, &stamp, 4);
     head[4] = (uint8_t)c->rssi; head[5] = (uint8_t)c->noise_floor; head[6] = c->rx_state;
-    head[7] = (uint8_t)type; head[8] = c->sig_mode; head[9] = c->rate;
-    head[10] = c->mcs | (c->cwb << 7);
+    head[7] = (uint8_t)type; head[8] = rx_sig_mode(c); head[9] = c->rate;
+    head[10] = rx_mcs_cwb(c);
     memcpy(head + 11, &sig_len, 2);
     atomic_fetch_add(&s_rx_sniff, 1);
     wire_send(MSG_RX_CENSUS, head, sizeof(head), packet->payload, sig_len < 16 ? sig_len : 16);
@@ -126,20 +158,22 @@ static void promiscuous_rx(void *buffer, wifi_promiscuous_pkt_type_t type)
         /* Sniff: every management or data frame to or from one MAC, whole, without FCS. */
         const int length = (int)packet->rx_ctrl.sig_len - 4;
         const uint8_t *frame = packet->payload;
+        /* Every action frame too: a network the console moves to is keyed by its own advertisement. */
         if ((type == WIFI_PKT_DATA || type == WIFI_PKT_MGMT) && length >= 24 && length <= 1600 &&
-            (!memcmp(frame + 4, s_sniff_mac, 6) || !memcmp(frame + 10, s_sniff_mac, 6))) {
+            (!memcmp(frame + 4, s_sniff_mac, 6) || !memcmp(frame + 10, s_sniff_mac, 6) ||
+             (type == WIFI_PKT_MGMT && frame[0] == 0xD0))) {
             /* The PHY fields: a flood's airtime is its bytes over its rate. */
             const uint8_t head[5] = {packet->rx_ctrl.channel, (uint8_t)packet->rx_ctrl.rssi,
-                                     packet->rx_ctrl.sig_mode, packet->rx_ctrl.rate,
-                                     packet->rx_ctrl.mcs | (packet->rx_ctrl.cwb << 7)};
+                                     rx_sig_mode(&packet->rx_ctrl), packet->rx_ctrl.rate,
+                                     rx_mcs_cwb(&packet->rx_ctrl)};
             atomic_fetch_add(&s_rx_sniff, 1);
             wire_send(MSG_RX_SNIFF, head, sizeof(head), frame, length);
         } else if (type == WIFI_PKT_CTRL && length == 10 && frame[0] == 0xD4) {
             /* Every ACK on the channel: it names only its receiver. Whether a data frame was
                acknowledged is read off the one that follows it. docs/hardware_esp32.md */
             const uint8_t head[5] = {packet->rx_ctrl.channel, (uint8_t)packet->rx_ctrl.rssi,
-                                     packet->rx_ctrl.sig_mode, packet->rx_ctrl.rate,
-                                     packet->rx_ctrl.mcs | (packet->rx_ctrl.cwb << 7)};
+                                     rx_sig_mode(&packet->rx_ctrl), packet->rx_ctrl.rate,
+                                     rx_mcs_cwb(&packet->rx_ctrl)};
             atomic_fetch_add(&s_rx_sniff, 1);
             wire_send(MSG_RX_SNIFF, head, sizeof(head), frame, length);
         }
@@ -235,6 +269,8 @@ static void tx_done(uint8_t ifidx, uint8_t *data, uint16_t *length, bool acked)
             atomic_fetch_add(&s_tx_queued_n, 1);
         }
     }
+    /* Diagnostic only; over BLE it crowded the console's own RX_ETH out of the queue. */
+    if (ble_linked()) return;
     uint8_t head[12];
     memcpy(head, &now, 4);
     memcpy(head + 4, &queued, 4);
@@ -346,6 +382,10 @@ static esp_err_t sta_join(const uint8_t *p, size_t n)
     }
     esp_wifi_stop();
     esp_err_t r = esp_wifi_set_mac(WIFI_IF_STA, s_sta_mac);
+#if CONFIG_SOC_WIFI_HE_SUPPORT
+    /* An HE station adds Wi-Fi 6 elements to its association request; the other targets send none. */
+    if (r == ESP_OK) r = esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+#endif
     if (r != ESP_OK) return r;
     esp_wifi_start();
     esp_wifi_set_tx_done_cb(tx_done);
@@ -552,6 +592,7 @@ static void button_pressed(uint32_t count, int64_t press_us)
     uint8_t head[6];
     const uint32_t us = (uint32_t)press_us;
     const uint16_t n = (uint16_t)count;
+    atomic_store(&s_presses, count);
     memcpy(head, &us, 4);
     memcpy(head + 4, &n, 2);
     wire_send(MSG_BUTTON, head, sizeof(head), NULL, 0);
@@ -573,6 +614,20 @@ static void led_state(led_look_t *look, uint32_t *activity, uint32_t *alarm)
                 atomic_load(&s_rx_sniff);
     *alarm = atomic_load(&s_led_alarm) + wire_dropped() + wire_rx_bad() + wire_rx_fifo_ovf() +
              wire_rx_buffer_full();
+}
+
+static void display_state(scene_radio_t *state)
+{
+    static const uint8_t SCENES[] = {
+        [MODE_IDLE] = SCENE_IDLE, [MODE_STA_JOINING] = SCENE_JOINING, [MODE_STA] = SCENE_JOINED,
+        [MODE_AP] = SCENE_HOSTING, [MODE_SNIFF] = SCENE_SNIFFING,
+    };
+    state->mode = SCENES[atomic_load(&s_mode)];
+    const int stations = atomic_load(&s_ap_stations);
+    state->stations = stations > 0 ? (uint8_t)stations : 0;
+    state->rx = atomic_load(&s_rx_eth);
+    state->tx = atomic_load(&s_tx_acked) + atomic_load(&s_tx_unacked);
+    state->presses = atomic_load(&s_presses);
 }
 
 static void send_status(void)
@@ -637,14 +692,28 @@ static void send_info(void)
     esp_wifi_get_mac(WIFI_IF_STA, head + 1);
     esp_read_mac(head + 7, ESP_MAC_WIFI_SOFTAP);
     head[13] = (uint8_t)(chip.revision / 100);
-    const char *text = "pokeldn-radio " CONFIG_IDF_TARGET " idf=" IDF_VER;
+    char text[128];
+#if POKELDN_BLE
+#define LINK_WORD " link=ble"   /* gui/board.py Identity.ble: the Board page names the Bluetooth build */
+#else
+#define LINK_WORD ""
+#endif
+    snprintf(text, sizeof(text), "pokeldn-radio " CONFIG_IDF_TARGET " version=%s idf=" IDF_VER LINK_WORD,
+             esp_app_get_description()->version);
     wire_send(MSG_INFO, head, sizeof(head), text, strlen(text));
+    usbwatch_report();
 }
+
+static _Atomic int64_t s_host_seen;   /* when the host last sent a command */
+static atomic_bool s_host_watched;    /* armed by CMD_ALIVE, disarmed by HELLO: an older host never sends it */
 
 static void command(uint8_t type, const uint8_t *p, size_t n)
 {
+    atomic_store(&s_host_seen, esp_timer_get_time());
+    wire_set_host_away(false);
     switch (type) {
-    case CMD_HELLO: wire_credit_reset(); send_info(); break;
+    case CMD_HELLO: atomic_store(&s_host_watched, false); wire_credit_reset(); display_reset(); send_info(); break;
+    case CMD_ALIVE: atomic_store(&s_host_watched, true); break;   /* no reply: it only keeps the watch fed */
     case CMD_BAUD: {
         uint32_t baud;
         if (n != 4) { result(type, ESP_ERR_INVALID_SIZE); break; }
@@ -735,12 +804,30 @@ static void command(uint8_t type, const uint8_t *p, size_t n)
         result(type, led_set(p[0], p[1], period, duration) ? 0 : ESP_ERR_INVALID_ARG);
         break;
     }
+    case CMD_DISPLAY:   /* scene.h; ESP_ERR_NOT_FOUND without a screen */
+        result(type, display_command(p, n) ? 0 : ESP_ERR_NOT_FOUND);
+        break;
     default: result(type, ESP_ERR_NOT_SUPPORTED);
     }
 }
 
+#if CONFIG_IDF_TARGET_ESP32C6
+/* XIAO ESP32C6: GPIO3 low powers the RF switch, GPIO14 low picks the ceramic antenna and high the
+   U.FL socket (Seeed's board guide). docs/hardware_esp32.md, Supported boards. */
+static void rf_switch_on(void)
+{
+    const gpio_config_t out = {.pin_bit_mask = (1ULL << 3) | (1ULL << 14), .mode = GPIO_MODE_OUTPUT};
+    gpio_config(&out);
+    gpio_set_level(3, 0);
+    gpio_set_level(14, 0);
+}
+#endif
+
 void app_main(void)
 {
+#if CONFIG_IDF_TARGET_ESP32C6
+    rf_switch_on();
+#endif
     esp_err_t r = nvs_flash_init();
     if (r == ESP_ERR_NVS_NO_FREE_PAGES || r == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -758,8 +845,13 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_wifi_start());
     esp_wifi_set_ps(WIFI_PS_NONE);
     start_sniffer();
+#if POKELDN_BLE
+    ble_start();
+#endif
     wire_start(command);
+    usbwatch_start();
     led_start(led_state, button_pressed);
+    display_start(display_state);
     send_info();
 
     int64_t last_status = 0;
@@ -771,6 +863,12 @@ void app_main(void)
         uint8_t joined[6];
         while (xQueueReceive(s_ap_joins, joined, 0) == pdTRUE) {
             if (atomic_load(&s_mode) == MODE_AP) ap_open_station(joined);
+        }
+        if (atomic_load(&s_host_watched) && atomic_load(&s_mode) != MODE_IDLE &&
+            esp_timer_get_time() - atomic_load(&s_host_seen) > HOST_SILENT_US) {
+            atomic_store(&s_host_watched, false);
+            go_idle();
+            wire_set_host_away(true);   /* its queue and what is heard next go nowhere: no alarm */
         }
         if (atomic_load(&s_mode) == MODE_STA_JOINING) {
             if (atomic_load(&s_assoc_seen) && esp_wifi_sta_is_running_internal()) {

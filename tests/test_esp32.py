@@ -5,6 +5,7 @@ import contextlib
 import contextvars
 import os
 import struct
+import threading
 import time
 
 import pytest
@@ -24,6 +25,41 @@ def test_cobs_round_trip():
             assert esp32.cobs_decode(encoded) == data
 
 
+def test_the_usbwatch_report_every_hello_repeats_is_logged_once_per_link():
+    report = b"usbwatch: reset reason 11, up 812 ms"
+    # A Z-A joiner's scans each sent a HELLO; the board's answer names its uptime at that moment.
+    later = b"usbwatch: reset reason 11, up 108855 ms"
+    frames = [esp32.encode_frame(esp32.MSG_LOG, line) for line in (report, b"joined", later, b"joined")]
+
+    class Stream:
+        def read(self, n):
+            time.sleep(0.005)
+            return frames.pop(0) if frames else b""
+
+        def write(self, data):
+            return len(data)
+
+    lines = []
+    radio = esp32.Radio(Stream(), log=lines.append)
+    deadline = time.monotonic() + 2
+    while frames and time.monotonic() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.05)
+    radio.close()
+    assert lines == ["[esp32] usbwatch: reset reason 11, up 812 ms", "[esp32] joined", "[esp32] joined"]
+
+
+def test_a_lost_board_ends_the_run_with_a_reason_the_players_stop_lacks(monkeypatch):
+    import pokeldn.ldn
+    interrupted = []
+    monkeypatch.setattr(esp32_wlan._thread, "interrupt_main", lambda: interrupted.append(True))
+    monkeypatch.setattr(pokeldn.ldn, "_radio_lost", "")
+    assert pokeldn.ldn.radio_lost() == ""
+    esp32_wlan.board_lost(log=lambda line: None, error=OSError("Device not configured"))
+    assert interrupted == [True]
+    assert pokeldn.ldn.radio_lost() == "The board's USB connection failed (Device not configured)."
+
+
 def test_reader_resynchronises_after_boot_text():
     frame = esp32.encode_frame(esp32.MSG_RX_ETH, b"\x00abc\x00")
     reader = esp32.FrameReader()
@@ -40,8 +76,9 @@ class _RingBoard:
 
     RING, RATE = 16384, 2_000_000   # bytes, bytes per second the handler takes
 
-    def __init__(self, losses=(), holds=()):
+    def __init__(self, losses=(), holds=(), start=0):
         import threading
+        self.start = start              # the count a HELLO restarts at, to reach the u32 wrap
         self.losses = sorted(losses)    # (at byte N received, lose the next M bytes)
         self.holds = sorted(holds)      # (at byte N read, the reader stops for S seconds)
         self.credit_at = 0.0
@@ -89,9 +126,10 @@ class _RingBoard:
                 self.consumed += 1
                 for msg_type, _ in self.reader.feed(bytes([b])):
                     if msg_type == esp32.CMD_HELLO:
-                        self.consumed = 0
+                        self.consumed = self.start
                         with self.lock:
-                            self.inbox.append(esp32.encode_frame(esp32.MSG_CREDIT, bytes(4)))
+                            self.inbox.append(esp32.encode_frame(
+                                esp32.MSG_CREDIT, struct.pack("<I", self.start & 0xFFFFFFFF)))
                     elif msg_type == esp32.CMD_ETH_TX:
                         self.frames += 1
                     elif msg_type == esp32.CMD_STATUS:
@@ -102,7 +140,7 @@ class _RingBoard:
                 self.credit_at = time.monotonic()
                 with self.lock:
                     self.inbox.append(esp32.encode_frame(esp32.MSG_CREDIT,
-                                                         struct.pack("<I", self.consumed)))
+                                                         struct.pack("<I", self.consumed & 0xFFFFFFFF)))
 
 
 def test_a_flood_of_eth_tx_never_overflows_the_boards_ring():
@@ -126,6 +164,78 @@ def test_a_flood_of_eth_tx_never_overflows_the_boards_ring():
         board.close()
     assert board.frames == 2000
     assert (radio.tx_dropped, radio.flow_resyncs) == (0, 0)
+
+
+def test_the_window_stays_open_across_the_boards_u32_count():
+    """A stream past 4 GiB (a 5.2 GB game update) keeps flowing when the board's count wraps."""
+    start = (1 << 32) - 100_000
+    board = _RingBoard(start=start)
+    radio = esp32.Radio(board)
+    try:
+        radio.send(esp32.CMD_HELLO)
+        assert radio.drain(5)
+        with radio._out_cv:     # as if 4 GiB had already passed since the HELLO
+            radio._written = radio._credited = start
+            radio._flow = True
+        frame = b"\xff" * 6 + bytes(6) + b"\x08\x00" + bytes(range(200))
+        for i in range(2000):
+            radio.send_ethernet(frame)
+            if i % 200 == 199:
+                assert radio.drain(10)
+        assert radio.drain(10)
+        while board.ring:
+            time.sleep(0.01)
+    finally:
+        radio.close()
+        board.close()
+    assert board.consumed > 1 << 32
+    assert (board.frames, radio.flow_resyncs, radio.tx_dropped, radio.lost) == (2000, 0, 0, None)
+
+
+class _MidWriteBoard:
+    """Credits as the USB firmware does, every 1024 bytes it reads, and reads a frame while the host's write
+    of it is still running: the CREDIT for its first part arrives before the write returns. It never sends
+    the idle CREDIT that would cover a frame's tail."""
+
+    def __init__(self):
+        self.radio = None
+        self.consumed = self.credited = 0
+
+    def write(self, data):
+        for part in (data[:1100], data[1100:]):
+            self.consumed += len(part)
+            if self.consumed - self.credited >= 1024:
+                self.credited = self.consumed
+                self.radio._dispatch(esp32.MSG_CREDIT, struct.pack("<I", self.consumed))
+        return len(data)
+
+    def read(self, n):
+        time.sleep(0.005)
+        return b""
+
+    def close(self):
+        pass
+
+
+def test_a_credit_for_a_frame_still_being_written_counts():
+    """Frames sent one at a time, each credited before its write returns, never wait on the window: a
+    refused count shuts it every few frames until the board's idle CREDIT, which this board never sends."""
+    board = _MidWriteBoard()
+    radio = esp32.Radio(board)
+    board.radio = radio
+    try:
+        with radio._out_cv:
+            radio._flow = True
+        frame = b"\xff" * 6 + bytes(6) + b"\x08\x00" + bytes(range(256)) * 6
+        started = time.monotonic()
+        for _ in range(12):
+            radio.send_ethernet(frame)
+            assert radio.drain(2)
+        took = time.monotonic() - started
+    finally:
+        radio.close()
+    assert radio.flow_resyncs == 0 and took < esp32.FLOW_STALL
+    assert radio._written - radio._credited < 1024
 
 
 def test_bytes_lost_on_the_line_close_the_window_once_each():
@@ -204,6 +314,34 @@ def test_a_reader_held_silent_is_waited_for_not_overrun():
     assert (board.overflowed, radio.flow_resyncs, board.frames) == (0, 0, 600)
 
 
+def test_a_hello_mid_session_does_not_open_the_window():
+    """A HELLO sent with ETH_TX queued behind it, to a reader held as it arrives, overran the 16 KB
+    ring by 76423 bytes when the host dropped flow control until the board's CREDIT 0."""
+    frame = b"\xff" * 6 + bytes(6) + b"\x08\x00" + bytes(range(200))
+    length = len(esp32.encode_frame(esp32.CMD_ETH_TX, frame))
+    board = _RingBoard(holds=[(400 * length - 50, 0.5)])
+    radio = esp32.Radio(board)
+    try:
+        radio.send(esp32.CMD_HELLO)
+        time.sleep(0.1)
+        for i in range(400):
+            radio.send_ethernet(frame)
+            if i % 200 == 199:
+                assert radio.drain(30)
+        radio.send(esp32.CMD_HELLO)
+        for _ in range(400):
+            radio.send_ethernet(frame)
+        assert radio.drain(30)
+        deadline = time.monotonic() + 10
+        while board.ring and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.3)
+    finally:
+        radio.close()
+        board.close()
+    assert (board.overflowed, board.frames) == (0, 800)
+
+
 def test_radio_commands_against_the_simulated_board():
     board = esp32_sim.SimulatedBoard(esp32_sim.Air())
     radio = esp32.Radio(board.host_stream())
@@ -225,9 +363,10 @@ _radio = contextvars.ContextVar("radio")
 
 
 @contextlib.contextmanager
-def _two_boards():
+def _two_boards(refuse_joins=0):
     air = esp32_sim.Air()
     host_board, station_board = esp32_sim.SimulatedBoard(air), esp32_sim.SimulatedBoard(air)
+    station_board.refuse_joins = refuse_joins
     radios = esp32.Radio(host_board.host_stream()), esp32.Radio(station_board.host_stream())
     ports = {}
 
@@ -269,7 +408,7 @@ def test_the_lets_go_host_finds_the_channel_a_console_searches_on(console_scene,
                 _radio.set(console_radio)
                 param = ldn.CreateNetworkParam(
                     keys=KEYS, channel=11, local_communication_id=COMM_ID_PIKACHU,
-                    scene_id=console_scene, name=b"GURVAN", app_version=0)
+                    scene_id=console_scene, name=b"POKELDN", app_version=0)
                 async with ldn.create_network(param):
                     up.set()
                     while not result:
@@ -295,9 +434,12 @@ def _udp_frame(target: bytes, source: bytes, payload: bytes) -> bytes:
     return target + source + b"\x08\x00" + ip + struct.pack(">HHHH", 12345, 12345, 8 + len(payload), 0) + payload
 
 
-def test_ldn_host_and_station_run_on_simulated_boards():
+# A retail Sword's network refused a board's join with 0xc9 or 0x2 while still advertising; the
+# next STA_JOIN was taken (docs/hardware_esp32.md, Joining).
+@pytest.mark.parametrize("refused", [0, 2])
+def test_ldn_host_and_station_run_on_simulated_boards(refused):
     async def main():
-        with _two_boards() as ((host_radio, station_radio), ports, host_board):
+        with _two_boards(refused) as ((host_radio, station_radio), ports, host_board):
             host_up = trio.Event()
             joined = []
             received = []
@@ -306,7 +448,7 @@ def test_ldn_host_and_station_run_on_simulated_boards():
                 _radio.set(host_radio)
                 param = ldn.CreateNetworkParam(
                     keys=KEYS, channel=6, local_communication_id=0x0100ABCD00000000,
-                    name=b"PkCamp", app_version=1, application_data=b"esp32 test")
+                    name=b"POKELDN", app_version=1, application_data=b"esp32 test")
                 async with ldn.create_network(param) as network:
                     host_up.set()
                     event = await network.next_event()
@@ -370,7 +512,7 @@ def test_userspace_stack_carries_udp_both_ways_on_simulated_boards():
             _radio.set(radios[0])
             param = ldn.CreateNetworkParam(
                 keys=KEYS, channel=6, local_communication_id=0x0100ABCD00000000,
-                name=b"PkCamp", app_version=1, application_data=b"esp32 test")
+                name=b"POKELDN", app_version=1, application_data=b"esp32 test")
             async with ldn.create_network(param) as network:
                 sock = userspace_ip.udp_socket("ldn-tap", 12345)
                 raw = userspace_ip.packet_socket("ldn-tap")
@@ -493,7 +635,7 @@ def test_first_contact_sees_and_decodes_a_simulated_host():
         async def run():
             param = ldn.CreateNetworkParam(
                 keys=KEYS, channel=6, local_communication_id=0x0100ABCD00000000,
-                name=b"PkCamp", app_version=1, application_data=b"first contact")
+                name=b"POKELDN", app_version=1, application_data=b"first contact")
             async with ldn.create_network(param):
                 up.set()
                 await trio.to_thread.run_sync(done.wait)
@@ -560,8 +702,14 @@ def test_userspace_socket_readiness_tracks_queued_datagrams(monkeypatch, tcp):
     import socket
     from pokeldn.ldn.userspace_ip import _Readable
 
+    def tcp_pair():
+        # Windows' socketpair is a loopback TCP pair; 3.13.15's own fallback fails on macOS
+        with socket.create_server(("127.0.0.1", 0)) as server:
+            client = socket.create_connection(server.getsockname())
+            return server.accept()[0], client
+
     if tcp:
-        monkeypatch.setattr(socket, "socketpair", socket._fallback_socketpair)
+        monkeypatch.setattr(socket, "socketpair", tcp_pair)
     with _Readable() as queue:
         if tcp:
             assert queue._w.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY)
@@ -830,7 +978,7 @@ def test_the_sword_gift_walks_its_fragments_on_a_simulated_board(tmp_path, monke
     keys_file = tmp_path / "prod.keys"
     keys_file.write_text("".join(f"{k} = {v.hex()}\n" for k, v in KEYS.items()))
     args = swsh_gift_host.build_parser().parse_args(
-        ["--species", "25", "--level", "25", "--nickname", "PKCAMP", "--ot", "POKELDN",
+        ["--species", "25", "--level", "25", "--nickname", "POKELDN", "--ot", "POKELDN",
          "--channel", "6"])
     record = swsh_gift_host.build_record(args)
     fragments = beacon.build_message(record)
@@ -863,7 +1011,8 @@ def test_the_sword_gift_walks_its_fragments_on_a_simulated_board(tmp_path, monke
         seen = {}
         deadline = time.time() + 20
         while len(seen) < 3 and time.time() < deadline:
-            for net in trio.run(lambda: ldn.scan(KEYS, channels=[6], dwell_time=0.3)):
+            # A 0.3 s scan locks to the 0.6 s walk and samples fragments 0 and 1 only; 0.27 s drifts.
+            for net in trio.run(lambda: ldn.scan(KEYS, channels=[6], dwell_time=0.27)):
                 assert net.local_communication_id == COMM_ID and net.max_participants == 8
                 seen[bytes(net.application_data)] = True
     finally:
@@ -924,7 +1073,8 @@ def test_the_firered_gift_host_comes_up_and_advertises_on_a_simulated_board(tmp_
 
 
 def test_the_lets_go_joiner_reaches_the_game_on_simulated_boards(tmp_path, monkeypatch):
-    """bin/lgpe_join.py against bin/lgpe_host.py: association through the kind-1 identity both ways."""
+    """bin/lgpe_join.py against bin/lgpe_host.py: association through the kind-1 identity both ways,
+    each under its own trainer's name."""
     import threading
 
     import lgpe_host
@@ -955,12 +1105,13 @@ def test_the_lets_go_joiner_reaches_the_game_on_simulated_boards(tmp_path, monke
     result = {}
     threads["host"] = threading.Thread(target=lambda: result.setdefault("host", lgpe_host.main(
         ["--keys", str(keys_file), "--channel", "6", "--seconds", "14", "--grace", "0",
-         "--first", "echo", "--capture", str(tmp_path / "host.jsonl")])), daemon=True)
+         "--first", "echo", "--trainer-name", "HOSTER", "--capture", str(tmp_path / "host.jsonl")])),
+        daemon=True)
     threads["join"] = threading.Thread(target=lambda: result.setdefault("join", lgpe_join.main(
         ["--keys", str(keys_file), "--channels", "6", "--dwell", "0.5", "--connect",
          "--connect-seconds", "10", "--facts", str(tmp_path / "facts.json"),
          "--capture", str(tmp_path / "join.jsonl"),
-         "--reliable-payload", str(tmp_path / "identity.bin"),
+         "--reliable-payload", str(tmp_path / "identity.bin"), "--trainer-name", "JOINER",
          "--ack-peer-clock", "--ack-re-announce"])), daemon=True)
     wlan.set_factory(factory)
     try:
@@ -974,8 +1125,106 @@ def test_the_lets_go_joiner_reaches_the_game_on_simulated_boards(tmp_path, monke
         host_radio.close()
         join_radio.close()
     assert result == {"host": 0, "join": 0}
-    assert (tmp_path / "host.jsonl.payload1.bin").read_bytes() == identity
-    assert (tmp_path / "join.jsonl.payload1.bin").read_bytes() == identity
+
+    def named(name):
+        return pb7.build_message(pb7.FIRST_MESSAGE, pb7.set_trainer_name(identity[pb7.HEADER_SIZE:], name))
+    assert (tmp_path / "host.jsonl.payload1.bin").read_bytes() == named("JOINER")
+    assert (tmp_path / "join.jsonl.payload1.bin").read_bytes() == named("HOSTER")
+
+
+def test_the_lets_go_joiner_trades_its_queue_on_one_seat_on_simulated_boards(tmp_path, monkeypatch):
+    """bin/lgpe_join.py with two --offer against bin/lgpe_host.py --lead, which plays a console host:
+    trade 2 offers on kind 4 and commits on kind 5 on clones 6 and 7, and each side writes what it
+    received in order."""
+    import struct
+    import threading
+
+    import lgpe_host
+    import lgpe_join
+    from pokeldn import pokemon
+    from pokeldn.ldn import userspace_ip
+    from pokeldn.lgpe import pb7
+
+    monkeypatch.setenv("POKELDN_RADIO", "esp32:simulated")
+    monkeypatch.setattr(pokemon, "prepare_file", lambda game, path, fresh=False: path)
+    keys_file = tmp_path / "prod.keys"
+    keys_file.write_text("".join(f"{k} = {v.hex()}\n" for k, v in KEYS.items()))
+
+    def record(name, species, ec):
+        plain = bytearray(pb7.BOX_SIZE)
+        struct.pack_into("<IH", plain, 0, ec, 0)
+        struct.pack_into("<H", plain, 8, species)
+        (tmp_path / name).write_bytes(pb7.encrypt(bytes(plain)))
+        return str(tmp_path / name)
+
+    host_offers = [record("pikachu.pb7", 25, 0x11111111), record("onix.pb7", 95, 0x22222222)]
+    join_offers = [record("eevee.pb7", 133, 0x33333333), record("bulbasaur.pb7", 1, 0x44444444)]
+    air = esp32_sim.Air()
+    host_radio = esp32.Radio(esp32_sim.SimulatedBoard(air).host_stream())
+    join_radio = esp32.Radio(esp32_sim.SimulatedBoard(air).host_stream())
+    threads = {}
+
+    @contextlib.asynccontextmanager
+    async def factory():
+        radio = join_radio if threading.current_thread() is threads.get("join") else host_radio
+        esp = esp32_wlan.EspFactory(radio, port_factory=userspace_ip.userspace_port,
+                                    join_timeout=5)
+        try:
+            yield esp
+        finally:
+            esp.router.close()
+
+    result = {}
+    scale = float(os.environ.get("POKELDN_TEST_TIME_SCALE", "1"))
+    threads["host"] = threading.Thread(target=lambda: result.setdefault("host", lgpe_host.main(
+        # A host leaves at its deadline between trades; the phone's self-test (examples/android)
+        # runs this about three times slower and scales both deadlines.
+        ["--keys", str(keys_file), "--channel", "6", "--seconds", str(30 * scale), "--grace", "0",
+         "--first", "echo", "--lead", "1", "--result-after", "2",
+         "--offer", host_offers[0], "--next-offer", host_offers[1],
+         "--received", str(tmp_path / "host_got.pb7"),
+         "--capture", str(tmp_path / "host.jsonl")])), daemon=True)
+    threads["join"] = threading.Thread(target=lambda: result.setdefault("join", lgpe_join.main(
+        ["--keys", str(keys_file), "--channels", "6", "--dwell", "0.5", "--connect",
+         "--connect-seconds", str(26 * scale), "--grace", "0", "--facts", str(tmp_path / "facts.json"),
+         "--capture", str(tmp_path / "join.jsonl"), "--ack-peer-clock", "--ack-re-announce",
+         "--offer", join_offers[0], "--offer", join_offers[1],
+         "--received", str(tmp_path / "join_got.pb7")])), daemon=True)
+    wlan.set_factory(factory)
+    try:
+        threads["host"].start()
+        time.sleep(2)
+        threads["join"].start()
+        threads["join"].join(60 * scale)
+        threads["host"].join(60 * scale)
+    finally:
+        wlan.set_factory(None)
+        host_radio.close()
+        join_radio.close()
+
+    def species(name):
+        return int.from_bytes(pb7.decrypt((tmp_path / name).read_bytes()[:pb7.BOX_SIZE])[8:10], "little")
+
+    def sent(capture):
+        """(kind, step) of each game message the other side received, from its payload files."""
+        out = []
+        for path in sorted(tmp_path.glob(f"{capture}.payload*.bin"),
+                           key=lambda p: int(p.name.rsplit("payload", 1)[1][:-4])):
+            m = pb7.parse_message(path.read_bytes())
+            out.append((m["kind"], m["step"]))
+        return out
+
+    # Messages carry the values: the Android self-test runs this compiled, with no assert rewriting.
+    files = sorted(p.name for p in tmp_path.glob("*_got*"))
+    assert result == {"host": 0, "join": 0}, result
+    got = [species(n) for n in ("join_got.pb7", "join_got-2.pb7") if (tmp_path / n).exists()]
+    assert got == [25, 95], (got, files)
+    got = [species(n) for n in ("host_got.pb7", "host_got-2.pb7") if (tmp_path / n).exists()]
+    assert got == [133, 1], (got, files)
+    # The joiner's answers, as the host read them: identity, offer, commits 1 and 2, then trade 2 on
+    # kinds 4 and 5. After the last queued trade it sends no kind 6.
+    assert sent("host.jsonl") == [(1, 1), (2, 2), (3, 3), (3, 4), (4, 5), (4, 6), (5, 7), (5, 8)], sent("host.jsonl")
+    assert sent("join.jsonl")[-1] == (6, 9), sent("join.jsonl")
 
 
 def test_the_bench_counts_every_message_from_a_simulated_board():
@@ -1025,6 +1274,330 @@ def test_the_fast_rate_comes_from_the_environment(monkeypatch):
     assert rates[-1] == 921600 and 2000000 in rates
 
 
+@pytest.mark.parametrize("run_baud,next_baud", [(921600, 921600), (1500000, 921600), (921600, 1500000)])
+def test_a_uart_board_left_at_a_run_rate_answers_the_next_session_and_board_check(monkeypatch, run_baud,
+                                                                                  next_baud):
+    """A classic board keeps the last BAUD while the port is closed and opened with DTR and RTS
+    released; a second run that only spoke 115200 failed with no reply 0x81 to command 0x01."""
+    import serial
+    from gui import board as gui_board
+
+    board = esp32_sim.SimulatedBoard(esp32_sim.Air())
+    opens = []
+
+    class Port(esp32_sim.UartPort):
+        held = False
+
+        def open(self):
+            assert (self.dtr, self.rts) == (False, False) and not any(p.held for p in opens)
+            self.held = True
+            opens.append(self)
+
+        def close(self):
+            self.held = False
+
+    monkeypatch.setattr(serial, "Serial", lambda: Port(board))
+    esp32.Radio.open_serial("COM16", fast_baud=run_baud).close()
+    assert board.line_rate == run_baud
+    assert gui_board.identify("COM16", blink=False).current
+    assert board.line_rate == run_baud
+    radio = esp32.Radio.open_serial("COM16", fast_baud=next_baud)
+    try:
+        assert radio.hello().version == esp32.PROTOCOL_VERSION and board.line_rate == next_baud
+    finally:
+        radio.close()
+    assert len(opens) == 3 and not any(p.held for p in opens)
+
+
+def test_a_board_that_leaves_usb_mid_run_stops_the_run_once_and_stops_writing():
+    """Windows fails the read of a removed USB device with PermissionError 13 and every write after
+    it; a run kept writing to the dead port until the player pressed Stop."""
+    board = esp32_sim.SimulatedBoard(esp32_sim.Air()).host_stream()
+    gone = threading.Event()
+    writes_after = []
+
+    class Port:
+        def read(self, n):
+            if gone.is_set():
+                raise PermissionError(13, "Access is denied.", None, 5)
+            return board.read(n)
+
+        def write(self, data):
+            if gone.is_set():
+                writes_after.append(data)
+                raise PermissionError(13, "Access is denied.", None, 5)
+            board.write(data)
+
+        def close(self):
+            board.close()
+
+    lost = []
+    radio = esp32.Radio(Port(), on_lost=lost.append)
+    try:
+        radio.hello()
+        gone.set()
+        deadline = time.monotonic() + 2
+        while not lost and time.monotonic() < deadline:
+            time.sleep(0.01)
+        start = time.monotonic()
+        with pytest.raises(esp32.RadioError, match="left USB"):
+            radio.request(esp32.CMD_HELLO, b"", esp32.MSG_INFO, timeout=3.0)
+        assert time.monotonic() - start < 0.5
+        for _ in range(50):
+            radio.send(esp32.CMD_STATUS)
+        time.sleep(0.2)
+        assert len(lost) == 1 and isinstance(lost[0], PermissionError)
+        assert writes_after == []
+    finally:
+        radio.close()
+
+
+def test_a_board_that_never_answers_releases_its_port(monkeypatch):
+    """Windows opens a COM port exclusively: a failed open that kept its handle refused every retry
+    with PermissionError 13, hiding the first attempt's cause."""
+    import serial
+    held = []
+
+    class Port:
+        def open(self):
+            if held:
+                raise serial.SerialException("could not open port: PermissionError(13, 'Access is denied.')")
+            held.append(self)
+
+        def read(self, n):
+            time.sleep(0.01)
+            return b""                                   # a board in its ROM bootloader
+
+        def write(self, data):
+            pass
+
+        def flush(self):
+            pass
+
+        def close(self):
+            held.remove(self)
+
+    def silent(self, *args, **kwargs):
+        raise esp32.RadioError("no answer to HELLO")
+
+    monkeypatch.setattr(serial, "Serial", Port)
+    monkeypatch.setattr(esp32.Radio, "request", silent)
+    for _ in range(2):
+        with pytest.raises(esp32.RadioError):
+            esp32.Radio.open_serial("COM7")
+    assert not held
+
+
+@pytest.mark.parametrize("failure", ["timeout", "short", "removed"])
+def test_a_failed_write_stops_the_run_without_counting_or_retrying_the_frame(failure):
+    board = esp32_sim.SimulatedBoard(esp32_sim.Air()).host_stream()
+    broken = threading.Event()
+    failed_writes, lost = [], []
+
+    class Port:
+        def read(self, n):
+            return board.read(n)    # Windows can keep returning empty reads after USB wedges
+
+        def write(self, data):
+            if broken.is_set():
+                failed_writes.append(data)
+                if failure == "short":
+                    return len(data) - 1
+                if failure == "timeout":
+                    raise TimeoutError("Write timeout")
+                raise PermissionError("Access is denied")
+            board.write(data)
+            return len(data)
+
+    radio = esp32.Radio(Port(), on_lost=lost.append)
+    try:
+        radio.hello()
+        assert radio.drain()
+        written = radio._written
+        broken.set()
+        started = time.monotonic()
+        with pytest.raises(esp32.RadioError, match="left USB"):
+            radio.request(esp32.CMD_STATUS, b"", esp32.MSG_STATUS, timeout=3)
+        assert time.monotonic() - started < 1
+        for _ in range(20):
+            radio.send_ethernet(bytes(100))
+        assert not radio.drain()
+        radio._writer.join(1)
+        assert not radio._writer.is_alive()
+        assert len(lost) == len(failed_writes) == 1
+        assert radio._written == written
+        # A simultaneous reader error must not notify the run again.
+        radio._lose(PermissionError("read failed too"))
+        assert len(lost) == 1
+    finally:
+        radio.close()
+
+
+@pytest.mark.parametrize("noise", [b"", b"boot garbage\x00"])
+def test_an_enumerated_but_silent_board_is_probed_and_stops_the_run(monkeypatch, noise):
+    import serial
+    board = esp32_sim.SimulatedBoard(esp32_sim.Air())
+    broken = threading.Event()
+    writes, lost = [], []
+
+    class Port(esp32_sim.UartPort):
+        def read(self, n):
+            if broken.is_set():
+                time.sleep(0.005)
+                return noise
+            return super().read(n)
+
+        def write(self, data):
+            writes.extend(esp32.FrameReader().feed(data))
+            if not broken.is_set():
+                super().write(data)
+            return len(data)
+
+    port = Port(board)
+    monkeypatch.setattr(serial, "Serial", lambda: port)
+    monkeypatch.setattr(esp32, "LINK_PROBE_AFTER", 0.05)
+    monkeypatch.setattr(esp32, "LINK_SILENCE", 0.2)
+    radio = esp32.Radio.open_serial("COM5", fast_baud=115200, on_lost=lost.append)
+    try:
+        assert port.write_timeout == esp32.WRITE_TIMEOUT
+        assert radio.drain()
+        writes.clear()
+        broken.set()
+        radio._thread.join(1)
+        radio._writer.join(1)
+        assert len(lost) == 1 and "stopped answering over USB" in str(lost[0])
+        assert [t for t, _ in writes] == [esp32.CMD_STATUS]
+        assert radio.flow_resyncs == 0
+        started = time.monotonic()
+        with pytest.raises(esp32.RadioError, match="stopped answering"):
+            radio.status()
+        assert time.monotonic() - started < 0.5
+    finally:
+        radio.close()
+
+
+def test_an_idle_board_without_periodic_credits_answers_liveness_probes(monkeypatch):
+    import serial
+    board = esp32_sim.SimulatedBoard(esp32_sim.Air())
+    probes, lost = [], []
+
+    class Port(esp32_sim.UartPort):
+        def read(self, n):
+            return esp32_sim._HostStream.read(self, n)   # no repeated idle CREDIT
+
+        def write(self, data):
+            probes.extend(t for t, _ in esp32.FrameReader().feed(data) if t == esp32.CMD_STATUS)
+            super().write(data)
+
+    monkeypatch.setattr(serial, "Serial", lambda: Port(board))
+    monkeypatch.setattr(esp32, "LINK_PROBE_AFTER", 0.05)
+    monkeypatch.setattr(esp32, "LINK_SILENCE", 0.3)
+    radio = esp32.Radio.open_serial("COM5", fast_baud=115200, on_lost=lost.append)
+    try:
+        time.sleep(0.65)
+        assert len(probes) >= 3 and not lost
+        assert radio.hello().version == esp32.PROTOCOL_VERSION
+    finally:
+        radio.close()
+
+
+def test_a_stuck_os_output_queue_cannot_hang_baud_negotiation(monkeypatch):
+    monkeypatch.setattr(esp32, "WRITE_TIMEOUT", 0.05)
+    board = esp32_sim.SimulatedBoard(esp32_sim.Air())
+
+    class Port(esp32_sim.UartPort):
+        out_waiting = 1
+
+        def flush(self):
+            pytest.fail("flush has no timeout")
+
+    radio = esp32.Radio(Port(board))
+    try:
+        started = time.monotonic()
+        with pytest.raises(esp32.RadioError, match="output did not drain"):
+            radio._set_rate(921600)
+        assert time.monotonic() - started < 0.5
+    finally:
+        radio.close()
+
+
+def test_a_full_credit_window_on_a_silent_stream_is_not_blindly_resynced(monkeypatch):
+    monkeypatch.setattr(esp32, "FLOW_BLIND", 0.15)
+    board = _RingBoard()
+    lost = []
+    radio = esp32.Radio(board, on_lost=lost.append)
+    try:
+        radio.send(esp32.CMD_HELLO)
+        assert radio.drain()
+        deadline = time.monotonic() + 1
+        while not radio._flow and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert radio._flow
+        board.close()
+        board.thread.join(1)
+        for _ in range(100):
+            radio.send_ethernet(bytes(300))
+        radio._writer.join(1)
+        assert len(lost) == 1 and "stopped answering" in str(lost[0])
+        assert radio.flow_resyncs == 0
+        assert radio._written <= esp32.FLOW_WINDOW
+        assert not radio.drain()
+    finally:
+        radio.close()
+
+
+@pytest.mark.parametrize("version", ["1.4.0", ""])
+def test_a_board_whose_host_dies_leaves_the_network_and_an_older_board_is_never_fed(monkeypatch, version):
+    """A host killed mid-seat stops sending ALIVE; the board leaves and the console's AP sees the
+    station go. Firmware that names no version answers ALIVE as unknown, so it is never sent."""
+    import serial
+    air = esp32_sim.Air()
+    ap_board, station_board = esp32_sim.SimulatedBoard(air), esp32_sim.SimulatedBoard(air)
+    station_board.version, station_board.host_silent_after = version, 0.3
+    commands = []
+    command = station_board._command
+    station_board._command = lambda t, p: (commands.append(t), command(t, p))
+
+    class Port:
+        def __init__(self):
+            self.board, self.baudrate = station_board.host_stream(), 115200
+
+        def open(self):
+            pass
+
+        def read(self, n):
+            return self.board.read(n)
+
+        def write(self, data):
+            self.board.write(data)
+
+        def flush(self):
+            pass
+
+        def close(self):
+            self.board.close()
+
+    monkeypatch.setattr(serial, "Serial", Port)
+    monkeypatch.setattr(esp32, "ALIVE_EVERY", 0.05)
+    ap = esp32.Radio(ap_board.host_stream())
+    station = esp32.Radio.open_serial("sim", fast_baud=115200)
+    try:
+        ap.ap_start(6, b"\x02" * 6, "0" * 32, bytes(16))
+        station.sta_join(6, b"\x02" * 6, "0" * 32, bytes(16))
+        time.sleep(0.6)                                  # twice the silence the board allows
+        assert ap_board.stations                             # fed, still seated
+        station._closed = True                            # the process is gone: nothing more is sent
+        deadline = time.monotonic() + 2
+        while ap_board.stations and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert (not ap_board.stations) == bool(version)
+        assert (esp32.CMD_ALIVE in commands) == bool(version)
+    finally:
+        station._closed = False
+        station.close()
+        ap.close()
+
+
 def test_auto_port_takes_the_one_serial_port_and_refuses_to_guess():
     from pokeldn.ldn import esp32_wlan
     assert esp32_wlan.auto_port(["/dev/cu.usbserial-7"]) == "/dev/cu.usbserial-7"
@@ -1047,3 +1620,81 @@ def test_windows_auto_port_enumerates_usb_without_opening_it(monkeypatch):
     found.append(SimpleNamespace(device="COM5", vid=0x10C4))
     with pytest.raises(RuntimeError, match="exactly one"):
         esp32_wlan.auto_port()
+
+
+def test_sword_host_and_joiner_trade_on_simulated_boards(tmp_path, monkeypatch):
+    """bin/swsh_connect.py against bin/swsh_host.py: two trades on one session, each side offering
+    its queued records in order and saving the other's. The host plays a console's player: it accepts
+    first and offers again from the box after the first trade (--lead)."""
+    import threading
+
+    import swsh_connect
+    import swsh_host
+    from test_swsh_trade_payload import a_payload
+    from pokeldn import gen8, pokemon as pokemon_service
+    from pokeldn.ldn import userspace_ip
+    from pokeldn.swsh import pokemon
+
+    monkeypatch.setenv("POKELDN_RADIO", "esp32:simulated")
+    monkeypatch.setattr(pokemon_service, "prepare_file", lambda game, path, **kw: path)
+    monkeypatch.setattr(pokemon_service, "prepare", lambda game, raw, **kw: gen8.decrypt(raw))
+    keys_file = tmp_path / "prod.keys"
+    keys_file.write_text("".join(f"{k} = {v.hex()}\n" for k, v in KEYS.items()))
+    party = a_payload(count=4)
+    (tmp_path / "snapshot.bin").write_bytes(party)
+    for slot in range(4):
+        (tmp_path / f"offer{slot}.pk8").write_bytes(party[slot * gen8.SIZE_PARTY:(slot + 1) * gen8.SIZE_PARTY])
+    air = esp32_sim.Air()
+    host_radio = esp32.Radio(esp32_sim.SimulatedBoard(air).host_stream())
+    join_radio = esp32.Radio(esp32_sim.SimulatedBoard(air).host_stream())
+    threads = {}
+
+    @contextlib.asynccontextmanager
+    async def factory():
+        radio = join_radio if threading.current_thread() is threads.get("join") else host_radio
+        esp = esp32_wlan.EspFactory(radio, port_factory=userspace_ip.userspace_port, join_timeout=5)
+        try:
+            yield esp
+        finally:
+            esp.router.close()
+
+    result = {}
+    threads["host"] = threading.Thread(target=lambda: result.setdefault("host", swsh_host.main(
+        ["--keys", str(keys_file), "--channel", "6", "--seconds", "50", "--accept-first",
+         "--lead", "3",
+         "--snapshot", str(tmp_path / "snapshot.bin"), "--received", str(tmp_path / "host.pk8"),
+         "--offer-file", str(tmp_path / "offer0.pk8"), "--offer-file", str(tmp_path / "offer1.pk8")])),
+        daemon=True)
+    threads["join"] = threading.Thread(target=lambda: result.setdefault("join", swsh_connect.main(
+        ["--keys", str(keys_file), "--preset", "trade", "--channels", "6", "--dwell", "0.5",
+         "--hold", "35", "--save-offered", str(tmp_path / "join.pk8"),
+         "--offer-file", str(tmp_path / "offer2.pk8"), "--offer-file", str(tmp_path / "offer3.pk8")])),
+        daemon=True)
+    wlan.set_factory(factory)
+    try:
+        threads["join"].start()          # before the host: the joiner rescans until it appears
+        time.sleep(1.5)
+        threads["host"].start()
+        threads["join"].join(120)
+        threads["host"].join(120)
+    finally:
+        wlan.set_factory(None)
+        host_radio.close()
+        join_radio.close()
+    assert result == {"host": 0, "join": 0}
+
+    def species(name):
+        return pokemon.read(pokemon.encrypt(gen8.load((tmp_path / name).read_bytes())))["species"]
+    assert [species(n) for n in ("join.pk8", "join-2.pk8")] == [94, 95]
+    assert [species(n) for n in ("host.pk8", "host-2.pk8")] == [96, 97]
+
+
+@pytest.mark.parametrize("platform", ["linux", "darwin", "win32"])
+def test_the_board_needs_no_privilege_on_any_platform(monkeypatch, platform):
+    """A kernel TAP needs CAP_NET_ADMIN, which the desktop app never has; it is opt-in on Linux."""
+    from pokeldn.ldn import userspace_ip
+    monkeypatch.delenv("POKELDN_L2", raising=False)
+    monkeypatch.setattr(esp32_wlan.sys, "platform", platform)
+    assert esp32_wlan.default_port_factory() is userspace_ip.userspace_port
+    monkeypatch.setenv("POKELDN_L2", "tap")
+    assert esp32_wlan.default_port_factory() is esp32_wlan.kernel_tap

@@ -17,12 +17,13 @@ NET_CONN_REQUEST = 0x11
 NET_CONN_RESPONSE = 0x12
 NET_UPDATE_PROPERTY = 0x50
 NET_UPDATE_PROPERTY_ACK = 0x51
+NET_START_HOST_MIGRATION = 0x40   # repeated by a host destroying its network until its clients leave
 
 SESSION_JOIN_REQUEST = 0
 SESSION_JOIN_RESPONSE = 2
 SESSION_UPDATE = 5
 SESSION_UPDATE_ACK = 6
-SESSION_LEFT_SYNC = 7
+SESSION_START_HOST_MIGRATION = 7
 
 DEFAULT_PROTOCOLS = [(1, 0), (3, 5), (5, 1), (10, 3), (13, 7), (15, 0)]
 DEFAULT_APP_VER = bytes.fromhex("0058")
@@ -63,9 +64,10 @@ def _net_station(ip=None, port=12345, *, migration_state=0, migration_rank=0, pr
 
 
 def build_net_conn_request(seqid, host_var, host_mac, network_id, stations, max_stations=6,
-                           station_size=22):
+                           station_size=22, migrating=False):
     """Net 0x11 carries all max_stations slots; the network id is the SSID CRC32 zero-extended to 8
-    bytes. `station_size` is 22 at Pia 6.39 (the GBA app) and 21 at 6.16-6.23 (Legends Arceus)."""
+    bytes. `station_size` is 22 at Pia 6.39 (the GBA app) and 21 at 6.16-6.23 (Legends Arceus).
+    `migrating` is a leaving host's form: byte 26 reads 2 and byte 29, is-migrating, 1 (docs/za.md)."""
     entries = list(stations)
     if not 1 <= len(entries) <= max_stations:
         raise ValueError("Net 0x11 needs 1..max_stations occupied station addresses")
@@ -75,9 +77,9 @@ def build_net_conn_request(seqid, host_var, host_mac, network_id, stations, max_
     body += (_vid(host_var) & 0xFFFF).to_bytes(2, "big")
     body += ldn_constant_id(host_mac)
     body += (network_id & 0xFFFFFFFF).to_bytes(8, "big")
-    body += bytes([1])
+    body += bytes([2 if migrating else 1])
     body += max_stations.to_bytes(2, "big")
-    body += bytes([0])
+    body += bytes([1 if migrating else 0])
     for rank, ip in enumerate(entries):
         body += _net_station(ip, migration_rank=rank, prefix_len=prefix_len)
     for _ in range(max_stations - len(entries)):
@@ -305,6 +307,17 @@ def build_session_join_response(join, host_constant_id, host_var, random4):
             + bytes([1]) + (1).to_bytes(2, "big") + b"\x00\x00")
 
 
+def build_session_leave_response(request, random4):
+    """The host's Session type-4 answer to a 6.39 type-3 leave request, 15 bytes: type, random,
+    the request's constant id and variable id (docs/frlg_link.md, Leaving the Pia session)."""
+    request, random4 = bytes(request), bytes(random4)
+    if len(request) not in (0x16, 0x22) or request[0] != SESSION_LEAVE_REQUEST:
+        raise ValueError("not a 6.39 Session leave request")
+    if len(random4) != 4:
+        raise ValueError("Session leave response random value must be four bytes")
+    return bytes([4]) + random4 + request[5:15]
+
+
 # Pia 6.16-6.30 (version 11) Session layouts (docs/pla.md, The Session join reply).
 SESSION_JOIN_ACK = 1
 WIRE_SESSION_PROTOCOL = 0x98
@@ -325,7 +338,7 @@ def parse_session_join_v11(payload, *, header_end=None):
         protocols = [(payload[2 + i * 2], payload[2 + i * 2 + 1]) for i in range(nprotocols)]
         if header_end is not None:
             p = header_end
-        if p + 4 + 12 + 32 + 3 + 6 + 12 > len(payload):
+        if p + 4 + 12 + 32 + 3 + 6 + 12 + 2 > len(payload):
             return None
         app4 = bytes(payload[p:p + 4])
         source_constant_id = bytes(payload[p + 4:p + 12])
@@ -335,6 +348,13 @@ def parse_session_join_v11(payload, *, header_end=None):
         port = int.from_bytes(payload[p + 55:p + 57], "big")
         destination_constant_id = bytes(payload[p + 57:p + 65])
         destination_var = int.from_bytes(payload[p + 67:p + 69], "big")
+        num_players = payload[p + 69]
+        num_participants = payload[p + 70]
+        players = []
+        q = p + 71
+        for _ in range(num_players):
+            player, q = _parse_player_info(payload, q)
+            players.append(player)
         return {
             "protocols": protocols,
             "app4": app4,
@@ -345,6 +365,9 @@ def parse_session_join_v11(payload, *, header_end=None):
             "port": port,
             "destination_constant_id": destination_constant_id,
             "destination_var": destination_var,
+            "num_players": num_players,
+            "num_participants": num_participants,
+            "players": players,
         }
     except (IndexError, ValueError):
         return None
@@ -399,17 +422,27 @@ def _session_station_v11(constant_id, variable_id, ip, port, *, station_index, r
 
 
 SESSION_LEAVE_REQUEST = 3
+SESSION_LEAVE_RESPONSE = 4
 
 
-def build_session_leave_v11(constant_id, variable_id, ip, port=12345, *, reason=0,
+def build_session_leave_v11(constant_id, variable_id, ip, port=12345, *, address_kind=0,
                             random4=b"\0\0\0\0"):
-    """Session type-3 leave request, 24 bytes (docs/pla.md, Leaving). A session of two owes no
-    type-7 left-station sync. Nothing reads the random word back."""
+    """Session type-3 leave request, 24 bytes (docs/pla.md, Leaving). Nothing reads the random
+    word back."""
     return (bytes([SESSION_LEAVE_REQUEST])
             + bytes(random4)[:4].ljust(4, b"\0")
             + _location_id(constant_id, variable_id)
-            + bytes([reason & 0xFF])
+            + bytes([address_kind & 0xFF])
             + _ip4(ip) + (port & 0xFFFF).to_bytes(2, "big"))
+
+
+def build_session_leave_response_v11(request, *, random4):
+    """The host's type-4 answer to a type-3 leave request: the request's location id echoed, 17
+    bytes (Arceus `0x7381c0`; the leaver's check `0x738280`; docs/pla.md, Leaving)."""
+    request = bytes(request)
+    if len(request) < 17 or request[0] != SESSION_LEAVE_REQUEST:
+        raise ValueError("not a leave request")
+    return bytes([SESSION_LEAVE_RESPONSE]) + bytes(random4)[:4].ljust(4, b"\0") + request[5:17]
 
 
 def build_session_update_v11(host_constant_id, host_var, stations, *, sequence_id=1):
@@ -523,7 +556,7 @@ def parse_session_migration_v11(payload):
     """Session type 7 (`LeaveMeshWithHostMigrationJob`, 0x6d8de0), the host naming its successor.
     34 bytes: type, host location id, a byte, host IPv4 and port, target location id, 00 00."""
     payload = bytes(payload)
-    if len(payload) < 32 or payload[0] != 7:
+    if len(payload) < 32 or payload[0] != SESSION_START_HOST_MIGRATION:
         return None
     return {
         "host_constant_id": bytes(payload[1:9]),
@@ -533,6 +566,15 @@ def parse_session_migration_v11(payload):
         "target_constant_id": bytes(payload[20:28]),
         "target_var": int.from_bytes(payload[30:32], "big"),
     }
+
+
+def build_session_migration_v11(host_constant_id, host_var, host_ip, target_constant_id,
+                                target_var, port=12345, tail=1):
+    """Session type 7, as `parse_session_migration_v11` reads it; `tail` is the u16 the writer
+    takes from its job's +0xe0 (`0x6d8ea8`), 0 or 1 in retail ones."""
+    return (bytes([SESSION_START_HOST_MIGRATION]) + _location_id(host_constant_id, host_var) + b"\0"
+            + bytes(int(x) for x in host_ip.split(".")) + (port & 0xFFFF).to_bytes(2, "big")
+            + _location_id(target_constant_id, target_var) + (tail & 0xFFFF).to_bytes(2, "big"))
 
 
 def build_session_migration_ack_v11(self_constant_id, self_var, host_constant_id, host_var):

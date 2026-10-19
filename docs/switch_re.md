@@ -5,8 +5,8 @@ nav_order: 3
 
 # Reverse-engineering a Switch title
 
-Reading a retail Switch game's code without unpacking it: BDSP (Unity/IL2CPP, 7.3 GB of NSPs, 3.5
-GB free) and Sword / Shield (native C++, a 13.3 GB XCI on a network share).
+Reading a retail Switch game's code without unpacking it, for a Unity/IL2CPP title (BDSP, 7.3 GB of
+NSPs) and a native C++ one (Sword / Shield, a 13.3 GB XCI).
 
 ## Order of work
 
@@ -91,7 +91,7 @@ written by its constructor with `RuntimeHelpers.InitializeArray` over a static f
 `<PrivateImplementationDetails>`, whose bytes live only in `global-metadata.dat`'s
 field-default-value table. The constructor's ADRP/LDR pair names a metadata-usage slot resolving to
 `Field$<PrivateImplementationDetails>.<HEX>`, the SHA-1 of the data; read the value by field name
-and verify by hashing. BDSP's 16-byte game key seed came out this way. Native C++ constants are in
+and verify by hashing. BDSP's 16-byte game key seed is stored this way. Native C++ constants are in
 rodata, found by cross-reference.
 
 ## Check which version you dumped
@@ -121,6 +121,9 @@ of the section counter. `tools/switch/bktr_read.py` composes both into one seeka
     ./.venv/bin/python tools/switch/bktr_read.py UPDATE.nsp --base BASE.nsp \
         --extract /Data/Managed/Metadata/global-metadata.dat
 
+The base is the Program NCA of the update's title with a CTR RomFS section: an XCI's update
+partition holds system titles' Program NCAs, and the first Program NCA found is one of those.
+
 ## Finding callers
 
 Scan the image words for `bl` (`100101` plus a signed 26-bit word offset) and the tail call `b`
@@ -142,7 +145,9 @@ cross-reference the slot (`tools/switch/nso_imports.py`), then count callers of 
 
 ## The tools
 
-Besides `xci_read.py`, `romfs_read.py`, `bktr_read.py` and `rtti_names.py` above, all offline:
+The readers are `pokeldn.switch` (containers and NCAs, RomFS, NSO, Trinity packs); the tools are
+command lines over it, and a program that needs a title's own files reads them through it from the
+user's dump. Besides `xci_read.py`, `romfs_read.py`, `bktr_read.py` and `rtti_names.py` above, all offline:
 
     tools/switch/nso_read.py     an NSO's three segments decompressed (pure-Python LZ4) at their
                                  memory offsets: a file offset is an address

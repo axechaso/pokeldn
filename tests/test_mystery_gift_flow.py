@@ -138,8 +138,8 @@ _RETAIL_PAU = bytes.fromhex(
 
 @pytest.mark.parametrize("name_bytes, reliable", [
     (_RETAIL_PAU[0x45:0x4C], True),                 # a short name arrives zero-padded
-    (bytes.fromhex("c1cfccd0bbc8ff"), True),        # six characters, the terminator fits
-    (bytes.fromhex("c1cfccd0bbc8bb"), False),       # seven: the terminator lands on the id
+    (bytes.fromhex("ceccbbbebfccff"), True),        # six characters, the terminator fits
+    (bytes.fromhex("ceccbbbebfccbb"), False),       # seven: the terminator lands on the id
 ])
 def test_the_trainer_id_is_trusted_whenever_the_name_terminator_fits(name_bytes, reliable):
     data = bytearray(_RETAIL_PAU)
@@ -211,7 +211,7 @@ class ConsoleClientModel:
     def __init__(self, *, flag_id=0, max_stamps=0, metadata_icon=0,
                  stamps=(), toss_answer=0, consume_latency=2,
                  saved_news=None, trainer_id=CONSOLE_TRAINER_ID,
-                 save_trainer_id=None, rom_stubs=None):
+                 save_trainer_id=None, rom_stubs=None, sav1=b""):
         self.lp = linkplayer.LinkPlayer(name="ASH", version=linkplayer.VERSION_FIRE_RED,
                                         player_id=1)
         self.toss_answer = toss_answer
@@ -229,6 +229,7 @@ class ConsoleClientModel:
             metadata_icon=metadata_icon, stamps=stamps, trainer_id=trainer_id)
         # What gSaveBlock2Ptr holds; a test drives it apart from the game data.
         self.save_trainer_id = trainer_id if save_trainer_id is None else save_trainer_id
+        self.sav1 = sav1
         self.buffer_scripts = []
         self.vars = {var: 0 for var in range(0x40B6, 0x40BD)}
         self.flags = set()
@@ -402,7 +403,7 @@ class ConsoleClientModel:
         # [decomp:src/mystery_gift_client.c:239,276].
         try:
             run = buffer_script.emulate_repeating(
-                payload, param=param, sav2=bytes(sav2), send_size=size, send_ident=ident,
+                payload, param=param, sav2=bytes(sav2), sav1=self.sav1, send_size=size, send_ident=ident,
                 memory=self.rom_stubs or None, max_calls=1200).final
         except buffer_script.BufferScriptError as exc:
             raise AssertionError(

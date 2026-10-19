@@ -2,6 +2,7 @@
 CRC-16/CCITT-FALSE at +0x2CC, checked at 0x010b5de0 (docs/swsh_gift.md, "What a record must carry").
 Trap: the nickname array is at 0x030 and the trainer array at 0x12C, as a console shows them.
 """
+import random
 import struct
 import time
 
@@ -56,6 +57,17 @@ def unpack_date(rec):
             (v >> 6) & 0x3F, v & 0x3F)
 
 
+def for_distribution(rec):
+    """Fill an absent distributor date at send time; local wireless preserves it (docs/swsh_gift.md)."""
+    if not sealed(rec):
+        raise ValueError("The WC8 size or checksum is invalid.")
+    if rec[:8] != bytes(8):
+        return bytes(rec)
+    out = bytearray(rec)
+    out[:8] = pack_date()
+    return seal(out)
+
+
 def build(card_id=0x270F, region_mask=0xFFFF, dedup=0, extra=None, date=None):
     """A sealed record with the card id, the region mask, the duplicate-check byte and the date set,
     and `extra` ({offset: bytes}) written over it before sealing."""
@@ -81,7 +93,7 @@ POKEMON = {
     "relearn3": (0x23C, "H"), "relearn4": (0x23E, "H"),
     "species": (0x240, "H"),
     "form": (0x242, "B"),
-    "gender": (0x243, "B"),            # 0 male, 1 female, 2 random
+    "gender": (0x243, "B"),            # 0 male, 1 female, 2 genderless, 3 random
     "level": (0x244, "B"),             # zero makes the game roll one
     "egg": (0x245, "B"),
     "nature": (0x246, "B"),
@@ -95,12 +107,23 @@ POKEMON = {
     "ev_hp": (0x273, "B"), "ev_atk": (0x274, "B"), "ev_def": (0x275, "B"),
     "ev_spe": (0x276, "B"), "ev_spa": (0x277, "B"), "ev_spd": (0x278, "B"),
 }
+# What the builder 0x010b6110 rolls; zero is male, Hardy, slot 1, IV 0 (docs/swsh_gift.md)
+ROLLED = {"gender": 3, "nature": 0xFF, "ability_type": 3,
+          **{f"iv_{s}": 0xFF for s in ("hp", "atk", "def", "spe", "spa", "spd")}}
 RIBBONS_AT, RIBBONS_LEN = 0x24C, 0x20     # ribbon indices; 0xFF ends the list
 NICKNAMES = 0x030       # 9 entries of 0x1C: 0x1A bytes of UTF-16, then a language byte at +0x1A
 OT_NAMES = 0x12C        # 9 entries of 0x1C: 0x1A bytes of UTF-16
 LANG_STRIDE = 0x1C
 LANG_COUNT = 9
 NAME_BYTES = 0x1A
+
+
+def roll_gender(ratio, rng=random):
+    """-> a fixed gender byte drawn as the game draws one (`0x00766d8c`: female when r + 1 < ratio,
+    r below 253). Gender 3 rolls twice, once for the reveal and once for the party (docs/swsh_gift.md)."""
+    if ratio in (0, 254, 255):
+        return 0                # the build forces these ratios (`0x777490`)
+    return 1 if rng.randrange(253) + 1 < ratio else 0
 
 
 def utf16(text, size=NAME_BYTES):
@@ -119,7 +142,7 @@ def pokemon_card(species, level=5, moves=(0, 0, 0, 0), form=0, nickname=None, ot
     if met_level is None:
         met_level = level
     values = dict(species=species, level=level, form=form, met_level=met_level,
-                  move1=moves[0], move2=moves[1], move3=moves[2], move4=moves[3])
+                  move1=moves[0], move2=moves[1], move3=moves[2], move4=moves[3], **ROLLED)
     values.update(fields)
     for name, value in values.items():
         off, fmt = POKEMON[name]

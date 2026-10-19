@@ -27,39 +27,47 @@ Jigglypuff, Diglett. The code sets the advertisement's scene id
 
 ## What works
 
-A retail Let's Go Pikachu trades in both directions: `bin/lgpe_join.py` joins the console's session,
-`bin/lgpe_host.py` hosts one the console joins, and two consecutive trades complete in one hosted
-session (a fresh offer and commit channel for the second). The game checks no field of a received
-box structure: a shiny level-100 Imposter Ditto with 31 in every IV and 200 in every AV reads back
-on the summary screen. The Clone Protocol's take-over exchange passes the game's `0x11b080` gate,
-and the Reliable Protocol carries identity, offer, commit and kind 4 (after the trade);
-`pokeldn.lgpe.pb7` reads and writes the 232-byte box structure the offer and kind 4 carry.
+`bin/lgpe_join.py` joins a console's session and `bin/lgpe_host.py` hosts one the console joins. A
+seat carries one trade after another: after each
+trade's normal save the trade dispatcher goes from state 7 back to state 1 unless the save reports
+that the link ends (`0x886908`), and the save re-creates the party-offer object on a new channel
+(`0x8375a4`) ([the session page](lgpe_session.md#the-trade-dispatcher)). Both launchers take a queue
+of records, one per trade on the seat. The game checks no field of a received box structure: a shiny
+level-100 Imposter Ditto with 31 in every IV and 200 in every AV reads back on the summary screen.
+The Clone Protocol's take-over exchange passes the game's `0x11b080` gate, and the Reliable Protocol
+carries identity, offer, commit and kind 4 (the next trade's selection); `pokeldn.lgpe.pb7` reads and
+writes the 232-byte box structure the offer and kind 4 carry.
 
-Leaving is clean both ways: a joiner backs out with `--leave-after` as a console does, and a host
-answers the console's Retour. `tests/test_lgpe_host_commit.py` pins the host's commit stage against
-a scripted console: a wrong commit leaves the console on its confirmation screen with the save's
-trade lock set (no trades for ten minutes of counted play time), then the fatal error screen.
+Three queued trades complete on one seat in both roles. Each completed entry is saved as a
+checksummed 260-byte file, and the host exits with code 0 after the console leaves. A record built by
+`pokeldn.pokemon` (level, gender, nature, ball, IVs and AVs chosen) and offered by `bin/lgpe_host.py
+--fresh-pid` shows those fields on the receiving summary screen.
+
+A console leaves the seat when its player presses Retour. `bin/lgpe_join.py --leave-after SECONDS`
+runs the same exit that long after its first answered trade step, and `bin/lgpe_host.py` answers a
+console's Retour ([A joiner leaving](lgpe_session.md#a-joiner-leaving)).
+`tests/test_lgpe_host_commit.py` pins the host's commit stage against a scripted console: a wrong
+commit leaves the console on its confirmation screen with the save's trade lock set (no trades for
+ten minutes of counted play time), then the fatal error screen.
 
 ## Unresolved
 
-- How counted play time relates to wall time, so how long the lock lasts on a clock: the rate of
-  the gated call `0x13c944` and whether the frame period stays at 33.3 ms are unread. Trying Link
-  Trade at play time P + 9 and P + 11 minutes after an aborted commit, against a stopwatch, measures
-  both.
-- Why the console that refused a trade after a host answered its withdrawn vote with A 2 left the
-  host's `0xa1` on clone type 4 unanswered, when its radio acknowledged every frame. `0x51c110`
-  drops such a message silently in `0x522a60` while the sender's bit is in the `+0xc0` mask, and
-  earlier at the destination check, the per-sender count filter or a length check; the message's own
-  bytes (destination `0x0002`, count 69 after a highest earlier host count of 63) pass the first two
-  for in-order delivery. What held the silence is unknown; the capture shows no
-  severity-4 error (`0x4d8a80`, result 2 and the fatal error screen). An `0xa1` repeated until
-  answered separates a pending mask (a later copy answered) from a message that never reaches the
-  clone protocol (none answered); a sniffing board records what arrived independently of the host.
-- Whether a partner leaving during the sync save reaches the code 0xe abort. The pump fails when
-  `+0x1e6` is 1 or less, but the recount runs only under the guards on `[s+0xd8]`, `[s+0xd4]` and
-  `0x52abf0`, whose values in a trade are unread, and the local station's own record (the other
-  callers of `0x5a9430`, `0x581f20` and `0x583b90`) is untraced.
-- Which process the trade dispatcher's child is, and whether the sync save's commit channel at
-  `seq+0xb8` is released after an aborted commit.
-- Whether the dispatcher's modes 1 and 2 are link battles. The reading rests on the scene they build;
-  a capture of a link battle's session, with the mode word `+0x8c`, settles it.
+- What left a retail console silent on both of the host's `0xa1` after a host answered its withdrawn
+  vote with A 2. The host's publishes: A 2 with trailing word 1, then A 2 with trailing word 2 one
+  second later; the console republished `0 2 3` under trailing word 2 and announced its commit clone
+  5.0 s after the first A 2. The host answered the announcement with `82, 91, 91, 84, 81, a1, a1`,
+  seven datagrams within 1 ms, all acknowledged by the console's radio. The console re-announced the
+  clone on clone type 1 under a new clock, which only the `0x81` on clone type 2 does (`0x51ca48`
+  -> `0x520c30`, after the `0x91` on clone type 2 unlinked the announcement at `0x520d30`; the `0x82`
+  on clone type 1 reaches only `0x5223c0` and sends nothing). It answered neither `0xa1`. The clone
+  type 1 `0xa1` handler (`0x51c714`, `0x522350`) sends on every outcome and `0x51e3d0` spends a
+  message count before it can fail; the console spent none. Every gate before the handlers (the
+  receive loop's station mask and frame-counter filter `0x51ae20..0x51ae84`, the destination check
+  `0x51ce80`, the count filter `0x51c1e0`, the `+0x3c` mask `0x51c6b0`) passed for the `0x81` with
+  the same sender, frame counter and mask. `0x522a60` returning 2 would silence the clone type 4
+  `0xa1` alone. An emulated Let's Go 1.0.2 given the same inputs answered both `0xa1` with `0xa2`
+  within 30 ms and completed the trade: it withdrew its vote (`2 2 3`) 0.81 s after its own `1 2 2`,
+  the host published A 2 with trailing word 1 0.16 s later and trailing word 2 1.0 s after that, the
+  console republished `0 2 3` under trailing word 2, announced its commit clone 5.4 s after the first
+  A 2 and drew the same seven-message burst. The retail console runs 1.0.2 as well; what differs on
+  retail is unknown.

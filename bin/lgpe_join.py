@@ -24,7 +24,7 @@ if os.path.isdir(BUNDLED_LDN):
     sys.path.insert(0, BUNDLED_LDN)
 
 import trio
-import ldn
+from pokeldn.ldn import api as ldn
 from pokeldn.host_support import open_output
 from pokeldn import pokemon as pokemon_service
 from pokeldn.ldn import pia3, pia4, station9, station4
@@ -40,10 +40,10 @@ from pokeldn.lgpe import (COMM_ID_PIKACHU, PASSPHRASE, PIA_PORT, PIA_VERSION, pa
                           session_keys)
 from pokeldn.lgpe.session import APP_HEADER_SIZE
 from pokeldn.lgpe import pb7, reference
-from pokeldn.lgpe.leave import Leaver
-from pokeldn.lgpe.trade import fresh_offer
+from pokeldn.lgpe.leave import Leaver, unagreed_vote, host_departure
 from pokeldn.lgpe.trade import (TRADE_IN_PROGRESS, _answer_commit, _answer_offer,  # noqa: F401
-                                _note_result, _send_step, _warn_if_mid_trade)
+                                _note_result, _send_step, _warn_if_mid_trade, answer_console,
+                                show_offer)
 
 
 def _survive_netlink_overflow():
@@ -221,6 +221,8 @@ def try_decrypt(keys, data, macs):
 def build_parser():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--print-packets", action="store_true",
+                    help="print every packet in and out; the --capture file keeps them either way")
     ap.add_argument("--comm-id", default=None,
                     help="local_communication_id to join, hex. Omit to join the only unknown one")
     ap.add_argument("--keys", default="~/.switch/prod.keys")
@@ -230,7 +232,7 @@ def build_parser():
     ap.add_argument("--dwell", type=float, default=0.8)
     ap.add_argument("--scan-seconds", type=float, default=300.0,
                     help="keep scanning this long for a console before giving up")
-    ap.add_argument("--name", default="PkCamp")
+    ap.add_argument("--name", default="POKELDN")
     ap.add_argument("--passphrase", default=None, help="override, as ASCII")
     ap.add_argument("--hold", type=float, default=60.0)
     ap.add_argument("--scan-only", action="store_true")
@@ -244,7 +246,10 @@ def build_parser():
                     help="our own variable id, any nonzero value (the console's is random)")
     ap.add_argument("--connect-seconds", type=float, default=20.0,
                     help="how long to retransmit the connection request and listen for its reply")
-    ap.add_argument("--player-name", default="PkCamp",
+    ap.add_argument("--grace", type=float, default=300.0,
+                    help="seconds past --connect-seconds or --hold to keep a seat whose trade is half "
+                         "done: a trade left mid-way locks the console out of trading")
+    ap.add_argument("--player-name", default="POKELDN",
                     help="the nickname the connection response carries, what the console shows as "
                          "the partner (a real station sends its Switch profile's)")
     ap.add_argument("--short-response", action="store_true",
@@ -290,21 +295,35 @@ def build_parser():
                     help="carry the peer's announcement clock in our acknowledgement on clone type "
                          "2 rather than the clock round-tripped from our own announcement, which "
                          "is what a reference joiner carries")
+    ap.add_argument("--trainer-name", default="POKELDN",
+                    help="the player name our identity carries, the one the trade screen shows")
     ap.add_argument("--our-trainer", metavar="TID:SID",
                     help="replace the trainer id pair in the first message. A payload captured "
                          "between two emulators that share a save carries the host's own pair, "
                          "which presents the joiner as the station it is trading with")
     ap.add_argument("--leave-after", type=float, default=None, metavar="SECONDS",
                     help="leave the session the way a console backs out of its trade screen, "
-                         "this long after our offer went out (docs/lgpe_session.md)")
+                         "this long after the first trade step we answered (docs/lgpe_session.md)")
+    ap.add_argument("--stall-leave", type=float, default=5.0, metavar="SECONDS",
+                    help="leave the way a console backs out when both players have voted and the "
+                         "host has not agreed for this long, before any commit; 0 never. It ends "
+                         "the wait, not the trade lock a confirmed trade already saved")
     ap.add_argument("--received", help="write the peer's offered PB7 here")
     ap.add_argument("--fresh-pid", action="store_true",
-                    help="offer the --offer structure under a new PID and encryption constant, "
+                    help="offer every --offer structure under a new PID and encryption constant, "
                          "shiny state kept, so a save that took it before takes it again")
-    ap.add_argument("--offer", metavar="echo|PATH",
-                    help="answer the host's type 2 message with a box structure of our own. "
-                         "'echo' returns the host's own, which the game accepts by construction; "
-                         "a path is a 232-byte structure, encrypted or not")
+    ap.add_argument("--offer", metavar="echo|PATH", action="append",
+                    help="answer the host's offers with a box structure of our own. 'echo' returns "
+                         "the host's own, which the game accepts by construction; a path is a "
+                         "232-byte structure, encrypted or not. Repeatable, one per trade on the "
+                         "seat; trade N writes what it received to --received with -N. After the "
+                         "last, a further trade is not answered and the player backs out")
+    ap.add_argument("--withhold-announce", type=int, default=0, metavar="N",
+                    help="test only: skip the first N of our announcements to the host alone, as "
+                         "if lost, so the resend carries them")
+    ap.add_argument("--withhold-clone0-answer", action="store_true",
+                    help="test only: send no answer to the host's first clone 0 pair (0xa1, 0xb1), "
+                         "as if lost, to see whether the host repeats it")
     ap.add_argument("--ack-re-announce", action="store_true",
                     help="answer a peer re-announcement with an acknowledgement carrying its "
                          "clock rather than a second take-over. A reference joiner takes a clone "
@@ -353,11 +372,12 @@ def pick(nets, want):
 def main(argv=None):
     ap = build_parser()
     args = ap.parse_args(argv)
-    if args.offer and args.offer != "echo":
-        args.offer = pokemon_service.prepare_file("lgpe", args.offer, fresh=getattr(args, "fresh_pid", False))
-        if hasattr(args, "fresh_pid"):
-            args.fresh_pid = False
-    fresh_offer(args, "[lg]")
+    args.offers = [path if path == "echo" else
+                   pokemon_service.prepare_file("lgpe", path, fresh=args.fresh_pid)
+                   for path in args.offer or ()]
+    args.offer = args.offers[0] if args.offers else None
+    show_offer(args.offer)
+    args.fresh_pid = False
     if args.over_ip:
         if not args.our_mac:
             ap.error("--over-ip needs --our-mac")
@@ -590,11 +610,27 @@ def _run(args, net, keys, facts, opener):
             else:
                 deadline = args.hold
                 print(f"[lg] listening on :{PIA_PORT} for {deadline:.0f}s")
-            while time.monotonic() - t0 < deadline:
+            while (time.monotonic() - t0 < deadline
+                   or state.get("mid_trade") and time.monotonic() - t0 < deadline + args.grace):
+                # Our own leave sends its disconnection request first: that, not the network
+                # leaving, returns a console host's player at once (docs/lgpe_session.md).
+                lv = state.get("leaver")
+                if state.get("host_left") and (lv is None or lv.disconnect_sent is not None):
+                    break
                 if (args.leave_after is not None and state.get("leave_at") is None
                         and state.get("answered_step")):
                     state["leave_at"] = time.monotonic() + args.leave_after
                     print(f"[lg] leaving in {args.leave_after:.0f} s")
+                if (args.stall_leave and state.get("leave_at") is None
+                        and state.get("clone") is not None and not TRADE_IN_PROGRESS["commit"]):
+                    cid = unagreed_vote(state["clone"])
+                    now = time.monotonic()
+                    if cid is None:
+                        state.pop("stall_since", None)
+                    elif now - state.setdefault("stall_since", now) >= args.stall_leave:
+                        state["leave_at"] = now
+                        print(f"[lg] *** STALLED *** both voted on clone {cid}, no agreement in "
+                              f"{args.stall_leave:.0f} s; leaving before any commit")
                 if (state.get("leave_at") is not None and state.get("leaver") is None
                         and time.monotonic() >= state["leave_at"]):
                     part = state["clone"]
@@ -614,6 +650,7 @@ def _run(args, net, keys, facts, opener):
                         to_host_bitmap(payload, proto, port=port)
                     if state["leaver"].done:
                         TRADE_IN_PROGRESS["offer"] = TRADE_IN_PROGRESS["commit"] = False
+                        state["mid_trade"] = False
                         print("[lg] *** LEFT *** " + "; ".join(state["leaver"].log))
                         break
                 if args.connect and not state["host_accepted"] and time.monotonic() - t0 >= next_tx:
@@ -640,16 +677,17 @@ def _run(args, net, keys, facts, opener):
                     path = state["payloads"].pop(0)
                     state["next_payload"] = time.monotonic() + args.reliable_interval
                     body = Path(path).read_bytes()
-                    if args.our_trainer:
-                        # A capture between two emulators sharing a save carries the host's own
-                        # trainer id.
-                        msg = pb7.parse_message(body)
-                        tid, sid = (int(v, 0) for v in args.our_trainer.split(":"))
-                        if msg:
-                            body = pb7.build_message(
-                                msg["kind"], pb7.set_trainer_id(msg["body"], tid, sid))
+                    msg = pb7.parse_message(body)
+                    if msg and msg["kind"] == pb7.FIRST_MESSAGE:
+                        inner = pb7.set_trainer_name(msg["body"], args.trainer_name)
+                        if args.our_trainer:
+                            # A capture between two emulators sharing a save carries the host's own
+                            # trainer id.
+                            tid, sid = (int(v, 0) for v in args.our_trainer.split(":"))
+                            inner = pb7.set_trainer_id(inner, tid, sid)
                             print(f"[lg] reliable: trainer id "
                                   f"{pb7.trainer_id(msg['body'])} -> ({tid}, {sid})")
+                        body = pb7.build_message(msg["kind"], inner)
                     to_host_bitmap(state["window"].send(body), reliable3.PROTOCOL)
                     print(f"[lg] reliable: sent {len(body)} B from {path}")
                 if args.connect and not args.no_rtt and state["mesh_joined"] and not left \
@@ -676,6 +714,10 @@ def _run(args, net, keys, facts, opener):
                         state["clone"].ack_re_announcement = args.ack_re_announce
                         state["clone"].publish_on_announce = args.publish_on_announce
                         state["clone"].publish_fallback = args.publish_fallback
+                        state["clone"].withhold_announces = args.withhold_announce
+                        if args.withhold_clone0_answer:
+                            state["clone"].withhold_clone0_answers = {clone.CLOCK_AND_COUNT,
+                                                                      clone.CLOCK_AND_PARTICIPANT}
                         print("[lg] clone: sending clock requests every 0.2 s")
                     sc = state.get("sync")
                     if sc is not None and sc.now_ms(now) is not None:
@@ -685,6 +727,9 @@ def _run(args, net, keys, facts, opener):
                         if out[1] == clone.PARTICIPATE:
                             print(f"[lg] clone: *** PARTICIPATE sent after "
                                   f"{state['clone'].answered} answered requests ***")
+                    for event in state["clone"].events:
+                        print(f"[lg] clone: {event}")
+                    state["clone"].events.clear()
                 if args.connect and state["host_accepted"] and not state["mesh_joined"] \
                         and time.monotonic() - t0 >= next_tx:
                     jr = pia3.build_message(mp.build_join_request(state["our_ack"][0]),
@@ -732,6 +777,18 @@ def _run(args, net, keys, facts, opener):
                                 for payload, proto, port in state["leaver"].receive(
                                         m["protocol"], pl, time.monotonic()):
                                     to_host_bitmap(payload, proto, port=port)
+                            replies, leave = host_departure(m["protocol"], pl,
+                                                            state.get("station_index", 1))
+                            for payload, proto, port in replies:
+                                to_host_bitmap(payload, proto, port=port)
+                            if replies and not state.get("host_migrating"):
+                                state["host_migrating"] = True
+                                print("[lg] *** THE HOST IS LEAVING *** answered its migration "
+                                      "start")
+                            if leave and not state.get("host_left"):
+                                state["host_left"] = True
+                                print("[lg] *** THE HOST CLOSED ITS NETWORK *** "
+                                      "(start host migration); leaving it")
                             if m["protocol"] == station9.PROTOCOL:
                                 kind, result = station9.parse_reply(pl)
                                 is_inverse = kind == 1 and len(pl) > 3 and pl[3] == 1
@@ -746,8 +803,9 @@ def _run(args, net, keys, facts, opener):
                                               f"result 0, {len(pl)}B) *** acked "
                                               f"{station9.ack_id_of(pl):#x}")
                                     state["host_accepted"] = state["acked_response"] = True
-                                print(f"[lg] station reply type={kind} result={result} "
-                                      f"inverse={is_inverse} {len(pl)}B pl[:24]={pl[:24].hex()}")
+                                if args.print_packets:
+                                    print(f"[lg] station reply type={kind} result={result} "
+                                          f"inverse={is_inverse} {len(pl)}B pl[:24]={pl[:24].hex()}")
                             elif m["protocol"] == mp.PROTOCOL:
                                 acked = mp.ack_for(pl)
                                 if acked:
@@ -763,8 +821,9 @@ def _run(args, net, keys, facts, opener):
                                     print("[lg] *** MESH JOIN RESPONSE - station index "
                                           f"{state.get('station_index', 1)} in the mesh, acked "
                                           "on 0x14 ***")
-                                print(f"[lg] mesh 0x18 type={pl[0]:#x} {len(pl)}B "
-                                      f"pl[:24]={pl[:24].hex()}")
+                                if args.print_packets:
+                                    print(f"[lg] mesh 0x18 type={pl[0]:#x} {len(pl)}B "
+                                          f"pl[:24]={pl[:24].hex()}")
                             elif m["protocol"] == reliable3.PROTOCOL:
                                 w = state.get("window")
                                 r = reliable3.parse(pl)
@@ -779,17 +838,12 @@ def _run(args, net, keys, facts, opener):
                                         if args.capture:
                                             write_file(f"{args.capture}.payload{n}.bin", r["payload"])
                                         msg = pb7.parse_message(r["payload"])
-                                        if msg and msg["kind"] == pb7.OFFER_MESSAGE:
-                                            _answer_offer(args, state, msg,
-                                                          to_host_bitmap)
-                                        elif msg and msg["kind"] == pb7.COMMIT_MESSAGE:
-                                            _answer_commit(args, state, msg,
-                                                           to_host_bitmap)
-                                        elif msg and msg["kind"] == pb7.RESULT_MESSAGE:
-                                            _note_result()
+                                        if msg:
+                                            answer_console(args, state, msg, to_host_bitmap)
                                     else:
-                                        print(f"[lg] reliable: acked, expects "
-                                              f"{r['expected']:#x}")
+                                        if args.print_packets:
+                                            print(f"[lg] reliable: acked, expects "
+                                                  f"{r['expected']:#x}")
                             elif m["protocol"] == rtt.PROTOCOL:
                                 ans = rtt.response_for_v3(pl) if args.connect else None
                                 if ans is not None and not args.no_rtt:

@@ -75,7 +75,7 @@ def run(monkeypatch, capsys, drop_host=None, drop_joiner=None):
     `drop_joiner` lose the first matching 0x7c data message. -> .joiner, .log, .jlog, .lost, .copies, .receiver"""
     clock = Clock()
     keys = pla.session_keys(SSID)
-    exchange = data_exchange.build_record(player_id=bytes.fromhex("504b4c44"), name="PkCamp")
+    exchange = data_exchange.build_record(player_id=bytes.fromhex("504b4c44"), name="POKELDN")
     offer = trade_box.build_our_record(**data_exchange.read_record(exchange))
     jlog = []
     r = types.SimpleNamespace(
@@ -136,7 +136,7 @@ def run(monkeypatch, capsys, drop_host=None, drop_joiner=None):
     monkeypatch.setattr(pla_host, "IpHostTransport", Loopback)
     monkeypatch.setattr(pla_host, "time", types.SimpleNamespace(time=clock, monotonic=clock))
     monkeypatch.setattr(sys, "argv", [
-        "pla_host.py", "--ip-host", "--our-ip", HOST_IP, "--seconds", str(SECONDS),
+        "pla_host.py", "--ip-host", "--our-ip", HOST_IP, "--seconds", str(SECONDS), "--print-packets",
         "--session-update", "--sustain", "--clock", "--data-exchange", "--game-channel",
         "--trade-box", "--trade-box-ours", "--data-exchange-name", "HOST",
         "--data-exchange-id", "11223344"])
@@ -205,7 +205,7 @@ def test_one_lost_message_and_the_trade_still_completes(monkeypatch, capsys, los
     assert r.receiver.skipped == [], lost
     assert r.joiner.traded, lost
     assert r.joiner.received == _host_offer()
-    assert r.log.count("trade complete, the phase key closed") == 1
+    assert r.log.count("complete, the phase key closed") == 1
     if lost == "nothing":
         assert r.lost is None
         assert "resend" not in r.log and "resend" not in r.jlog and "held behind" not in r.jlog

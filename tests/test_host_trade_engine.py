@@ -4,6 +4,8 @@ and block layers."""
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pokeldn import config
@@ -54,8 +56,10 @@ def test_host_trade_engine_uses_supplied_timing():
 
 
 class ScriptedChild:
-    def __init__(self, host, party, offered=(0, 1)):
+    def __init__(self, host, party, offered=(0, 1), early_cancel=False):
         self.host = host
+        self.early_cancel = early_cancel
+        self.cancel_sent_at = self.cancel_seen_at = None
         self.party = list(party)
         self.offered = list(offered)
         self.round = 0
@@ -121,6 +125,7 @@ class ScriptedChild:
                     self.send_standby(n)
             elif cmd == trade.BOTH_CANCEL_TRADE:
                 self.cancel_seen = True
+                self.cancel_seen_at = self.host._parent_polls
                 self.send_standby(20)
             return
         if count == trade.COUNT_TRAINER_CARD:
@@ -177,20 +182,28 @@ class ScriptedChild:
     def maybe_select(self):
         if self.host.state == H_SELECT and self.confirmed < self.host.trades:
             self.send_linkcmd(trade.READY_TO_TRADE, self.offered[self.round])
-        elif (self.host.state == H_LEAVE_MENU and self.host._host_cancel_ready
+        elif (self.host.state == H_LEAVE_MENU
+              and (self.early_cancel or self.host._host_cancel_ready)
               and not self.cancel_seen and not self.host._child_cancel_requested):
+            self.cancel_sent_at = self.host._parent_polls
             self.send_linkcmd(trade.REQUEST_CANCEL)
 
 
-def test_two_trades_then_graceful_cancel_and_close():
-    host_original = [_mon(0x11), _mon(0x12)]
-    child_original = [_mon(0x21), _mon(0x22)]
-    h = HostTradeEngine(host_original, trades=2, offered_slots=[0, 1], anim_delay=1)
-    c = ScriptedChild(h, child_original)
+@pytest.mark.parametrize("trades", [2, 6])
+@pytest.mark.parametrize("early_cancel", [False, True])
+def test_queued_trades_then_graceful_cancel_and_close(early_cancel, trades):
+    """early_cancel: the console's player cancels as soon as the menu is back, as retail FireRed did
+    1.5 to 4.2 s after the final party refresh, and waited on "waiting for friend" until the end of
+    the host's menu wait. Its REQUEST_CANCEL comes from its live menu [trade.c:2049]."""
+    slots = list(range(trades))
+    host_original = [_mon(0x11 + n) for n in slots]
+    child_original = [_mon(0x21 + n) for n in slots]
+    h = HostTradeEngine(host_original, trades=trades, offered_slots=slots, anim_delay=1)
+    c = ScriptedChild(h, child_original, offered=slots, early_cancel=early_cancel)
 
     # LinkPlayer completes before the child initiates warp standby count 0.
     sent_warp0 = False
-    for _ in range(4000):
+    for _ in range(4000 * trades // 2):
         c.consume_host_words(h.tick())
         if h.established and not sent_warp0:
             sent_warp0 = True
@@ -202,26 +215,25 @@ def test_two_trades_then_graceful_cancel_and_close():
     else:
         raise AssertionError(f"leader did not finish: state={h.state}, trace={h.trace[-20:]}")
 
-    assert h.commits == 2
-    assert [m.raw for m in h.received_mons] == [child_original[0].raw, child_original[1].raw]
-    assert [m.raw for m in h.party] == [child_original[0].raw, child_original[1].raw]
-    assert c.confirmed == 2
+    assert h.commits == trades
+    assert [m.raw for m in h.received_mons] == [m.raw for m in child_original]
+    assert [m.raw for m in h.party] == [m.raw for m in child_original]
+    assert c.confirmed == trades
     assert c.cancel_seen and c.closed and h.disconnect_requested and h.done and h.state == H_DONE
 
     child_cmds = [x[1] for x in h.trace if x[0] == "child_linkcmd"]
-    assert child_cmds == [
-        "READY_TO_TRADE", "INIT_BLOCK", "READY_FINISH_TRADE",
-        "READY_TO_TRADE", "INIT_BLOCK", "READY_FINISH_TRADE",
-        "REQUEST_CANCEL",
-    ]
+    assert child_cmds == ["READY_TO_TRADE", "INIT_BLOCK", "READY_FINISH_TRADE"] * trades + [
+        "REQUEST_CANCEL"]
     queued = [x[1] for x in h.trace if x[0] == "queue_block"]
     assert "host:link_player_menu" not in queued
-    assert queued.count("SET_MONS_TO_TRADE") == 2
-    assert queued.count("START_TRADE") == 2
-    assert queued.count("CONFIRM_FINISH_TRADE") == 2
+    assert queued.count("SET_MONS_TO_TRADE") == trades
+    assert queued.count("START_TRADE") == trades
+    assert queued.count("CONFIRM_FINISH_TRADE") == trades
     assert queued[-1] == "BOTH_CANCEL_TRADE"
     assert any(x[0] == "mail_wait_idle" for x in h.trace)
     assert any(x[0] == "ribbons_wait_idle" for x in h.trace)
+    if early_cancel:
+        assert c.cancel_seen_at - c.cancel_sent_at < 30 < FINAL_MENU_READY_FRAMES
 
 
 def test_final_menu_waits_for_two_sided_native_cancel_decision():
@@ -243,24 +255,6 @@ def test_final_menu_waits_for_two_sided_native_cancel_decision():
     assert h.state == H_CANCEL
     queued = [x[1] for x in h.trace if x[0] == "queue_block"]
     assert queued[-1:] == ["BOTH_CANCEL_TRADE"]
-
-
-def test_early_child_cancel_is_latched_until_five_second_menu_wait():
-    h = HostTradeEngine([_mon(1)])
-    h._words.clear()
-    h._blocks.clear()
-    h._sender = None
-    h.round = h.trades
-    h._finish_party_exchange()
-
-    h._on_child_linkcmd(trade.REQUEST_CANCEL, 0)
-    assert h.state == H_LEAVE_MENU
-    assert h._child_cancel_requested and not h._host_cancel_ready
-    for _ in range(FINAL_MENU_READY_FRAMES - 1):
-        h.tick()
-    assert h.state == H_LEAVE_MENU
-    h.tick()
-    assert h.state == H_CANCEL
 
 
 def test_extra_trade_selection_is_declined_without_false_exit():
@@ -514,53 +508,21 @@ def test_leave_menu_report_separates_a_silent_console_from_a_steadily_idling_one
     assert "30 frames (30 idle)" in lines[-1]
 
 
-def test_child_cancel_at_select_is_answered_with_partner_cancel_not_silence():
-    """Leader_ReadLinkBuffer sets STATUS_CANCEL unguarded (trade.c:1622); READY + CANCEL is
-    LINKCMD_PARTNER_CANCEL_TRADE (trade.c:1694-1701)."""
+def test_the_first_child_cancel_at_select_ends_the_session():
+    """The leader cancels as well: LINKCMD_BOTH_CANCEL_TRADE (trade.c:1715-1722) on the player's
+    first Cancel. PARTNER_CANCEL_TRADE would loop the console on "votre ami veut échanger"."""
     h = HostTradeEngine([_mon(1), _mon(2)], anim_delay=0)
     h._words.clear()
     h._blocks.clear()
     h._sender = None
     h._set_state(H_SELECT)
 
-    h._on_child_linkcmd(trade.REQUEST_CANCEL, 0)
-
-    queued = [x[1] for x in h.trace if x[0] == "queue_block"]
-    assert queued[-1:] == ["PARTNER_CANCEL_TRADE"], queued
-    assert ("partner_cancel_at_select",) in h.trace
-    assert h.state == H_SELECT
-    h._on_child_linkcmd(trade.READY_TO_TRADE, 0)
-    assert h.state == H_CONFIRM
-
-
-def test_second_child_cancel_at_select_makes_both_cancel():
-    """A second consecutive CANCEL is answered LINKCMD_BOTH_CANCEL_TRADE (trade.c:1715-1722)."""
-    h = HostTradeEngine([_mon(1), _mon(2)], anim_delay=0)
-    h._words.clear()
-    h._blocks.clear()
-    h._sender = None
-    h._set_state(H_SELECT)
-
-    h._on_child_linkcmd(trade.REQUEST_CANCEL, 0)
-    assert h.state == H_SELECT
     h._on_child_linkcmd(trade.REQUEST_CANCEL, 0)
 
     queued = [x[1] for x in h.trace if x[0] == "queue_block"]
     assert queued[-1:] == ["BOTH_CANCEL_TRADE"], queued
-    assert ("both_cancel_at_select",) in h.trace
+    assert "PARTNER_CANCEL_TRADE" not in queued
     assert h.state == H_CANCEL
-
-
-def test_child_selection_resets_the_select_cancel_count():
-    h = HostTradeEngine([_mon(1), _mon(2)], anim_delay=0)
-    h._words.clear()
-    h._blocks.clear()
-    h._sender = None
-    h._set_state(H_SELECT)
-    h._on_child_linkcmd(trade.REQUEST_CANCEL, 0)
-    h._on_child_linkcmd(trade.READY_TO_TRADE, 0)
-    assert h.state == H_CONFIRM
-    assert h._select_cancels == 0
 
 
 def test_joiner_reanswers_a_leaders_cancel_after_its_earlier_request_was_consumed(tmp_path):
@@ -597,3 +559,17 @@ def test_joiner_reanswers_a_leaders_cancel_after_its_earlier_request_was_consume
             break
     (tmp_path / "cancel_reply.bin").write_bytes(wire)
     assert replies == [bytes.fromhex("aaee") + bytes(22)]
+
+
+def test_the_joiner_cancels_with_a_console_leader_whose_player_cancelled():
+    """A leader whose player picks Cancel while we are READY sends PLAYER_CANCEL_TRADE
+    (trade.c:1704-1712); selecting again would loop its player on "votre ami veut échanger"."""
+    child = trade.TradeEngine([_mon(1)], trade_slot=0)
+    child.state = trade.S5_SELECT
+    child._selected = True
+    child._on_linkcmd(trade.PLAYER_CANCEL_TRADE, 0)
+    assert child.state == trade.S4_PARTY and child.leaving
+    child._reselect_wait = None
+    child._trade_menu_live = lambda: True
+    child._select_offer()
+    assert child._pending_push == trade.linkcmd_block(trade.REQUEST_CANCEL)

@@ -3,10 +3,12 @@ from pokeldn.frlg.gift.gift_composer import (
     AllOf,
     CARD_TYPE_LINK_STAT,
     GET_CARD_BATTLES_WON,
+    GiveRandomEgg,
     ReadSpecial,
     SPECIAL_GET_MYSTERY_GIFT_CARD_STAT,
     VAR_MYSTERY_GIFT_2,
     AnyOf,
+    FlagSet,
     BattleLegendary,
     DeliveryPlan,
     DeliveryStage,
@@ -41,7 +43,7 @@ from pokeldn.frlg.rom import builds, native_script
 from pokeldn.frlg.rom import rng_script
 from pokeldn.frlg.gift import ereader_trainer, stamp_rally, wonder_card
 from pokeldn.frlg.rom import mystery_event
-from pokeldn.frlg.save import mevent_pokemon
+from pokeldn.frlg.save import mevent_pokemon, mon as monmod
 from pokeldn.frlg.text import charmap
 from pokeldn.frlg.rom.scrcmd import VAR_0x8008, VAR_RESULT
 
@@ -280,7 +282,7 @@ PORYGON_TM_GIFT = WonderGift(
             "Visit the deliveryman on the",
             "2nd floor of a Pokemon Center.",
         ),
-        footer1=" - MercuryEnigma",
+        footer1=" - POKELDN",
         default_flag_id=PORYGON_TM_GIFT_FLAG_ID,
     ),
     intro_message="A special CLEFAIRY delivery has arrived!",
@@ -320,7 +322,7 @@ WORLDS_XP_GIFT = WonderGift(
             "a LEGENDARY aura.",
             "We hope you enjoy this fan-made event!",
         ),
-        footer1=" - MercuryEnigma.github.io/pkcamp",
+        footer1=" - decryptu.github.io/pokeldn",
         footer2="NOTE. not official use at your own risk",
         default_flag_id=WORLDS_XP_GIFT_FLAG_ID,
     ),
@@ -421,7 +423,7 @@ WORLDS_XP_GIFT = WonderGift(
             ))),
         ),
     )),
-    completed_message="Visit MercuryEnigma.github.io/pkcamp",
+    completed_message="Visit decryptu.github.io/pokeldn",
 )
 
 
@@ -546,11 +548,11 @@ def build_mevent_celebi_script(*, nickname="CELEBI", level=30, build=None):
         moves=(MOVE_CONFUSION, MOVE_RECOVER, MOVE_HEAL_BELL, MOVE_ANCIENT_POWER),
         pp=(25, 20, 5, 5),
         nickname=nickname,
-        ot_name="PkCamp",
+        ot_name="POKELDN",
         held_item=mevent_pokemon.ITEM_ORANGE_MAIL,
         language=builds.resolve(build).language_id)
     mail = mevent_pokemon.build_mail(
-        MEVENT_CELEBI_MAIL_WORDS, player_name="PkCamp",
+        MEVENT_CELEBI_MAIL_WORDS, player_name="POKELDN",
         species=SPECIES_CELEBI_MEVENT, item_id=mevent_pokemon.ITEM_ORANGE_MAIL)
     payload = mevent_pokemon.build_givepokemon_payload(mon, mail)
 
@@ -758,7 +760,8 @@ def build_rng_seed_reader_script(build=None, **kwargs):
     gSpecialVar_0x8000/0x8001 (0x020370B4) and prints it in one frame, writing nothing
     [gift_composer.build_seed_read_script]."""
     return build_mevent_npc_script(
-        field_script=build_seed_read_script(address=builds.resolve(build).rng),
+        field_script=build_seed_read_script(address=builds.resolve(build).rng,
+                                            var_address=builds.resolve(build).ewram.get("special_var_8000")),
         **_at_mom(kwargs))
 
 
@@ -804,7 +807,8 @@ def build_rng_rate_probe_script(frames=None, build=None, **kwargs):
     frames with `delay`, and reads it again."""
     asked = ({} if frames is None else {"frames": frames})
     return build_mevent_npc_script(
-        field_script=build_seed_rate_script(address=builds.resolve(build).rng, **asked),
+        field_script=build_seed_rate_script(address=builds.resolve(build).rng,
+                                            var_address=builds.resolve(build).ewram.get("special_var_8000"), **asked),
         **_at_mom(kwargs))
 
 
@@ -896,7 +900,7 @@ MEVENT_SWEEP_MARK_RAREWORD = 41
 MEVENT_SWEEP_MARK_TRAINER = 42
 
 
-def build_sweep_berry(name="PKCAMP", build=None):
+def build_sweep_berry(name="PKLDN", build=None):
     """struct Berry2, 28 bytes: the console's own growth data under a name of ours."""
     desc1, desc2 = builds.resolve(build).enigma_desc
     encoded = charmap.encode(name).ljust(6, b"\x00")[:6] + b"\xFF"
@@ -1052,11 +1056,14 @@ GIFT_RESIDENT_SAVE = "resident-save"
 
 
 def build_resident_save_script(build=None, **kwargs):
+    """MOM runs install-kept out of the RAM script body, through the ram-jump trampoline."""
     from pokeldn.frlg.rom import buffer_script
+    tail = (bytes([native_script.SCR_PLAYSE]) + native_script.SE_SUCCESS.to_bytes(2, "little")
+            + bytes([native_script.SCR_WAITSE, native_script.SCR_END]))
     return build_mevent_npc_script(
-        field_script=native_script.build_loader_script(
-            base=buffer_script.RESIDENT_SAVE_STAGING, size=buffer_script.RESIDENT_SAVE_SIZE,
-            magic=buffer_script.RESIDENT_SAVE_MAGIC, build=build), **_at_mom(kwargs))
+        field_script=native_script.build_body_script(
+            buffer_script.build_install_kept(build)[buffer_script.INSTALL_KEPT_THUMB_ENTRY:],
+            tail, build=build), **_at_mom(kwargs))
 
 
 RESIDENT_SAVE_GIFT = WonderGift(
@@ -1416,7 +1423,8 @@ def build_rng_draw_count_script(build=None, **kwargs):
     return build_mevent_npc_script(
         field_script=build_draw_count_script(species=RNG_DRAW_COUNT_SPECIES,
                                              level=RNG_DRAW_COUNT_LEVEL,
-                                             address=builds.resolve(build).rng),
+                                             address=builds.resolve(build).rng,
+                                             var_address=builds.resolve(build).ewram.get("special_var_8000")),
         **_at_mom(kwargs))
 
 
@@ -1593,6 +1601,194 @@ MASTER_BALL_GIFT = WonderGift(
 )
 
 
+# The JPAJ distribution eggs, ported from the bytes in GB-Link-Switch-LDN `web/js/gift/official.js`
+# (github.com/GB-Link). Plain field scripts: one build serves all four cartridges.
+SPECIES_EGG = 412
+MOVE_WISH = 273
+DISTRIBUTION_INTRO = "Thank you for using the MYSTERY\nGIFT System."
+
+# (species, the egg's four moves; 0 empties a slot). Each list is one distribution's eggs, a payload
+# per species in official.js; the console picks one here with `random`.
+WISH_EGGS = (
+    (113, (230, MOVE_WISH, 0, 0)),      # CHANSEY: SWEET_SCENT
+    (96, (187, MOVE_WISH, 0, 0)),       # DROWZEE: BELLY_DRUM
+    (102, (230, MOVE_WISH, 0, 0)),      # EXEGGCUTE: SWEET_SCENT
+    (83, (281, MOVE_WISH, 0, 0)),       # FARFETCHD: YAWN
+    (115, (281, MOVE_WISH, 0, 0)),      # KANGASKHAN: YAWN
+    (108, (215, MOVE_WISH, 0, 0)),      # LICKITUNG: HEAL_BELL
+)
+POKEPARK_EGGS = (
+    (344, (40, 43, 71, 227)),           # CACNEA: POISON_STING LEER ABSORB ENCORE
+    (326, (145, 346, 0, 0)),            # CORPHISH: BUBBLE WATER_SPORT
+    (351, (150, 253, 0, 0)),            # SPOINK: SPLASH UPROAR
+    (311, (145, 300, 0, 0)),            # SURSKIT: BUBBLE MUD_SPORT
+    (304, (64, 45, 116, 297)),          # TAILLOW: PECK GROWL FOCUS_ENERGY FEATHER_DANCE
+    (370, (1, 253, 298, 0)),            # WHISMUR: POUND UPROAR TEETER_DANCE
+    (360, (150, 204, 227, 321)),        # WYNAUT: SPLASH CHARM ENCORE TICKLE
+    (222, (33, 300, 0, 0)),             # CORSOLA: TACKLE MUD_SPORT
+    (174, (47, 204, 111, 321)),         # IGGLYBUFF: SING CHARM DEFENSE_CURL TICKLE
+    (354, (45, 86, 300, 0)),            # MINUN: GROWL THUNDER_WAVE MUD_SPORT
+    (172, (84, 204, 266, 0)),           # PICHU: THUNDER_SHOCK CHARM FOLLOW_ME
+    (353, (45, 86, 346, 0)),            # PLUSLE: GROWL THUNDER_WAVE WATER_SPORT
+    (54, (346, 10, 39, 300)),           # PSYDUCK: WATER_SPORT SCRATCH TAIL_WHIP MUD_SPORT
+    (315, (45, 33, 39, 205)),           # SKITTY: GROWL TACKLE TAIL_WHIP ROLLOUT
+    (308, (33, 253, 47, 0)),            # SPINDA: TACKLE UPROAR SING
+)
+PC_JAPAN_EGGS = (
+    (69, (22, 298, 0, 0)),              # BELLSPROUT: VINE_WHIP TEETER_DANCE
+    (52, (10, 45, 80, 0)),              # MEOWTH: SCRATCH GROWL PETAL_DANCE
+    (43, (71, 73, 0, 0)),               # ODDISH: ABSORB LEECH_SEED
+    (60, (145, 186, 0, 0)),             # POLIWAG: BUBBLE SWEET_KISS
+)
+def _egg_gift(slug, title, subtitle, eggs, flag_id):
+    return WonderGift(
+        slug=slug,
+        card=WonderCardSpec(
+            icon_species=SPECIES_EGG,
+            title=title,
+            subtitle=subtitle,
+            body=("Go to the second floor of the POKéMON",
+                  "CENTER and meet the delivery person in",
+                  "green. Receive the POKéMON EGG and",
+                  "then save the game!!"),
+            footer1="Do not toss this Present Card",
+            footer2="before receiving the POKéMON EGG!!",
+            default_flag_id=flag_id,
+        ),
+        intro_message=DISTRIBUTION_INTRO,
+        event=GiftSpec(),
+        delivery=DeliveryPlan(delivery=(
+            DeliveryStage(
+                GiveRandomEgg(eggs, fateful_encounter=True,
+                              failure_message="Oh, your party appears to be full.\n"
+                                              "Please store a POKéMON on a PC."),
+                Message("Please raise it with love and\nkindness."),
+            ),
+        )),
+    )
+
+
+WISH_EGG_GIFT = _egg_gift("wish-egg", "“WISH EGG”", "POKéMON CENTER NEW YORK", WISH_EGGS, 1005)
+POKEPARK_EGG_GIFT = _egg_gift("pokepark-egg", "POKéMON EGG Present Card", "POKéPARK MARKET FANTASIA",
+                              POKEPARK_EGGS, 1003)
+PC_JAPAN_EGG_GIFT = _egg_gift("pc-japan-egg", "POKéMON EGG Present Card", "POKéMON CENTER JAPAN",
+                              PC_JAPAN_EGGS, 1003)
+
+
+GIFT_EVENT_POKEMON = "event-pokemon"
+EVENT_POKEMON_FLAG_ID = 1010
+# A WISHMKR Jirachi PKHeX made by the event's own PID/IV method (EncounterGift3, BACD_R): the card
+# `--gift event-pokemon` sends when no `--event-pokemon NAME` asks PKHeX for a fresh one.
+WISHMKR_JIRACHI_PK3 = bytes.fromhex(
+    "b6d580654b4e0000c4c3ccbbbdc2c3ff00000202d1c3cdc2c7c5cc009f3d00009901aa009c0000000064000011015d00"
+    "9c0000000a190a0000000000000000000000000000ff0521e979b42100000000000000000500190019000f0011000f00"
+    "10000d00")
+
+
+def build_event_pokemon_gift(pk3=WISHMKR_JIRACHI_PK3, *, name="WISHMKR Jirachi"):
+    """A distribution Pokemon as `givepokemon` [decomp:src/mystery_event_script.c:234]: the record
+    goes into the party as it is, PID, IVs, OT and ribbons kept. Relative blob offsets, so one
+    build serves every cartridge."""
+    raw = bytearray(monmod.Mon.from_pk3(pk3).party_bytes())
+    raw[85] = mevent_pokemon.MAIL_NONE
+    script = mystery_event.MysteryEventScript()
+    script.givepokemon(script.blob(mevent_pokemon.build_givepokemon_payload(bytes(raw)))).end()
+    species = monmod.decode_mon(bytes(raw))["species"]
+    return WonderGift(
+        slug=GIFT_EVENT_POKEMON,
+        card=WonderCardSpec(
+            icon_species=species,
+            title="EVENT POKéMON",
+            subtitle=name.upper(),
+            body=("A POKéMON from a past event has",
+                  "been sent straight to your party.",
+                  "With a full party, make room and",
+                  "receive this card again."),
+            footer1="pokeldn",
+            default_flag_id=EVENT_POKEMON_FLAG_ID,
+        ),
+        intro_message=DISTRIBUTION_INTRO,
+        event=GiftSpec(repeatable=True),
+        delivery=DeliveryPlan(delivery=(
+            DeliveryStage(Message("The POKéMON was sent straight to\nyour party, {PLAYER}.")),
+        )),
+        completed_message="The POKéMON was sent straight to\nyour party, {PLAYER}.",
+        mevent=script.assemble(),
+    )
+
+
+EVENT_POKEMON_GIFT = build_event_pokemon_gift()
+
+
+# GB-Link Team cards with no native code (GB-Link-Switch-LDN `cards/build.mjs`), ported to the composer.
+SPECIAL_ENABLE_NATIONAL_POKEDEX = 367       # counted in data/specials.inc
+SPECIAL_IS_NATIONAL_POKEDEX_ENABLED = 403
+DEX_STATE_VAR = 0x8008
+
+NATIONAL_DEX_GIFT = WonderGift(
+    slug="national-dex",
+    card=WonderCardSpec(
+        icon_species=137,
+        title="NATIONAL POKéDEX",
+        subtitle="Every POKéMON, right away",
+        body=("Upgrade your POKéDEX to the", "NATIONAL POKéDEX now. Visit", "the delivery man on the 2nd",
+              "floor of a POKéMON CENTER."),
+        footer1="pokeldn",
+        default_flag_id=1007,
+    ),
+    intro_message=DISTRIBUTION_INTRO,
+    event=GiftSpec(),
+    delivery=DeliveryPlan(delivery=(
+        DeliveryStage(ReadSpecial(DEX_STATE_VAR, SPECIAL_IS_NATIONAL_POKEDEX_ENABLED)),
+        DeliveryStage(Exit(), condition=Not(VarEquals(DEX_STATE_VAR, 0))),
+        # EnableNationalPokedex returns nothing; the var only receives what r0 held.
+        DeliveryStage(ReadSpecial(DEX_STATE_VAR, SPECIAL_ENABLE_NATIONAL_POKEDEX),
+                      Message("Done! Your POKéDEX is now the\nNATIONAL POKéDEX.")),
+    )),
+    completed_message="Your POKéDEX is the\nNATIONAL POKéDEX!",
+)
+
+ITEM_LANSAT_BERRY, ITEM_STARF_BERRY, ITEM_ENIGMA_BERRY = 173, 174, 175
+RARE_BERRIES_GIFT = WonderGift(
+    slug="rare-berries",
+    card=WonderCardSpec(
+        icon_species=288,
+        title="RARE BERRIES",
+        subtitle="ENIGMA, LANSAT and STARF",
+        body=("Three BERRIES that were only", "ever given out at events.", "Visit the delivery man on 2F",
+              "of a POKéMON CENTER."),
+        footer1="pokeldn",
+        default_flag_id=1008,
+    ),
+    intro_message=DISTRIBUTION_INTRO,
+    event=GiftSpec(),
+    delivery=DeliveryPlan(delivery=tuple(DeliveryStage(GiveItem(item)) for item in
+                                         (ITEM_ENIGMA_BERRY, ITEM_LANSAT_BERRY, ITEM_STARF_BERRY))),
+)
+
+# Bulbasaur, Charmander, Squirtle, Chikorita, Cyndaquil, Totodile, Treecko, Torchic, Mudkip; each egg
+# keeps the moves `giveegg` gives it.
+STARTERS = (1, 4, 7, 152, 155, 158, 277, 280, 283)
+STARTER_EGG_GIFT = WonderGift(
+    slug="starter-egg",
+    card=WonderCardSpec(
+        icon_species=SPECIES_EGG,
+        title="STARTER EGG",
+        subtitle="Which one will hatch?",
+        body=("An EGG with one of the nine", "first partners inside. Visit", "the delivery man on the 2nd",
+              "floor of a POKéMON CENTER."),
+        footer1="pokeldn",
+        default_flag_id=1009,
+    ),
+    intro_message=DISTRIBUTION_INTRO,
+    event=GiftSpec(),
+    delivery=DeliveryPlan(delivery=(
+        DeliveryStage(GiveRandomEgg(tuple((species, ()) for species in STARTERS)),
+                      Message("Take good care of it!")),
+    )),
+)
+
+
 __all__ = [
     "CELEBI_GIFT", "DIR_WEST", "GIFT_MEVENT_PROBE", "GIFT_PORYGON_TMS",
     "GIFT_VISITING_TRAINER",
@@ -1600,6 +1796,8 @@ __all__ = [
     "GIFT_MEVENT_NPC", "MEVENT_NPC_GIFT", "MEVENT_NPC_FLAG_ID",
     "GIFT_MASTER_BALL", "MASTER_BALL_GIFT", "MASTER_BALL_FLAG_ID",
     "GIFT_ALTERING_CAVE", "ALTERING_CAVE_GIFT", "ALTERING_CAVE_FLAG_ID",
+    "WISH_EGG_GIFT", "POKEPARK_EGG_GIFT", "PC_JAPAN_EGG_GIFT", "GIFT_EVENT_POKEMON",
+    "EVENT_POKEMON_GIFT", "NATIONAL_DEX_GIFT", "RARE_BERRIES_GIFT", "STARTER_EGG_GIFT", "STARTERS", "EVENT_POKEMON_FLAG_ID", "build_event_pokemon_gift", "WISH_EGGS", "POKEPARK_EGGS", "PC_JAPAN_EGGS",
     "GIFT_BATTLE_COUNT", "BATTLE_COUNT_GIFT", "BATTLE_COUNT_FLAG_ID",
     "BATTLE_COUNT_PRIZE_WINS", "BATTLE_COUNT_PRIZE_TAKEN", "ITEM_POTION",
     "VAR_ALTERING_CAVE_WILD_SET", "NUM_ALTERING_CAVE_TABLES", "ALTERING_CAVE_WRAP",

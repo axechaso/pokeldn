@@ -243,6 +243,25 @@ class Participant:
         self.votes = {}
         self.queue = []
         self.log = []
+        # clone id -> (next resend, resends): our peer-only announcement until the peer's 0x82.
+        self.unrequested = {}
+        # Resends and withheld frames, for the launcher to print.
+        self.events = []
+        self.withhold_clone0_answers = set()
+        # clone id -> the session host's clone type 4 data: A, the agreed argument, first.
+        self.agreed = {}
+        # (clone type, clone id) -> the clock of our last record there.
+        self.record_clocks = {}
+
+    def record_clock(self, ctype, clone_id, now):
+        """The clock for our next record on a clone: a peer keeps its stored copy for a clock that
+        is not newer (Let's Go main 0x52184c), and mesh_ms moves only once a loop pass."""
+        clock = self.ms(now)
+        last = self.record_clocks.get((ctype, clone_id))
+        if last is not None and clock <= last:
+            clock = last + 1
+        self.record_clocks[(ctype, clone_id)] = clock
+        return clock
 
     def frame(self, now):
         return int((now - self.t0) * FRAME_HZ) & 0xFFFF
@@ -303,12 +322,19 @@ class Participant:
                 self.published.add(clone_id)
                 out.append(build_data_message(
                     STATE_DATA, ctype, station, clone_id, self.frame(now),
-                    build_state_record(clone_id, station, 3, self.ms(now),
+                    build_state_record(clone_id, station, 3, self.record_clock(ctype, clone_id, now),
                                        self.our_data(clone_id)),
                     flags=3))
                 self.held.add(clone_id)
                 continue
             payload = content or b""
+            if kind == COMMAND_ANNOUNCE and qdest is None and clone_id not in self.unrequested:
+                self.unrequested[clone_id] = (now + self.announce_retry, 0)
+                if self.withhold_announces > 0:
+                    # Test only: as if this frame were lost, so the resend below carries it.
+                    self.withhold_announces -= 1
+                    self.events.append(f"withheld our announcement of clone {clone_id}")
+                    continue
             if kind == CLOCK_AND_COUNT:
                 # As late as possible: the host's announcements arrive in the same packet as the one
                 # that queued this.
@@ -327,6 +353,15 @@ class Participant:
                         or struct.pack(">I", self.ms(now)))
                 payload = echo + struct.pack(">BBH", 0, 0, self.element_ms(now) & 0xFFFF)
             out.append(self._command(kind, ctype, station, clone_id, now, payload, qdest))
+        for cid, (when, sent) in list(self.unrequested.items()):
+            if now < when or sent is None:
+                continue
+            if sent >= self.announce_retries:
+                self.unrequested[cid] = (when, None)
+                continue
+            self.unrequested[cid] = (now + self.announce_retry, sent + 1)
+            self.events.append(f"resent our announcement of clone {cid} ({sent + 1})")
+            out.append(self._command(COMMAND_ANNOUNCE, 2, self.station, cid, now))
         if (self.participated and self.peer_participated_ack and not self.announced
                 and not self.host_role):
             # A joiner sends this 6 ms after the host's 0x33: an 0xa1 for type-3 clone 0, count 1.
@@ -350,12 +385,19 @@ class Participant:
     ack_peer_clock = False
     ack_re_announcement = False
     publish_once = False
+    # Set once the peer releases clone 0, as it leaves (docs/lgpe_session.md, Leaving).
+    peer_released = False
     publish_delay = 0.09
     ack_in_burst = False
     ack_early = False
     publish_on_announce = False
     publish_fallback = 3.0
     announce_in_burst = True
+    # Our announcement to the peer alone goes out once; one lost frame, ours or its 0x82, leaves
+    # both waiting on the confirmation screen (docs/lgpe_session.md, The take-over exchange).
+    announce_retry = 0.1
+    announce_retries = 20
+    withhold_announces = 0
 
     def _mirror_announce(self, c, now, takeover_only=False):
         """Take the host's clone over on three clone types, then announce our own copy of it, in
@@ -426,12 +468,13 @@ class Participant:
         for cid in sorted(self.held):
             out.append(build_data_message(
                 STATE_DATA, 2, self.station, cid, self.frame(now),
-                build_state_record(cid, self.station, 3, self.ms(now), self.our_data(cid)),
+                build_state_record(cid, self.station, 3, self.record_clock(2, cid, now),
+                                   self.our_data(cid)),
                 flags=3))
             if self.publish_type4:
                 out.append(build_data_message(
                     STATE_DATA, 4, 0xFD, cid, self.frame(now),
-                    build_state_record(cid, self.station, 3, self.ms(now),
+                    build_state_record(cid, self.station, 3, self.record_clock(4, cid, now),
                                        self.type4_data(cid)), flags=3))
         return out
 
@@ -463,14 +506,16 @@ class Participant:
             if self.publish_type4:
                 out.append(build_data_message(
                     STATE_DATA, 4, 0xFD, cid, self.frame(now),
-                    build_state_record(cid, self.station, self.dest, self.ms(now), bytes(32)),
+                    build_state_record(cid, self.station, self.dest,
+                                       self.record_clock(4, cid, now), bytes(32)),
                     flags=self.dest))
             return out
         out.append(self._command(COMMAND_REQUEST, 1, 0xFD, cid, now))
         self.published.add(cid)
         out.append(build_data_message(
             STATE_DATA, 2, self.station, cid, self.frame(now),
-            build_state_record(cid, self.station, 3, self.ms(now), self.our_data(cid)),
+            build_state_record(cid, self.station, 3, self.record_clock(2, cid, now),
+                               self.our_data(cid)),
             flags=3))
         return out
 
@@ -529,7 +574,9 @@ class Participant:
                                                   self.element_ms(now) & 0xFFFF,
                                                   self.own | self.dest))]
             if d["type"] & 0xF0 == 0xF0 and r is not None and r["kind"] == RECORD_STATE:
-                if d["ctype"] == 2 and d["station"] != self.station:
+                if d["ctype"] == 4 and r["station"] != self.station:
+                    self.agreed[d["clone_id"]] = r["data"]
+                if d["ctype"] == 2 and d["station"] != self.station and not self.peer_released:
                     # Answer the shared clone with our copy once: the peer retransmits about ten
                     # times a second, and answering each makes the pair trade publishes all session.
                     seen = self.shared.get(d["clone_id"])
@@ -542,7 +589,8 @@ class Participant:
                         return [build_data_message(
                             STATE_DATA, 2, self.station, d["clone_id"], self.frame(now),
                             build_state_record(r["clone_id"], self.station, r["participants"],
-                                               self.ms(now), self.our_data(d["clone_id"])),
+                                               self.record_clock(2, d["clone_id"], now),
+                                               self.our_data(d["clone_id"])),
                             flags=r["participants"])]
                 # A clone type 2 copy is acked on clone type 1, station 0xFD, with the publisher's
                 # station in the header byte (docs/lgpe_session.md).
@@ -616,6 +664,9 @@ class Participant:
             # Unacked, the peer repeats the 0x83 every 100 ms and its player waits on 'interruption
             # de la connexion'. A release on type 2 is acked on type 1 (docs/lgpe_session.md).
             cid = c["clone_id"]
+            if c["ctype"] == 3 and cid == 0:
+                self.peer_released = True
+            self.unrequested.pop(cid, None)
             self.held.discard(cid)
             self.published.discard(cid)
             self.tail.pop(cid, None)
@@ -625,6 +676,7 @@ class Participant:
             return [self._command(COMMAND_END_ACK, 1 if c["ctype"] == 2 else c["ctype"],
                                   0xFD, cid, now)]
         if kind == COMMAND_REQUEST and c["ctype"] == 1:
+            self.unrequested[c["clone_id"]] = (now, None)
             out = [build_data_message(STATE_ACK, 1, 0xFD, c["clone_id"], self.frame(now),
                                       build_ack_record(c["clone_id"], 0, self.ms(now)),
                                       flags=0)]
@@ -634,7 +686,8 @@ class Participant:
                 self.published.add(c["clone_id"])
                 out.append(build_data_message(
                     STATE_DATA, 2, self.station, c["clone_id"], self.frame(now),
-                    build_state_record(c["clone_id"], self.station, 3, self.ms(now),
+                    build_state_record(c["clone_id"], self.station, 3,
+                                       self.record_clock(2, c["clone_id"], now),
                                        self.our_data(c["clone_id"])),
                     flags=3))
                 if self.request_publishes_type4 and self.publish_type4:
@@ -643,13 +696,19 @@ class Participant:
                     # it.
                     out.append(build_data_message(
                         STATE_DATA, 4, 0xFD, c["clone_id"], self.frame(now),
-                        build_state_record(c["clone_id"], self.station, self.dest, self.ms(now),
-                                           bytes(32)),
+                        build_state_record(c["clone_id"], self.station, self.dest,
+                                           self.record_clock(4, c["clone_id"], now), bytes(32)),
                         flags=self.dest))
             return out
         if key == (3, 0xFD, 0):
             # The measured joiner on the type-3 clone: a2 echoes a1's clock with count 1, c1 echoes
             # b1's with its bitmap, 0x84 answers 0x83.
+            if (kind in (CLOCK_AND_COUNT, CLOCK_AND_PARTICIPANT)
+                    and kind in self.withhold_clone0_answers):
+                # Test only: as if the answer were lost, to see whether the owner repeats its pair.
+                self.withhold_clone0_answers.discard(kind)
+                self.events.append(f"withheld our answer to the peer's clone 0 {kind:#04x}")
+                return []
             if kind == CLOCK_AND_COUNT and len(c["payload"]) >= 8:
                 if self.host_role:
                     # The reference host answers the joiner's clone 0 announcement with a 0x91

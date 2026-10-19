@@ -47,9 +47,9 @@ nav_exclude: true
 
 ## 3. 开发基线与工作目录
 
-研究源码快照固定为 `da882c7633ff106a0d2206fa2015a3538777e542`；[v0.30.0](https://github.com/Decryptu/pokeldn/releases/tag/v0.30.0) 可作为桌面宿主兼容测试的候选版本。正式实施时将源码提交、依赖、模拟器构建及固件版本写入记录，不直接跟随滚动的 `main`。
+研究文献快照固定为 `da882c7633ff106a0d2206fa2015a3538777e542`（[v0.30.0](https://github.com/Decryptu/pokeldn/releases/tag/v0.30.0) 阶段）；实际宿主采用下方单独记录的现用基线。将源码提交、依赖、模拟器构建及固件版本写入记录，不直接跟随滚动的 `main`。
 
-原方案所在检出为 `codex/frlg-remote-trade-p0`，HEAD 为 `ce9af7dec807253adb4dc4baea8a21120ca756b2`，并有未提交的远程交换、RNG 和文档工作。实现已使用独立检出及 `codex/frlg-zh-runtime` 分支，以 fork 的 `main` 提交 `b7ec48237106db8ed2d1f81bedf87a386496b307` 为实现基线，避免混入这些工作。上面的 `da882c7` 仍仅为固定研究文献来源，不能把它写成本次宿主运行版本。
+原方案所在检出为 `codex/frlg-remote-trade-p0`，HEAD 为 `ce9af7dec807253adb4dc4baea8a21120ca756b2`，并有未提交的远程交换、RNG 和文档工作。实现使用独立检出及 `codex/frlg-zh-runtime` 分支。2026-10-19 已同步上游并固定为 `f513dd0d5e1150aaa48fe99d165b0cec49c8c249`，包含最新稳定版 v0.31.4；无线驱动及固件源码与该提交一致。实际从 COM8 的 HELLO 读到无线固件 1.6.2、串口协议 1（只确认串口握手）。具体同步和回归记录见[汉化工具说明](frlg_localization.md)。上面的 `da882c7` 仍仅为固定研究文献来源，不能把它写成本次宿主运行版本。
 
 优先复用：
 

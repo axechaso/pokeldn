@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Host a Let's Go Pikachu trade session: the console joins us and speaks first.
 
-    sudo ./.venv/bin/python bin/lgpe_host.py --seconds 180 --player-name PkCamp
+    sudo ./.venv/bin/python bin/lgpe_host.py --seconds 180 --player-name POKELDN
 
     (them) Let's Go Pikachu: menu -> Communiquer -> Communication locale -> Echange,
            link code Pikachu, Pikachu, Pikachu, then wait on the search screen.
@@ -23,15 +23,18 @@ from pokeldn.host_support import open_output
 from pokeldn import pokemon as pokemon_service
 from pokeldn.ldn import clone, pia3, pia4, reliable3, station4, station9, sync_clock
 from pokeldn.lgpe import pb7
-from pokeldn.lgpe.trade import fresh_offer
-from pokeldn.lgpe.trade import (TRADE_IN_PROGRESS, _answer_offer, _send_step,
-                                _warn_if_mid_trade)
+from pokeldn.lgpe.trade import (keep_received, TRADE_IN_PROGRESS, _answer_offer, _send_step,
+                                _warn_if_mid_trade, show_offer)
+from pokeldn import receiver_gift
+from pokeldn.app import screen
+from pokeldn.online import session as online
 from pokeldn.ldn import local_protocol as lp
 from pokeldn.ldn import mesh_protocol as mp
 from pokeldn.ldn import rtt_protocol as rtt
 from pokeldn.ldn.station_protocol import (DISCONNECTION_REQUEST, DISCONNECTION_RESPONSE,
                                           ldn_constant_id, ldn_service_variable_id,
                                           station_location)
+from pokeldn.ldn.ldn_mitm_host import IpHostTransport
 from pokeldn.ldn.transport import HostTransport, board_radio, find_ap_phy
 from pokeldn.host_support import resolve_keys, needs_root, write_file
 from pokeldn.lgpe import (APPLICATION_VERSION, COMM_ID_PIKACHU, MAX_PARTICIPANTS, PASSPHRASE,
@@ -39,7 +42,7 @@ from pokeldn.lgpe import (APPLICATION_VERSION, COMM_ID_PIKACHU, MAX_PARTICIPANTS
                           session_keys)
 from pokeldn.lgpe.session import SEARCH_CHANNELS
 from pokeldn.lgpe import local_host, mesh_host
-from pokeldn.ldn import show_done
+from pokeldn.ldn import left_after_trade, show_done
 
 HOST_INDEX = 0
 JOINER_INDEX = 1
@@ -65,7 +68,7 @@ def build_parser():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--seconds", type=float, default=180.0, help="how long to host")
-    ap.add_argument("--player-name", default="PkCamp",
+    ap.add_argument("--player-name", default="POKELDN",
                     help="the nickname our connection response carries")
     ap.add_argument("--phy", default="auto")
     ap.add_argument("--ifname", default="ldn-tap")
@@ -98,19 +101,22 @@ def build_parser():
     ap.add_argument("--first", metavar="echo|PATH",
                     help="our kind-1 identity message, sent when the console's arrives: a captured "
                          "376-byte message, header included, or echo for the console's own back")
+    ap.add_argument("--trainer-name", default="POKELDN",
+                    help="the player name our identity carries, the one the trade screen shows")
     ap.add_argument("--our-trainer", metavar="TID:SID",
                     help="the trainer id pair written over the identity's")
     ap.add_argument("--scene-id", type=int, default=None,
                     help="the advertised scene id, in place of the one --code gives")
     ap.add_argument("--received", help="write the peer's offered PB7 here")
     ap.add_argument("--fresh-pid", action="store_true",
-                    help="offer the --offer structure under a new PID and encryption constant, "
+                    help="offer every --offer and --next-offer structure under a new PID and encryption constant, "
                          "shiny state kept, so a save that took it before takes it again")
     ap.add_argument("--offer", metavar="echo|PATH",
                     help="answer the console's offer with this 232-byte box structure (echo: "
                          "its own back), and its commits with commits")
-    ap.add_argument("--next-offer", metavar="PATH",
-                    help="232-byte box structure for a second trade in the same session")
+    ap.add_argument("--next-offer", metavar="PATH", action="append", default=[],
+                    help="232-byte box structure for the next trade in the same session; "
+                         "repeatable, one per trade after the first")
     ap.add_argument("--no-type4-data", dest="type4_data", action="store_false",
                     help="publish no clone data on clone types 4 and 1. Without it the console "
                          "never passes the gate at 0x11b080 and stays on its search screen")
@@ -129,6 +135,29 @@ def build_parser():
     ap.add_argument("--party-clones-delay", type=float, default=3.2,
                     help="seconds after our identity to announce them")
     ap.add_argument("--session-param", type=lambda s: int(s, 0), default=None)
+    ap.add_argument("--result-after", type=float, default=27.0,
+                    help="seconds after the second commit to send the result, the next trade's "
+                         "first slot, with two clones announced 0.5 s before it; a retail host sent "
+                         "it 26.8 s after, behind its trade animation")
+    ap.add_argument("--ignore-clone0-answer", action="store_true",
+                    help="test only: ignore the console's first answer to our clone 0 pair, as if "
+                         "lost, so the pair goes again")
+    ap.add_argument("--withhold-announce", type=int, default=0, metavar="N",
+                    help="test only: skip the first N of our announcements to the console alone, as "
+                         "if lost, so the resend carries them")
+    ap.add_argument("--lead", type=float, default=None, metavar="SECONDS",
+                    help="test only, for bin/lgpe_join.py: act as a console host's player, each "
+                         "step this many seconds after the last. Offer unprompted after the party "
+                         "clones and after each result, vote on the offered clone, announce and vote "
+                         "the commit clone, commit (docs/lgpe_session.md). Never against a console")
+    ap.add_argument("--agree-withdrawn-vote", action="store_true",
+                    help="test only: carry the drive on through a withdrawn vote, as the host did "
+                         "before it answered state 2 (docs/lgpe_session.md). Locks a console's save")
+    ap.add_argument("--ip-host", action="store_true",
+                    help="host over ldn_mitm for an emulator instead of the radio (docs/ldn.md)")
+    ap.add_argument("--our-ip", default=None, help="with --ip-host, the address to advertise")
+    online.add_arguments(ap)
+    receiver_gift.add_arguments(ap, "--offer and --next-offer")
     return ap
 
 
@@ -136,7 +165,7 @@ async def find_console_channel(keys, phy, scene, seconds, channels=(1, 6, 11), d
     """The channel of a searching console's own network under `scene`, or None within `seconds`.
     A searching console joins only a host on its own channel (docs/lgpe_session.md, The link code)."""
     import trio
-    import ldn
+    from pokeldn.ldn import api as ldn
     deadline = trio.current_time() + seconds
     while trio.current_time() < deadline:
         for net in await ldn.scan(keys, phyname=phy, channels=list(channels), dwell_time=dwell):
@@ -148,36 +177,55 @@ async def find_console_channel(keys, phy, scene, seconds, channels=(1, 6, 11), d
 
 def console_channel(keys_path, phy, scene, seconds):
     import trio
-    import ldn
+    from pokeldn.ldn import api as ldn
     return trio.run(find_console_channel, ldn.load_keys(keys_path), phy, scene, seconds)
+
+
+def boxed(raw):
+    """-> the 232-byte box structure as a station sends it, encrypted; ValueError for one that is not a valid
+    box structure, which a --next-offer may not be either."""
+    body = raw if pb7.valid(raw) else pb7.encrypt(raw)
+    if not pb7.valid(body):
+        raise ValueError(f"not a valid {pb7.BOX_SIZE}-byte box structure")
+    return body
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if args.online and (args.offer or args.next_offer):
+        print("[lgh] --online offers the partner's Pokemon; --offer and --next-offer are ignored")
+        args.offer, args.next_offer = None, []
+    fresh, args.fresh_pid = args.fresh_pid, False
     if args.offer and args.offer != "echo":
-        args.offer = pokemon_service.prepare_file("lgpe", args.offer, fresh=getattr(args, "fresh_pid", False))
-        if hasattr(args, "fresh_pid"):
-            args.fresh_pid = False
-    if args.next_offer:
-        args.next_offer = pokemon_service.prepare_file("lgpe", args.next_offer)
-    fresh_offer(args, "[lgh]")
-    if args.next_offer:
-        with open(args.next_offer, "rb") as fh:
-            next_body = fh.read()
-        if not pb7.valid(next_body):
-            print(f"[lgh] next offer is not a valid {pb7.BOX_SIZE}-byte box structure")
-            return 2
-    if needs_root():
-        print("[lgh] must run as root (LDN needs the raw radio)"); return 1
-    phy = find_ap_phy(log=print) if args.phy == "auto" else args.phy
-    if phy is None:
-        print("[lgh] no AP-capable phy"); return 1
+        args.offer = pokemon_service.prepare_file("lgpe", args.offer, fresh=fresh)
+    args.next_offer = [pokemon_service.prepare_file("lgpe", path, fresh=fresh) for path in args.next_offer]
+    for path in args.next_offer:
+        with open(path, "rb") as fh:
+            if not pb7.valid(fh.read()):
+                print(f"[lgh] next offer {path} is not a valid {pb7.BOX_SIZE}-byte box structure")
+                return 2
+    # A gift made for the receiving player stands in for an online partner (pokeldn.receiver_gift).
+    receiving = None
+    if not args.online and args.offer and args.offer != "echo":
+        offers = [boxed(Path(path).read_bytes()) for path in (args.offer, *args.next_offer)]
+        receiving = receiver_gift.setup("lgpe", args, offers, boxed, fresh=fresh)
+    show_offer(args.offer)
+    if not args.ip_host and needs_root():
+        print("[lgh] hosting over the radio needs root, a board (POKELDN_RADIO), or --ip-host")
+        return 1
+    phy = None
+    if not args.ip_host:
+        phy = find_ap_phy(log=print) if args.phy == "auto" else args.phy
+        if phy is None:
+            print("[lgh] no AP-capable phy"); return 1
     keys_path = resolve_keys(args.keys)
-    if not os.path.exists(keys_path):
+    if not args.ip_host and not os.path.exists(keys_path):
         print(f"[lgh] prod.keys not found at {keys_path!r}"); return 2
 
     scene = args.scene_id if args.scene_id is not None else scene_id(args.code.split(","))
-    if args.channel == "auto":
+    if args.channel == "auto" and args.ip_host:
+        channel = SEARCH_CHANNELS[scene % 3]
+    elif args.channel == "auto":
         channel = console_channel(keys_path, phy, scene, args.seconds)
     elif args.channel == "code":
         channel = SEARCH_CHANNELS[scene % 3]
@@ -198,14 +246,19 @@ def main(argv=None):
         if cap:
             cap.write(json.dumps(kw) + "\n"); cap.flush()
 
-    host = HostTransport(app_data=adv.data, password=PASSPHRASE, nickname=args.player_name,
-                         keys_path=keys_path, local_comm_id=COMM_ID_PIKACHU, scene_id=scene,
-                         app_version=APPLICATION_VERSION, max_participants=MAX_PARTICIPANTS,
-                         phyname=phy, ifname=args.ifname, ap_ifname=args.ap_ifname,
-                         mon_ifname=args.mon_ifname, channel=channel,
-                         skip_encryption=not args.no_skip_encryption,
-                         accept_decrypted_ccmp=not args.no_accept_decrypted_ccmp,
-                         ssid=None if args.random_ssid else SSID, protocol=args.protocol)
+    common = dict(app_data=adv.data, password=PASSPHRASE, nickname=args.player_name,
+                  keys_path=keys_path, local_comm_id=COMM_ID_PIKACHU, scene_id=scene,
+                  app_version=APPLICATION_VERSION, max_participants=MAX_PARTICIPANTS,
+                  channel=channel, ssid=None if args.random_ssid else SSID,
+                  protocol=args.protocol)
+    if args.ip_host:
+        host = IpHostTransport(**common, mirror_comm_version=True,
+                               **({"our_ip": args.our_ip} if args.our_ip else {}))
+    else:
+        host = HostTransport(**common, phyname=phy, ifname=args.ifname, ap_ifname=args.ap_ifname,
+                             mon_ifname=args.mon_ifname,
+                             skip_encryption=not args.no_skip_encryption,
+                             accept_decrypted_ccmp=not args.no_accept_decrypted_ccmp)
     if not host.start():
         print("[lgh] the AP did not come up"); return 3
     print(f"[lgh] hosting: ssid={host.ssid.hex()} us={host.our_ip}/{host.our_mac.hex()}")
@@ -213,17 +266,26 @@ def main(argv=None):
            application_data=adv.data.hex(), session_key=adv.keys.session_key.hex(),
            our_ip=host.our_ip, our_mac=host.our_mac.hex())
 
-    session = Session(host, adv, args, record)
+    partner = online.partner("lgpe", args, code=args.code, name=args.trainer_name)
+    if receiving is not None:
+        partner = receiver_gift.ReceiverGift("lgpe", *receiving, shown=lambda body: screen.offer("lgpe", body),
+                                             notify=receiver_gift.pop_up())
+    session = Session(host, adv, args, record, partner=partner)
     t0 = time.monotonic()
     try:
         while True:
             if time.monotonic() - t0 >= args.seconds:
                 # Stopping between offer and result makes the console refuse the next trade for
                 # 600 s of play: hold until the exchange is settled or the console has left.
-                if not TRADE_IN_PROGRESS["offer"] or session.trade.get("done"):
+                # This session's own flag: TRADE_IN_PROGRESS is the process's, which a joiner in
+                # the same process (tests/test_esp32.py) clears.
+                if not session.trade.get("mid_trade") or session.trade.get("done"):
                     break
                 if time.monotonic() - t0 >= args.seconds + args.grace:
                     break
+            if left_after_trade(host.participants):
+                print("[lgh] the console left after the trade; closing")
+                break
             session.poll()
             time.sleep(0.005)
     except KeyboardInterrupt:
@@ -239,8 +301,14 @@ def main(argv=None):
 
 
 class Session:
-    def __init__(self, host, adv, args, record):
+    def __init__(self, host, adv, args, record, partner=None):
         self.host, self.adv, self.args, self.record = host, adv, args, record
+        # Online (pokeldn.online): the partner's console's kind 2 answers ours, and the A 2 that
+        # starts the console's save waits for both consoles' votes (docs/online.md).
+        self.partner = partner
+        self.console_offer = None         # the console's kind 2 still owed an answer
+        self.sent_remote = None           # the partner record our kind 2 carried
+        self.held_vote = None             # the offered clone whose A 2 waits for the partner
         self.keys = adv.keys
         self.t0 = time.monotonic()
         self.rx = self.tx = 0
@@ -261,11 +329,13 @@ class Session:
         self.window.clock = time.monotonic
         self.trade = {"window": self.window, "step": 1}
         self.round = 0
+        self.received = args.received
         self.payloads = []
         self.clone = None
         # Each step is timed 30 ms off the console's answer to the last (docs/lgpe_session.md).
         self.announce_clone_0_at = None
         self.clone_0_announced = False
+        self.clone_0_resend_at, self.clone_0_resends = 0.0, 0
         self.publish_clone_0_at = None
         self.clone_0_published = False
         self.clone_0_acked = False
@@ -277,6 +347,10 @@ class Session:
         self.party_clones_announced = False
         self.advance_at = None
         self.advanced = False
+        # --lead (test only): an unprompted offer awaiting its answer, and the timers.
+        self.led = False
+        self.lead_offer_at = self.lead_vote_at = None
+        self.lead_commit_clone_at = self.lead_commit_at = None
         self.extra_first = None
         self.drive = []
         self.commit_clone = None
@@ -399,9 +473,20 @@ class Session:
                 if out[1] == clone.PARTICIPATE:
                     print("[lgh] clone: PARTICIPATE sent, 1.1 s after the console's")
                 self.send(out, clone.PROTOCOL)
+            for event in self.clone.events:
+                print(f"[lgh] clone: {event}")
+            self.clone.events.clear()
             if (self.announce_clone_0_at is not None and not self.clone_0_announced
                     and now >= self.announce_clone_0_at):
                 self.clone_0_announced = True
+                self.announce_clone_0(now)
+                self.clone_0_resend_at, self.clone_0_resends = now + 0.11, 0
+            if (self.clone_0_announced and self.publish_clone_0_at is None
+                    and now >= self.clone_0_resend_at and self.clone_0_resends < 20):
+                # A retail console host repeats an unanswered pair about 110 ms later
+                # (docs/lgpe_session.md, The clone 0 pair).
+                self.clone_0_resend_at, self.clone_0_resends = now + 0.11, self.clone_0_resends + 1
+                print(f"[lgh] clone: no answer to the clone 0 pair; resent ({self.clone_0_resends})")
                 self.announce_clone_0(now)
             if (self.publish_clone_0_at is not None and not self.clone_0_acked
                     and now >= self.publish_clone_0_at and now >= self.next_clone_0):
@@ -428,6 +513,8 @@ class Session:
                     self.announce_clone(now, cid)
                 if self.args.advance_after:
                     self.advance_at = now + self.args.advance_after
+                if self.args.lead is not None:
+                    self.lead_offer_at = now + self.args.lead
             while self.release_at and now >= self.release_at[0][0]:
                 _, cid = self.release_at.pop(0)
                 for out in self.clone.release(cid, now):
@@ -462,14 +549,29 @@ class Session:
             if self.advance_at is not None and not self.advanced and now >= self.advance_at:
                 self.advanced = True
                 self.send_offer()
+            if self.lead_offer_at is not None and now >= self.lead_offer_at:
+                self.lead_offer_at = None
+                self.send_offer()
+            if self.lead_vote_at is not None and now >= self.lead_vote_at:
+                self.lead_vote_at = None
+                self.lead_vote(now)
+            if self.lead_commit_clone_at is not None and now >= self.lead_commit_clone_at:
+                self.lead_commit_clone_at = None
+                self.lead_commit_clone(now)
+            if self.lead_commit_at is not None and now >= self.lead_commit_at:
+                self.lead_commit_at = None
+                if not self.committed:
+                    self.commit(now)
             if (self.commit_2_at is not None and not self.committed_2 and self.peer_committed
                     and now >= self.commit_2_at):
                 self.committed_2 = True
                 step = _send_step(self.trade, self.send, self.commit_kind, b"\x02\0\0\0")
                 self.publish_step()
+                keep_received(self.args, self.trade.get("peer_offer"))
+                screen.received("lgpe", self.trade.get("peer_offer"))
                 # A retail host sent its result 26.8 s after this (docs/lgpe_session.md).
-                self.result_clones_at = now + 26.5
-                self.result_at = now + 27.0
+                self.result_clones_at = now + self.args.result_after - 0.5
+                self.result_at = now + self.args.result_after
                 print(f"[lgh] game: *** COMMIT sent, 2 under step {step} *** the trade is agreed; "
                       "the animation runs on the console now")
             if (self.result_clones_at is not None and not self.result_clones_announced
@@ -479,6 +581,34 @@ class Session:
                     self.announce_clone(now, cid)
             if self.result_at is not None and now >= self.result_at:
                 self.send_result()
+            if self.partner is not None:
+                self.online_tick(now)
+
+    def online_tick(self, now):
+        """The partner's progress: their record answers the console's offer, and the A 2 goes once
+        both consoles voted (docs/online.md)."""
+        theirs = self.partner.theirs()
+        if self.committed:
+            return
+        msg = self.console_offer
+        if (msg is not None and theirs.offer is not None and self.held_vote is None
+                and (msg["step"] > self.trade.get("answered_step", 0) or theirs.offer != self.sent_remote)):
+            if not pb7.valid(theirs.offer):
+                return
+            self.trade["answered_step"] = max(self.trade.get("answered_step", 0), msg["step"])
+            self.trade["mid_trade"] = TRADE_IN_PROGRESS["offer"] = True
+            self.sent_remote = theirs.offer
+            step = _send_step(self.trade, self.send, self.offer_kind, theirs.offer)
+            self.publish_step()
+            print(f"[lgh] offer: *** SENT the partner's {len(theirs.offer)} B step {step} *** "
+                  f"(answering the console's step {msg['step']})")
+        cid = self.held_vote
+        if cid is not None and theirs.accepted and theirs.offer == self.sent_remote:
+            self.held_vote = None
+            agreed = b"\x01\0\0\0" + b"\x02\0\0\0" * 2
+            self.drive += [(now, cid, agreed, 1), (now + self.args.drive_delay, cid, agreed, 2)]
+            self.drive.sort(key=lambda step: step[0])
+            print(f"[lgh] clone: both consoles confirmed; driving clone {cid} to A 2")
 
     def announce_clone_0(self, now):
         """Announced with a1 + b1, published only once the joiner answers the pair."""
@@ -510,13 +640,21 @@ class Session:
 
     def next_round(self, result_step):
         self.round += 1
-        self.args.offer = self.args.next_offer
+        if self.partner is not None:
+            self.console_offer = self.sent_remote = self.held_vote = None
+        else:
+            self.args.offer = self.args.next_offer[self.round - 1]
+            show_offer(self.args.offer)
+        self.args.received = pokemon_service.trade_path(self.received, self.round + 1)
         self.trade["answered_step"] = result_step
         self.commit_clone = None
         self.committed = self.peer_committed = self.committed_2 = False
         self.commit_2_at = None
         self.result_clones_at = self.result_at = None
         self.result_clones_announced = self.result_sent = False
+        self.led = False
+        if self.args.lead is not None:
+            self.lead_offer_at = time.monotonic() + self.args.lead
         print(f"[lgh] game: round {self.round + 1} ready; offers kind {self.offer_kind}, "
               f"commits kind {self.commit_kind}, party clones "
               f"{2 + self.round * (self.args.party_clones + 1)} and "
@@ -532,16 +670,50 @@ class Session:
             print(f"[lgh] game: {self.args.offer} is {len(raw)} bytes, not {pb7.BOX_SIZE}")
             return
         body = raw if pb7.valid(raw) else pb7.encrypt(raw)
-        TRADE_IN_PROGRESS["offer"] = True
-        step = _send_step(self.trade, self.send, pb7.OFFER_MESSAGE, body)
+        self.trade["mid_trade"] = TRADE_IN_PROGRESS["offer"] = True
+        self.led = True
+        step = _send_step(self.trade, self.send, self.offer_kind, body)
         print(f"[lgh] offer: *** SENT {len(body)} B step {step} *** {self.args.offer}, unprompted")
         self.publish_step()
+
+    @property
+    def offered_clone(self):
+        """The last party clone of this round, the one a console host votes on (clones 3 and 6
+        on retail, docs/lgpe_session.md)."""
+        return (self.round + 1) * (self.args.party_clones + 1)
+
+    def lead_vote(self, now):
+        """--lead: the vote a console host's player gives, as the authority walks it: 1 1 1, then
+        trailing word 1, then 1 2 2 and trailing word 2 (docs/lgpe_session.md)."""
+        cid = self.offered_clone
+        ones, agreed = b"\x01\0\0\0" * 3, b"\x01\0\0\0" + b"\x02\0\0\0" * 2
+        delay = self.args.drive_delay
+        self.drive = [(now, cid, ones, 0), (now + 0.066, cid, ones, 1),
+                      (now + delay, cid, agreed, 1), (now + delay + 0.046, cid, agreed, 2)]
+        self.lead_commit_clone_at = now + delay + self.args.lead
+        print(f"[lgh] lead: voting on clone {cid}")
+
+    def lead_commit_clone(self, now):
+        """--lead: the sync save announces the commit clone, votes 1 on it and commits, 152 ms
+        from announcement to commit on a retail host (docs/lgpe_session.md)."""
+        cid = self.commit_clone = self.offered_clone + 1
+        self.announce_clone(now, cid)
+        ones = b"\x01\0\0\0" * 3
+        self.drive = [(now + 0.086, cid, ones, 0), (now + 0.13, cid, ones, 1)]
+        self.lead_commit_at = now + 0.152
+        print(f"[lgh] lead: commit clone {cid}")
 
     def send_result(self):
         """The next offer channel, once after this round's animation (docs/lgpe_session.md)."""
         if self.result_sent or not self.committed_2:
             return
         self.result_sent = True
+        if self.partner is not None and self.sent_remote is not None:
+            # The next trade's first slot: the record just traded, as a station's own (docs/lgpe_session.md).
+            step = _send_step(self.trade, self.send, self.result_kind, self.sent_remote)
+            self.publish_step()
+            print(f"[lgh] game: *** RESULT sent, step {step} *** the partner's record")
+            return
         if not self.args.offer or self.args.offer == "echo":
             print("[lgh] game: no --offer structure to send as the result")
             return
@@ -648,14 +820,21 @@ class Session:
             print("[lgh] game: not a trade message")
             return
         print(f"[lgh] game: kind {msg['kind']} step {msg['step']} body {msg['size']} B")
+        if msg["kind"] == pb7.FIRST_MESSAGE:
+            # The console's save, for a gift made for it (pokeldn.receiver_gift).
+            receiver_gift.hear(self.partner, pb7.first_trainer, msg["body"])
         if msg["kind"] == pb7.FIRST_MESSAGE and self.args.first and not self.trade.get("first"):
             self.trade["first"] = True
             body = (pb7.build_message(msg["kind"], msg["body"]) if self.args.first == "echo"
                     else Path(self.args.first).read_bytes())
             first = pb7.parse_message(body)
-            if first and self.args.our_trainer:
-                tid, sid = (int(v, 0) for v in self.args.our_trainer.split(":"))
-                body = pb7.build_message(first["kind"], pb7.set_trainer_id(first["body"], tid, sid))
+            if first:
+                inner = pb7.set_trainer_name(first["body"], self.args.trainer_name)
+                if self.args.our_trainer:
+                    tid, sid = (int(v, 0) for v in self.args.our_trainer.split(":"))
+                    inner = pb7.set_trainer_id(inner, tid, sid)
+                body = pb7.build_message(first["kind"], inner)
+                first = pb7.parse_message(body)
             self.send(self.window.send(body), reliable3.PROTOCOL)
             self.trade["step"] = 1
             self.publish_step()
@@ -666,6 +845,24 @@ class Session:
                 self.extra_first = (first["body"] if first else body[16:],
                                     time.monotonic() + 0.3, self.args.first_copies - 1)
             self.party_clones_at = time.monotonic() + self.args.party_clones_delay
+        elif msg["kind"] == self.offer_kind and self.led:
+            # The answer to our own unprompted offer: kept, never answered, or the two stations
+            # answer each other without end.
+            self.led = False
+            self.trade["answered_step"] = max(self.trade.get("answered_step", 0), msg["step"])
+            self.trade["done"] = False
+            if pb7.valid(msg["body"]):
+                self.trade["peer_offer"] = msg["body"]
+            print(f"[lgh] offer: the peer answered ours under step {msg['step']}")
+            if self.args.lead is not None:
+                self.lead_vote_at = time.monotonic() + self.args.lead
+            self.publish_step()
+        elif msg["kind"] == self.offer_kind and self.partner is not None:
+            if msg["step"] > self.trade.get("answered_step", 0) and pb7.valid(msg["body"]):
+                self.console_offer = msg
+                self.trade["peer_offer"] = msg["body"]
+                self.trade["done"] = False
+                self.partner.offer(msg["body"])
         elif msg["kind"] == self.offer_kind:
             before = self.trade.get("answered_step", 0)
             _answer_offer(self.args, self.trade, msg, self.send, tag="[lgh]",
@@ -679,6 +876,8 @@ class Session:
             print(f"[lgh] game: the console's commit carries {value}")
             if value == 1:
                 self.peer_committed = True
+            elif value == 2:   # the console sent the 2: that commits the trade on its side
+                keep_received(self.args, self.trade.get("peer_offer"))
         elif msg["kind"] == self.result_kind:
             if self.trade.get("done"):
                 print(f"[lgh] game: kind {self.result_kind} after the completed trade; "
@@ -688,10 +887,14 @@ class Session:
                 return
             self.trade["done"] = True
             show_done()
-            TRADE_IN_PROGRESS["offer"] = TRADE_IN_PROGRESS["commit"] = False
+            screen.arrived()
+            TRADE_IN_PROGRESS["offer"] = TRADE_IN_PROGRESS["commit"] = self.trade["mid_trade"] = False
             print("[lgh] game: *** THE RESULT *** the trade has gone through on the console")
             self.send_result()
-            if self.round == 0 and self.args.next_offer:
+            if self.partner is not None:
+                self.partner.done()
+                self.next_round(msg["step"])
+            elif self.round < len(self.args.next_offer):
                 self.next_round(msg["step"])
 
     def new_clone(self):
@@ -709,6 +912,7 @@ class Session:
         # A retail station answers every clone type 2 publish with its own copy, about ten a second
         # for the whole session (docs/lgpe_session.md).
         self.clone.publish_once = False
+        self.clone.withhold_announces = self.args.withhold_announce
 
     def clone_step(self, pl, now):
         kind = pl[1] if len(pl) > 1 else -1
@@ -726,7 +930,11 @@ class Session:
                 and self.publish_clone_0_at is None:
             # A 0x91 here is what a console gave when the pair reached it before its own a1.
             c = clone.parse_command(pl)
-            if c and (c["ctype"], c["station"], c["clone_id"]) == (3, 0xFD, 0):
+            if c and (c["ctype"], c["station"], c["clone_id"]) == (3, 0xFD, 0) \
+                    and self.args.ignore_clone0_answer and self.clone_0_resends == 0:
+                # Test only: as if the answers were lost, so the console gets the pair twice.
+                print(f"[lgh] clone: ignored the console's {kind:#04x} to the clone 0 pair")
+            elif c and (c["ctype"], c["station"], c["clone_id"]) == (3, 0xFD, 0):
                 self.publish_clone_0_at = now + 0.03
                 print(f"[lgh] clone: the console answered the clone 0 pair with {kind:#04x}")
         elif kind == clone.EXIT_REQUEST:
@@ -747,7 +955,12 @@ class Session:
             ones = b"\x01\0\0\0" * 3
             self.drive = [(now + 0.03, d["clone_id"], ones, 1)]
             offer_clone_start = 2 + self.round * (self.args.party_clones + 1)
-            if offer_clone_start <= d["clone_id"] < offer_clone_start + self.args.party_clones:
+            if (self.partner is not None
+                    and offer_clone_start <= d["clone_id"] < offer_clone_start + self.args.party_clones):
+                # The console's 1 1 1 is its player's confirmation; A 2 waits for the partner's.
+                self.held_vote = d["clone_id"]
+                self.partner.accept()
+            elif offer_clone_start <= d["clone_id"] < offer_clone_start + self.args.party_clones:
                 self.drive += [(now + self.args.drive_delay, d["clone_id"],
                                 b"\x01\0\0\0" + b"\x02\0\0\0" * 2, 1),
                                (now + 2 * self.args.drive_delay, d["clone_id"],
@@ -762,7 +975,7 @@ class Session:
                and d["ctype"] == 2 and d["record"] else b"")
         cid = d["clone_id"] if rec else None
         if (len(rec) >= 20 and rec[:4] == b"\x02\0\0\0" and cid in self.clone.flags
-                and self.withdrawn.get(cid) != rec[8:12]):
+                and self.withdrawn.get(cid) != rec[8:12] and not self.args.agree_withdrawn_vote):
             agreed = self.clone.type4_data(cid)[:4]
             if rec[4:8] != agreed:
                 self.withdrawn[cid] = rec[8:12]
@@ -777,6 +990,9 @@ class Session:
                 self.drive.append((now + 0.03, cid, self.clone.flags[cid],
                                    (self.clone.tail.get(cid) or 0) + 1, hold))
                 self.drive.sort(key=lambda step: step[0])
+                if self.partner is not None and self.held_vote == cid:
+                    self.held_vote = None
+                    self.partner.unaccept()
                 print(f"[lgh] clone: the console withdrew its vote {int.from_bytes(rec[4:8], 'little')}"
                       f" on clone {cid} (counter {int.from_bytes(rec[8:12], 'little')}); "
                       f"holding {int.from_bytes(agreed, 'little')}")
@@ -808,27 +1024,34 @@ class Session:
             arg = int.from_bytes(d["record"]["data"][4:8], "little")
             print(f"[lgh] clone: the console's state 4 on clone {d['clone_id']}, argument {arg}; "
                   "acknowledging")
+            if self.partner is not None and not self.committed:
+                self.held_vote = self.console_offer = None
+                self.partner.withdraw()
         # docs/lgpe_session.md: the commit follows the peer's zero first word in one frame.
         if (d and d["type"] == clone.STATE_DATA and d["ctype"] == 2
                 and d["clone_id"] == self.commit_clone and d["record"]
                 and d["record"].get("data", b"")[:4] == bytes(4)
                 and self.clone.tail.get(self.commit_clone) == 1 and not self.committed):
-            self.committed = True
-            self.drive = []
-            for cid, flags in list(self.clone.flags.items()):
-                self.clone.flags[cid] = bytes(4) + flags[4:12]
-            TRADE_IN_PROGRESS["commit"] = True
-            self.trade["step"] = self.trade.get("step", 1) + 1
-            self.publish_step()
-            self.send(self.window.send(pb7.build_message(self.commit_kind, b"\x01\0\0\0",
-                                                         step=self.trade["step"])),
-                      reliable3.PROTOCOL)
-            self.commit_2_at = now + 0.065
-            print(f"[lgh] game: *** COMMIT sent, 1 under step {self.trade['step']} ***")
+            self.commit(now)
         if d and d["type"] == clone.STATE_ACK and d["clone_id"] == 0 \
                 and not self.clone_0_acked:
             self.clone_0_acked = True
             print("[lgh] clone: the console acknowledged our clone 0")
+
+    def commit(self, now):
+        """0 in every clone's first word and the kind 3 carrying 1, in one frame."""
+        self.committed = True
+        self.drive = []
+        for cid, flags in list(self.clone.flags.items()):
+            self.clone.flags[cid] = bytes(4) + flags[4:12]
+        TRADE_IN_PROGRESS["commit"] = True
+        self.trade["step"] = self.trade.get("step", 1) + 1
+        self.publish_step()
+        self.send(self.window.send(pb7.build_message(self.commit_kind, b"\x01\0\0\0",
+                                                     step=self.trade["step"])),
+                  reliable3.PROTOCOL)
+        self.commit_2_at = now + 0.065
+        print(f"[lgh] game: *** COMMIT sent, 1 under step {self.trade['step']} ***")
 
     def station(self, pl):
         kind = pl[0]
@@ -882,20 +1105,20 @@ class Session:
                   "starting the clone protocol")
             self.broadcast_mesh()
         elif pl[0] == 0 and len(pl) >= reliable3.HEADER_SIZE:
-            # The leave request rides the reliable port and is owed that ack and a leave response;
-            # unanswered, a console repeats it every 40 ms for 5 s, then disconnects the station.
+            # The leave request rides the reliable port and is owed that ack and `08 <host index>`:
+            # the leaver's handler 0x591bf4 drops any other index and waits out its 5000 ms
+            # (0x589490) before it deauthenticates (docs/lgpe_session.md, A joiner leaving).
             r = reliable3.parse(pl)
             if r and r["size"] and r["payload"][0] == mp.LEAVE_REQUEST and not self.peer_left:
                 self.peer_left = True
-                TRADE_IN_PROGRESS["offer"] = TRADE_IN_PROGRESS["commit"] = False
+                TRADE_IN_PROGRESS["offer"] = TRADE_IN_PROGRESS["commit"] = self.trade["mid_trade"] = False
                 self.send(reliable3.build_ack(r["sequence"] + 1), mp.PROTOCOL, port=1)
-                self.send(bytes([mp.LEAVE_RESPONSE, r["payload"][1]]), mp.PROTOCOL,
-                          destination=0, kind="leave_response")
+                for _ in range(2):
+                    self.send(mp.build_leave_response(HOST_INDEX), mp.PROTOCOL,
+                              destination=0, kind="leave_response")
                 self.peer_location = None
                 self.joined = False
                 self.broadcast_mesh()
-                # Under test: the console waited 5 s after the leave response and then disconnected
-                # itself; our own disconnection request may be what it waits for.
                 self.send(bytes([DISCONNECTION_REQUEST]), station9.PROTOCOL, destination=0)
                 print(f"[lgh] *** THE CONSOLE LEFT THE MESH *** station {r['payload'][1]}; "
                       "answered its leave request and asked it to disconnect")

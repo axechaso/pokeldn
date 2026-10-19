@@ -22,10 +22,10 @@ class HostSession:
                  offered_slots=None, trades=1, link_player=None,
                  anim_delay=None, trust_pia=True, log=lambda *a: None,
                  reliable_kwargs=None, rfu_kwargs=None,
-                 player_ids_repeat_frames=None, link_player_idle_frames=None,
+                 player_ids_repeat_frames=None, link_player_idle_frames=None, save_rounds=None,
                  union_room=False, union_room_chat=False, chat_messages=None,
                  union_room_battle=False, battle_forfeit=True, battle_move_slot=0,
-                 colosseum=False):
+                 colosseum=False, partner=None):
         if plan is not None:
             trade_slot = plan.trade_slot
             offered_slots = plan.offered_slots
@@ -36,6 +36,8 @@ class HostSession:
                 player_ids_repeat_frames = plan.player_ids_repeat_frames
             if link_player_idle_frames is None:
                 link_player_idle_frames = plan.link_player_idle_frames
+            if save_rounds is None:
+                save_rounds = plan.save_rounds
         self.reliable = reliable.HostReliableSession(retransmit_limit=HOST_RTX_LIMIT, **(reliable_kwargs or {}))
         self.rfu = RFULeader(**(rfu_kwargs or {}))
         if engine is not None:
@@ -48,6 +50,8 @@ class HostSession:
                 overrides["player_ids_repeat_frames"] = player_ids_repeat_frames
             if link_player_idle_frames is not None:
                 overrides["link_player_idle_frames"] = link_player_idle_frames
+            if save_rounds is not None:
+                overrides["save_barrier_rounds"] = save_rounds
             timing = replace(DEFAULT_HOST_TRADE_TIMING, **overrides) if overrides else None
             self.activity = HostTradeEngine(
                 party, trade_slot=trade_slot, offered_slots=offered_slots, trades=trades,
@@ -57,7 +61,7 @@ class HostSession:
                 union_room_chat=union_room_chat, chat_messages=chat_messages,
                 union_room_battle=union_room_battle, battle_forfeit=battle_forfeit,
                 battle_move_slot=battle_move_slot, colosseum=colosseum,
-                log=log)
+                log=log, partner=partner)
         else:
             raise ValueError("HostSession needs either a party or an activity engine")
         self.log = log

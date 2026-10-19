@@ -27,7 +27,8 @@ from pokeldn.frlg.link import trade_runtime  # noqa: E402
 from pokeldn.frlg.rom import buffer_script, builds, native_script  # noqa: E402
 from pokeldn.frlg.text import easychat  # noqa: E402
 from pokeldn.frlg.gift.host_mg_app import (  # noqa: E402
-    BufferScriptHostApplication, MysteryGiftHostApplication, WonderNewsHostApplication)
+    BufferScriptHostApplication, MysteryGiftHostApplication, SaveTransferHostApplication,
+    WonderNewsHostApplication)
 from pokeldn.frlg.gift import wonder_card_events  # noqa: E402
 from pokeldn.frlg.gift.wonder_card import GIFT_BEAST_CUTSCENE  # noqa: E402
 from pokeldn.ldn import ldn_mitm_host, transport  # noqa: E402
@@ -65,6 +66,20 @@ def build_parser(file_config=None, *, shared_path=None, local_path=None):
         "--gift", choices=gift_registry.GIFT_REGISTRY.live_choices,
         default=GIFT_BEAST_CUTSCENE,
         help=gift_registry.GIFT_REGISTRY.format_live_gift_help())
+    payload_group.add_argument("--gift-file", help="a complete FRLG .pokegift file, or a .wc3 Wonder Card")
+    parser.add_argument("--export-gift", metavar="FILE",
+                        help="save a .pokegift file and exit without using the radio")
+    payload_group.add_argument(
+        "--save-backup", metavar="FILE",
+        help=("copy the console's whole 128 KB save into FILE (.sav); the console's save is not "
+              "changed [docs/frlg_gift.md, Save backup and restore]"))
+    payload_group.add_argument(
+        "--save-restore", metavar="FILE",
+        help=("write the .sav FILE onto the console: beside its newest save, every sector read "
+              "back, then the game loads it and saves; anything short of that keeps the old save"))
+    parser.add_argument(
+        "--save-resume-dir", metavar="DIR",
+        help="with --save-backup: keep a backup the link cut short here; the next one goes on from it")
     payload_group.add_argument(
         "--news", nargs="?", const=wonder_news.DEFAULT_NEWS, default=None,
         choices=wonder_news.news_choices(), metavar="NAME",
@@ -235,7 +250,7 @@ def build_parser(file_config=None, *, shared_path=None, local_path=None):
               "function that returns nothing, such as SeedRng, this is the only evidence the call "
               "did what it was called for" % (builds.BPRF.rng, builds.BPRE.rng)))
     parser.add_argument(
-        "--expect-console", choices=("firered", "leafgreen"), default=None,
+        "--expect-console", choices=("firered", "leafgreen", "emerald"), default=None,
         help=("refuse the session unless the console that joins is this cartridge, checked "
               "against the version in its game data. Nothing is sent on a mismatch"))
     parser.add_argument(
@@ -422,6 +437,12 @@ def build_parser(file_config=None, *, shared_path=None, local_path=None):
               "screen shows."
               % (wonder_card_events.GIFT_RNG_MON_HUNT, ", ".join(native_script.IV_FIELDS))))
     parser.add_argument(
+        "--event-pokemon", metavar="NAME", default=None,
+        help=("with --gift %s: a fresh copy of a Gen 3 distribution, made by PKHeX by that event's\n"
+              "own PID/IV method, e.g. \"WISHMKR Jirachi\", \"10 ANIV Pikachu\", \"Aura Mew\". The\n"
+              "release in --language is preferred. Without it the card sends a stored WISHMKR Jirachi."
+              % wonder_card_events.GIFT_EVENT_POKEMON))
+    parser.add_argument(
         "--hunt-cap", type=lambda v: int(v, 0), default=None, metavar="N",
         help=("with --gift %s: how many states the stub may try before giving up and leaving the\n"
               "rng alone. The default is the smallest cap that finds one %d times in 100."
@@ -550,6 +571,21 @@ def _hunt_asked(args):
                                                args.ram_script_object))
 
 
+def _event_definition(parser, args):
+    """-> the event Pokemon card for --event-pokemon NAME, made now so a bad name fails here."""
+    if args.event_pokemon is None:
+        return None
+    if args.gift != wonder_card_events.GIFT_EVENT_POKEMON:
+        parser.error(f"--event-pokemon belongs to --gift {wonder_card_events.GIFT_EVENT_POKEMON}")
+    from pokeldn.pokemon import SERVICE, BuilderError
+    try:
+        pk3, summary = SERVICE.event(args.event_pokemon, configmod.LANGUAGES.get(args.language, 0))
+    except BuilderError as exc:
+        parser.error(str(exc))
+    print(f"event Pokemon: {summary}")
+    return wonder_card_events.build_event_pokemon_gift(pk3, name=args.event_pokemon)
+
+
 def _hunt_definition(parser, args):
     """-> the card the command line asked for, composed, or None to send the registered one.
     The cost is printed before anything is on the air [native_script.search_cost]."""
@@ -588,8 +624,30 @@ def _hunt_definition(parser, args):
 
 def build_run_config(parser, args):
     profile, ldn, role = host_cli.build_host_config(parser, args)
+    emerald = args.version == "emerald" or args.expect_console == "emerald"
+    if args.version in ("ruby", "sapphire"):
+        parser.error("Ruby and Sapphire have no Mystery Gift menu, only the e-Reader's Mystery "
+                     "Event (docs/rse.md)")
+    if emerald and not args.gift_file:
+        parser.error("an Emerald console takes a gift file made for Emerald, --gift-file; the "
+                     "presets, news and console code are FireRed's (docs/rse.md, Mystery Gift)")
     try:
-        if args.news is not None:
+        if args.gift_file and emerald:
+            from pokeldn import gifts
+            from pokeldn.rse.gifts import EmeraldPayload
+            payload = EmeraldPayload(gifts.load(args.gift_file, game="rse"), dump_file=args.dump_file)
+        elif args.gift_file:
+            from pokeldn import gifts
+            from pokeldn.frlg.gift.file import FilePayload
+            payload_prefixes = ("dump_", "create_mon_", "write_", "flash_", "scan_", "sum_",
+                                "table_", "trace_", "call_", "chain_", "svc_", "resident", "hunt_")
+            overrides = any(value != parser.get_default(key) for key, value in vars(args).items()
+                            if key != "dump_file" and (key.startswith(payload_prefixes)
+                            or key in ("questionnaire", "denied_message", "news_id")))
+            if overrides or getattr(args, "_flag_id_explicit", False):
+                parser.error("A gift file already defines its card, scripts and options; use it without payload overrides")
+            payload = FilePayload(gifts.load(args.gift_file, game="frlg"), dump_file=args.dump_file)
+        elif args.news is not None:
             if args.questionnaire is not None:
                 parser.error(
                     "--questionnaire gates a Wonder Card session; the News server script has no "
@@ -760,7 +818,7 @@ def build_run_config(parser, args):
             payload = configmod.MysteryGiftPayload(
                 gift=args.gift, flag_id=gift_registry.resolve_flag_id(args),
                 questionnaire=phrase, denied_message=args.denied_message,
-                definition=_hunt_definition(parser, args))
+                definition=_event_definition(parser, args) or _hunt_definition(parser, args))
         return configmod.MysteryGiftRunConfig(
             profile=profile, ldn=ldn, role=role,
             payload=payload, expect_console=args.expect_console,
@@ -774,8 +832,44 @@ def build_run_config(parser, args):
             idle_timeout_seconds=args.idle_timeout,
             attempt_log_dir=args.attempt_log_dir,
             game_data_log=args.game_data_log)
-    except ValueError as exc:
+    except (OSError, ValueError) as exc:
         parser.error(str(exc))
+
+
+def _transport(parser, args):
+    factory = transport.HostTransport
+    if args.over_ip:
+        our_ip = None if args.over_ip == "auto" else args.over_ip
+        factory = functools.partial(ldn_mitm_host.IpHostTransport, our_ip=our_ip)
+        # functools.partial hides the class attribute the phy resolution reads.
+        factory.NEEDS_RADIO = False
+    elif needs_root():
+        parser.error("live LDN hosting requires root; run with sudo -E")
+    return factory
+
+
+def _save_session(parser, args, config):
+    if args.export_gift:
+        parser.error("--export-gift saves a gift; a save session sends none")
+    if args.save_restore:
+        from pokeldn.frlg.save import sav
+        try:
+            with open(args.save_restore, "rb") as handle:
+                summary = sav.describe(handle.read())
+        except (OSError, sav.SaveError) as exc:
+            parser.error(f"--save-restore: {exc}")
+        if not summary.sound:
+            parser.error("--save-restore: the save has no whole copy of a game in it")
+    app = SaveTransferHostApplication(
+        config, backup=args.save_backup, restore=args.save_restore,
+        resume_dir=args.save_resume_dir, transport_factory=_transport(parser, args),
+        log=trade_runtime.ConsoleLog(args.verbose))
+    app.run()
+    if app.interrupted:
+        return 130
+    if app.idle_timed_out:
+        return 124
+    return 0 if app.delivery_succeeded else 1
 
 
 def main(argv=None):
@@ -792,17 +886,34 @@ def main(argv=None):
         host_cli.build_host_config(parser, args)
         print(host_cli.format_effective_config(args), end="")
         return 0
-    if not args.live:
+    if not args.live and not args.export_gift:
         parser.error("hosting only supports live mode; omit --no-live")
+    if args.save_resume_dir and not args.save_backup:
+        parser.error("--save-resume-dir goes with --save-backup")
     config = build_run_config(parser, args)
+    if args.save_backup or args.save_restore:
+        return _save_session(parser, args, config)
     try:
         plan = configmod.plan_builds(config.payload, config.console_build, config.console_version)
     except ValueError as exc:
         parser.error(str(exc))
+    if args.export_gift:
+        from pokeldn import gifts
+        from pokeldn.frlg.gift.file import from_payload
+        try:
+            gift = (config.payload.file if hasattr(config.payload, "distribution") else
+                    from_payload(config.payload, console_build=config.console_build,
+                                 version=config.console_version))
+            gifts.save(args.export_gift, gift,
+                       build=None if config.console_build == "auto" else config.console_build)
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
+        print(f"Saved {args.export_gift}: {gift.summary}")
+        return 0
     distribution = None
-    if args.make_artifact and args.news is not None:
+    if args.make_artifact and plan.distribution.is_news:
         parser.error("--make-artifact disassembles a delivery RAM script; Wonder News has none")
-    if args.make_artifact and args.buffer_script is not None:
+    if args.make_artifact and plan.distribution.buffer_code is not None:
         parser.error(
             "--make-artifact disassembles a delivery RAM script; a buffer script has none")
     if args.make_artifact:
@@ -811,8 +922,8 @@ def main(argv=None):
                          "build; name it with --console-build")
         distribution = plan.distribution
         # --hunt-* composes its own definition; the registry holds the default one.
-        definition = (config.payload.definition
-                      or gift_registry.GIFT_REGISTRY.entry(args.gift).definition)
+        definition = (config.payload.definition or
+                      (gift_registry.GIFT_REGISTRY.entry(args.gift).definition if not args.gift_file else None))
         try:
             artifact_path = gift_artifact.write_artifact(
                 args.artifact_dir, gift=args.gift, flag_id=config.payload.flag_id,
@@ -820,16 +931,9 @@ def main(argv=None):
         except OSError as exc:
             parser.error(f"could not write --artifact-dir {args.artifact_dir!r}: {exc}")
         print(f"wrote Mystery Gift artifact: {artifact_path}")
-    factory = transport.HostTransport
-    if args.over_ip:
-        our_ip = None if args.over_ip == "auto" else args.over_ip
-        factory = functools.partial(ldn_mitm_host.IpHostTransport, our_ip=our_ip)
-        # functools.partial hides the class attribute the phy resolution reads.
-        factory.NEEDS_RADIO = False
-    elif needs_root():
-        parser.error("live LDN hosting requires root; run with sudo -E")
-    application = (WonderNewsHostApplication if args.news is not None
-                   else BufferScriptHostApplication if args.buffer_script is not None
+    factory = _transport(parser, args)
+    application = (WonderNewsHostApplication if plan.distribution.is_news
+                   else BufferScriptHostApplication if plan.distribution.buffer_code is not None
                    else MysteryGiftHostApplication)
     app = application(
         config, plan=plan, transport_factory=factory,

@@ -27,6 +27,7 @@ from pokeldn.gba import barrier as lsmod_barrier  # noqa: E402
 from pokeldn.ldn import pia_connect  # noqa: E402
 from pokeldn.frlg.link import trade_runtime as runtime  # noqa: E402
 from pokeldn.ldn import show_done  # noqa: E402
+from pokeldn.app import screen  # noqa: E402
 
 
 def make_engine(run_config, lg, *, default_anim_delay=None):
@@ -75,6 +76,7 @@ def _live_connect(run_config, lg):
         local_comm_id=ldn.local_comm_id, phyname=ldn.phy, log=lg, beacon_debug=beacon.diagnose).start()
     pc = cryptomod.PiaCrypto(t.ssid)
     engine = make_engine(run_config, lg)
+    runtime.show_offer(engine)
     # The sim must not emit trade traffic or sit until the host confirms the Pia connection
     # (Net 0x11->0x12, Session join) [pokeldn/ldn/pia_connect.py].
     if not t.our_mac or not t.host_mac:
@@ -122,6 +124,7 @@ class _LiveJoiner:
         self.announced_entry = self.announced_menu = False
         self.announced_established = False
         self.saved_commits = 0  # saved at commit, not only at run end
+        self.shown_anims = 0
         self.connect_ticks = 0
         self.ni_wait_ticks = 0
         self.entry_ticks = 0
@@ -166,9 +169,13 @@ class _LiveJoiner:
     def save_at_commit(self):
         # The post-trade tail can stall or be interrupted; the mon is already valid.
         engine, lg = self.engine, self.lg
+        if engine.anim_starts > self.shown_anims:
+            self.shown_anims = engine.anim_starts
+            runtime.show_trade_started(engine)
         if engine.commits > self.saved_commits:
             self.saved_commits = engine.commits
             show_done()
+            runtime.show_received(engine)
             try:
                 n = save_received(engine, self.run_config, lg)
                 lg(f"[live] trade committed -> saved {n} received mon(s) to disk now "
@@ -343,6 +350,7 @@ def run_live(run_config, lg):
             _paced_sleep(s, period)
     finally:
         signal.signal(signal.SIGINT, old_sigint)
+        screen.drain()
         s.close()
         t.stop()
         lg.info("Link closed.")

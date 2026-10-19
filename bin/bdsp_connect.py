@@ -16,6 +16,8 @@ import trio, ldn
 from pokeldn.host_support import open_output
 from pokeldn import pokemon as pokemon_service
 from pokeldn.bdsp import COMM_ID, PASSPHRASE, PIA_PORT, pokemon, room, session_keys
+from pokeldn.bdsp.host import player_info
+from pokeldn.bdsp.session import answer_departure
 from pokeldn.ldn import (local_protocol as lp, mesh_protocol as mp, reliable5 as rl,
                         rtt_protocol as rtt, station_protocol as stp)
 from pokeldn.ldn.pia5 import (PiaHeader5, is_pia5, ciphertext, gcm_iv, ldn_nonce_crc,
@@ -26,6 +28,7 @@ from pokeldn.ldn.transport import board_radio, find_ap_phy
 UNRELIABLE_PROTOCOL = 0x68  # its payload is the game's live state
 from pokeldn.host_support import resolve_keys, needs_root
 from pokeldn.ldn import show_done
+from pokeldn.app import screen
 
 
 def cleanup():
@@ -38,7 +41,7 @@ def cleanup():
 
 
 def make_socket(ifname):
-    from pokeldn.ldn import userspace_ip  # no kernel interface (ESP32 on macOS)
+    from pokeldn.ldn import userspace_ip  # no kernel interface on the ESP32
     if (user := userspace_ip.udp_socket(ifname, PIA_PORT)) is not None:
         user.setblocking(False)
         return user
@@ -87,11 +90,15 @@ async def main_async(args):
     keys_file = ldn.load_keys(resolve_keys(args.keys))
     phy = find_ap_phy(log=print) if args.phy == "auto" else args.phy
     cleanup()
-    nets = await ldn.scan(keys_file, phyname=phy,
-                          channels=[int(c) for c in args.channels.split(",")],
-                          dwell_time=args.dwell)
     want = int(args.comm_id, 16) if args.comm_id else COMM_ID
-    net = next((n for n in nets if n.local_communication_id == want), None)
+    net = None
+    for _ in range(args.scans):
+        nets = await ldn.scan(keys_file, phyname=phy,
+                              channels=[int(c) for c in args.channels.split(",")],
+                              dwell_time=args.dwell)
+        net = next((n for n in nets if n.local_communication_id == want), None)
+        if net is not None:
+            break
     if net is None:
         print("[cx] target network not seen - is the console sitting in the room right now?")
         return 3
@@ -151,23 +158,26 @@ async def main_async(args):
               "reserve_accepted": False, "room_done": False, "their_traner": None,
               "requests_sent": 0, "requested_answers": {}, "rel_rx": rl.Reassembler(), "their_zone": None,
               "rel_repeats": 0,
-              "their_poke": None, "their_pokes": 0, "our_poke": None, "answered_with": set(), "trade_replies": 0, "check_oks": 0,
+              "their_poke": None, "their_raw": None, "their_pokes": 0, "our_pokes": [], "trades": 0, "answered_with": set(), "trade_replies": 0, "check_oks": 0,
               "their_ready_ok": None, "ready_oks_sent": 0, "their_security_state": None,
-              "our_security_state": 0, "our_next_seq": 0, "return_selects": 0}
+              "our_security_state": 0, "our_next_seq": 0, "return_selects": 0, "arriving": False,
+              "departure_answers": 0, "leaving": False, "hold_scope": None}
 
         # Build the offer before the radio is touched, so a bad template or nickname fails here.
-        if args.trade_template:
-            # No species edit: the species word alone leaves the template's gender, ability, moves
-            # and level, and the game crashes drawing such an offer. Offer a complete, legal PB8.
-            edits = {k: v for k, v in (("nickname", args.trade_nickname),
-                                       ("ot_name", args.trade_ot)) if v is not None}
-            st["our_poke"] = pokemon.build_from(
-                pathlib.Path(args.trade_template).read_bytes(), **edits)
+        # No species edit: the species word alone leaves the template's gender, ability, moves
+        # and level, and the game crashes drawing such an offer. Offer a complete, legal PB8.
+        edits = {k: v for k, v in (("nickname", args.trade_nickname),
+                                   ("ot_name", args.trade_ot)) if v is not None}
+        for n, path in enumerate(args.trade_template, start=1):
+            poke = pokemon.build_from(pathlib.Path(path).read_bytes(), **edits)
             if args.fresh_pid:
-                st["our_poke"] = pokemon.fresh(st["our_poke"])
-            offered = pokemon.read(st["our_poke"])
-            print(f"[cx] offering species {offered['species']}, {offered['nickname']!r}, "
+                poke = pokemon.fresh(poke)
+            st["our_pokes"].append(poke)
+            offered = pokemon.read(poke)
+            print(f"[cx] trade {n} offers species {offered['species']}, {offered['nickname']!r}, "
                   f"OT {offered['ot_name']!r}, IVs {offered['ivs']}, pid {offered['pid']:08x}")
+        if st["our_pokes"]:
+            screen.offer("bdsp", st["our_pokes"][0])
 
         # Read now, so a missing file fails before the console waits on us.
         answer_with = {}
@@ -229,7 +239,45 @@ async def main_async(args):
                             st["seq"] = us.sequence_id
                             print(f"[rx] t={now:6.2f} update session seq={us.sequence_id} "
                                   f"host_var={us.host_variable_id:#010x} "
-                                  f"host_constant={st['host_constant_seen']:#018x}")
+                                  f"host_constant={st['host_constant_seen']:#018x} "
+                                  f"migration state {us.host_migration_state}")
+                        if st["phase"] not in ("listen", "ack"):
+                            # A later session (a departing host's carries migration state 1) is
+                            # repeated for 10 s until acked (docs/bdsp_session.md, Leaving).
+                            sock.sendto(wrap(keys, our_mac, args.src_var, 0, next_nonce(),
+                                             lp.build_ack(us.sequence_id), lp.PROTOCOL),
+                                        (bcast, PIA_PORT))
+                            record(rec="tx_ack", t=now, seq=us.sequence_id)
+                    elif (m.protocol == lp.PROTOCOL and len(m.payload) > 1
+                          and m.payload[1] == lp.START_HOST_MIGRATION):
+                        record(rec="host_migration", t=now, payload=m.payload.hex())
+                        if args.leave_on_host_migration and not st["leaving"]:
+                            st["leaving"] = True
+                            print(f"\n[rx] t={now:6.2f} *** THE CONSOLE IS CLOSING ITS ROOM "
+                                  f"(start host migration) *** leaving the network")
+                            st["hold_scope"].cancel()
+                    elif m.protocol == mp.PROTOCOL and m.port == mp.PORT_RELIABLE:
+                        jr = (mp.parse_join_response(st["join_response"])
+                              if st["join_response"] else None)
+                        own = jr["our_index"] if jr else 1
+                        host_index = jr["host_index"] if jr else 0
+                        try:
+                            ack, answer = answer_departure(m.payload, own)
+                        except ValueError:
+                            ack = answer = None
+                        out = ([(ack, mp.PORT_RELIABLE)] if ack else []) \
+                            + [(answer, mp.PORT_UNRELIABLE)] * (2 if answer else 0)
+                        for payload, port in out:
+                            sock.sendto(wrap(keys, our_mac, args.src_var, st["dst_var"],
+                                             next_nonce(), payload, mp.PROTOCOL, port=port,
+                                             destination=1 << host_index, message_flags=0x01),
+                                        (st["dst_ip"], PIA_PORT))
+                        record(rec="mesh_reliable", t=now, payload=m.payload.hex(),
+                               answer=answer.hex() if answer else None)
+                        if answer and st["departure_answers"] == 0:
+                            print(f"\n[rx] t={now:6.2f} *** THE CONSOLE IS LEAVING *** "
+                                  f"{m.payload.hex()}, answered {answer.hex()}")
+                        st["departure_answers"] += bool(answer)
                     elif m.protocol == mp.PROTOCOL:
                         kind, name = mp.parse_message(m.payload)
                         st["replies"].append((now, st["phase"], m.payload.hex()))
@@ -306,10 +354,12 @@ async def main_async(args):
                             continue
                         body = (rl.parse_ack_payload(d["payload"]) if d["is_ack"]
                                 and len(d["payload"]) >= 2 else None)
-                        print(f"\n[rx] t={now:6.2f} *** RELIABLE seq {d['sequence_id']} "
-                              f"stream {d['stream_id']} pending {d['lowest_pending']} "
-                              f"[{'|'.join(d['flag_names'])}] {d['payload_size']} B ***")
-                        print(f"[rx]     {d['payload'].hex(' ')}\n")
+                        if args.print_packets:
+                            print(f"\n[rx] t={now:6.2f} *** RELIABLE seq {d['sequence_id']} "
+                                  f"stream {d['stream_id']} pending {d['lowest_pending']} "
+                                  f"[{'|'.join(d['flag_names'])}] {d['payload_size']} B ***")
+                        if args.print_packets:
+                            print(f"[rx]     {d['payload'].hex(' ')}\n")
                         if d["flags"] & rl.FLAG_APPLICATION_DATA:
                             st["rel_max_seq"] = max(st["rel_max_seq"], d["sequence_id"])
                             st["rel_streams"].add(d["stream_id"])
@@ -676,7 +726,8 @@ async def main_async(args):
                     deadline = trio.current_time() + args.join_wait
                     while st["state_requests"] == created and trio.current_time() < deadline:
                         await trio.sleep(0.05)
-                print(f"\n[tx]   --- now moving whatever is standing there, to the RIGHT")
+                if args.room_walk_steps:
+                    print(f"\n[tx]   --- now moving whatever is standing there, to the RIGHT")
                 for i in range(args.room_walk_steps):
                     # The console's own pace (docs/bdsp_protocol.md); a ninth of it renders as a
                     # stutter.
@@ -837,7 +888,7 @@ async def main_async(args):
             st["dst_ip"], st["dst_var"] = dst_ip, dst_var
             location = stp.station_location(our_ip, PIA_PORT, our_constant, args.src_var,
                                             our_service)
-            infos = [stp.player_info(args.name, language=args.language)]
+            infos = [player_info(args.name, args.language)]
 
             count = args.count
             if count is None:
@@ -1054,21 +1105,17 @@ async def main_async(args):
                 reply = room.build_fields(room.TRADE_POKE_CHECK_OK, 1)
                 label = "our check-ok"
             elif g["data_id"] == room.RETURN_SELECT:
-                # The post-trade question repeats every second; answer the first. It ends the
-                # security phase: a repeater still sending SEND_READYOK(5) holds the next trade in
-                # the box window (docs/bdsp_trade.md).
-                if st["our_security_state"] or st["their_security_state"] is not None:
-                    print(f"[cx]   trade complete - security phase over, repeater quiet")
-                    show_done()
-                    record(rec="security_phase_end", t=now)
+                # A reset of the round: the console's back-out, or its answer to a stray 0x21
+                # (docs/bdsp_trade.md).
                 st["our_security_state"] = 0
                 st["their_security_state"] = None
+                st["arriving"] = False
                 st["return_selects"] += 1
                 if not args.answer_return_select or st["return_selects"] > 1:
                     if st["return_selects"] == 2:
                         print(f"[cx]   NetDataReturnSelectData again - answered once, not repeating")
                     return
-                print(f"\n[rx] t={now:6.2f} *** THE POST-TRADE QUESTION - "
+                print(f"\n[rx] t={now:6.2f} *** A ROUND RESET - "
                       f"NetDataReturnSelectData {payload.hex(' ')} ***")
                 record(rec="their_return_select", t=now, payload=payload.hex(),
                        fields=g.get("fields"))
@@ -1086,6 +1133,16 @@ async def main_async(args):
                     record(rec="security_state_declined", t=now)
                     return
                 st["our_security_state"] = room.mirror_trade_state(their)
+                # this answer lands in its WAIT_READYOK; it writes its save next (docs/bdsp_trade.md)
+                if their >= room.TRADE_STATE_SEND_READYOK and not st["arriving"]:
+                    st["arriving"] = True
+                    st["trades"] += 1
+                    print(f"[cx]   trade {st['trades']} complete - the console saves next, repeater quiet")
+                    show_done()
+                    record(rec="security_phase_end", t=now)
+                    screen.received("bdsp", st["their_raw"])
+                    if st["our_pokes"]:
+                        screen.offer("bdsp", st["our_pokes"][min(st["trades"], len(st["our_pokes"]) - 1)])
                 reply = room.build_trade_ready_ok(st["our_security_state"], is_trade_ok=1)
                 st["ready_oks_sent"] += 1
                 label = (f"our state {room.TRADE_STATE_NAMES.get(st['our_security_state'])} "
@@ -1121,17 +1178,20 @@ async def main_async(args):
                       f"{theirs['nickname']!r}, OT {theirs['ot_name']!r}, "
                       f"IVs {theirs['ivs']} ***")
                 record(rec="their_poke", t=now, fields=theirs)
-                # One association carries many trades; each offer also goes to a numbered copy.
+                # One association carries many trades, each to its own file; a reselection within
+                # one trade replaces that trade's file.
+                if st["arriving"]:                 # the next round's first Pokemon
+                    st["our_security_state"], st["their_security_state"] = 0, None
+                    st["arriving"] = False
                 st["their_pokes"] += 1
-                out = pathlib.Path(args.trade_save_poke)
-                numbered = out.with_name(f"{out.stem}_{st['their_pokes']}{out.suffix}")
-                out.write_bytes(payload[room.HEADER_SIZE:])
-                numbered.write_bytes(payload[room.HEADER_SIZE:])
-                print(f"[cx]   saved their Pokemon -> {out} and {numbered}")
-                if not st["our_poke"]:
+                out = pokemon_service.trade_path(args.trade_save_poke, st["trades"] + 1)
+                pathlib.Path(out).write_bytes(payload[room.HEADER_SIZE:])
+                st["their_raw"] = payload[room.HEADER_SIZE:]
+                print(f"[cx]   saved their Pokemon -> {out}")
+                if not st["our_pokes"]:
                     print("[cx] no --trade-template, so nothing to offer back")
                     return
-                reply = room.build_trade_poke(st["our_poke"])
+                reply = room.build_trade_poke(st["our_pokes"][min(st["trades"], len(st["our_pokes"]) - 1)])
                 label = "our Pokemon"
             send_trade_message(reply, label, now)
 
@@ -1154,11 +1214,12 @@ async def main_async(args):
             record(rec="trade_reply", t=now, label=label, seq=seq, length=len(reply))
 
         async def repeat_the_security_state():
-            """Repeat our security state every second: a console leaves its wait state only on a
-            message arriving in it (`TradeParentStateModel$$StateProc`, docs/bdsp_trade.md)."""
+            """Repeat our security state every second until the console's SEND_READYOK: a CHILD
+            leaves it only on a message arriving in it (docs/bdsp_trade.md)."""
             while True:
                 await trio.sleep(args.security_repeat)
-                if st["their_security_state"] is None or not st["our_security_state"]:
+                if (not room.repeats_trade_state(st["their_security_state"])
+                        or not st["our_security_state"]):
                     continue
                 if st["their_ack_id"] < st["our_next_seq"]:
                     # Something we sent is still unacked; more would only fill the window.
@@ -1390,6 +1451,7 @@ async def main_async(args):
                     return
 
         with trio.move_on_after(args.hold) as hold_scope:
+            st["hold_scope"] = hold_scope
             async with trio.open_nursery() as nursery:
                 nursery.start_soon(stop_on_signal, hold_scope)
                 nursery.start_soon(receiver)
@@ -1462,17 +1524,21 @@ async def main_async(args):
 def build_parser():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--print-packets", action="store_true",
+                    help="print every packet in and out; the --capture file keeps them either way")
     ap.add_argument("--comm-id", default=None)
     ap.add_argument("--keys", default="~/.switch/prod.keys")
     ap.add_argument("--phy", default="auto")
     ap.add_argument("--ifname", default="ldnclient")
     ap.add_argument("--channels", default="1,6,11")
+    ap.add_argument("--scans", type=int, default=12,
+                    help="scans for the console's room before giving up; it may not exist yet")
     ap.add_argument("--dwell", type=float, default=1.5,
                     help="seconds per channel in the scan; 0.8 missed a live network twice")
-    ap.add_argument("--name", default="PkCamp")
-    ap.add_argument("--language", type=int, default=1,
-                    help="the PlayerInfo language byte; 1, 8, 9 and 10 cap the greeting's name at 6 "
-                         "characters, any other positive value at 12 (docs/bdsp_protocol.md)")
+    ap.add_argument("--name", default="POKELDN")
+    ap.add_argument("--language", type=int, default=3,
+                    help="the PlayerInfo language byte, a MsgLangId (3 is French); 1, 8, 9 and 10 cap "
+                         "the greeting's name at 6 characters, others at 12 (docs/bdsp_protocol.md)")
     ap.add_argument("--hold", type=float, default=300.0)
     ap.add_argument("--listen-first", type=float, default=5.0)
     ap.add_argument("--ack-seconds", type=float, default=6.0)
@@ -1532,32 +1598,34 @@ def build_parser():
                          "PlayerSave. The Pokemon the player picked leaves their box and ours takes "
                          "its place. Needs --trade-reply. ASK THE USER FIRST")
     ap.add_argument("--security-repeat", type=float, default=1.0, metavar="S",
-                    help="seconds between repeats of our security-phase state. The console's "
-                         "WAIT_READYOK only ends when a message ARRIVES inside it, and it enters "
-                         "that state on its own countdown, so the answer has to keep coming")
+                    help="seconds between repeats of our security-phase state, until the console "
+                         "reports SEND_READYOK. A CHILD console's SEND_READYOK only ends when a "
+                         "message arrives inside it")
     ap.add_argument("--fresh-pid", action="store_true",
                     help="offer it under a new PID and encryption constant, shiny state kept, so a "
                          "save that took it before takes it again")
-    ap.add_argument("--trade-template", metavar="FILE",
+    ap.add_argument("--trade-template", metavar="FILE", action="append", default=[],
                     help="a PB8 to offer (328 or 344 bytes, encrypted or PKHeX's decrypted export), edited by --trade-nickname and --trade-ot. 328 "
                          "bytes hold much more than this project has identified, so what we send "
                          "is a real Pokemon with named fields changed rather than one invented "
-                         "from nothing")
+                         "from nothing. Repeatable, one per trade in order; the last is offered "
+                         "again after the list")
     ap.add_argument("--trade-nickname", metavar="TEXT", help="nickname for the offered Pokemon")
     ap.add_argument("--answer-return-select", action="store_true",
-                    help="answer the NetDataReturnSelectData a completed trade ends on, ONCE. "
-                         "It is an announcement; the answer has no measured effect")
+                    help="answer the console's NetDataReturnSelectData, a round reset, ONCE; "
+                         "the answer has no measured effect")
     ap.add_argument("--return-select-value", type=int, default=0, metavar="N",
                     help="the byte to answer it with (default 0, what a console answers a {1} "
                          "with [0x1c27f48]; a {1} reads as our back-out and, past phase 2, shows "
                          "'the partner canceled the trade')")
     ap.add_argument("--trade-ot", metavar="TEXT", help="OT name for the offered Pokemon")
-    ap.add_argument("--trade-name", default="PkCamp", metavar="TEXT",
+    ap.add_argument("--trade-name", default="POKELDN", metavar="TEXT",
                     help="the name in OUR trainer record")
-    ap.add_argument("--trade-tid", type=int, default=44466, metavar="N")
-    ap.add_argument("--trade-sid", type=int, default=4080, metavar="N")
+    ap.add_argument("--trade-tid", type=int, default=41234, metavar="N")
+    ap.add_argument("--trade-sid", type=int, default=23117, metavar="N")
     ap.add_argument("--trade-save-poke", default="received.pb8", metavar="FILE",
-                    help="where to write the Pokemon the console offers")
+                    help="where to write the Pokemon the console offers; trade N > 1 writes "
+                         "FILE-N")
     ap.add_argument("--join-offset-x", type=float, default=2.0, metavar="U",
                     help="where our character spawns relative to the console's own, on x. The "
                          "default +2.0 is one fixed side, and a player standing against the wall "
@@ -1664,6 +1732,11 @@ def build_parser():
                     help="how long one connection request waits for its answer")
     ap.add_argument("--rtt", action=argparse.BooleanOptionalAction, default=True,
                     help="answer the console's RTT requests (protocol 0x58) while we hold the seat")
+    ap.add_argument("--leave-on-host-migration", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="leave the network when the console host starts host migration (Local "
+                         "Protocol 0x13), which its player leaving the room sends; a station that "
+                         "stays sees it repeated for 10 s before the console closes its network")
     ap.add_argument("--join-ack", action=argparse.BooleanOptionalAction, default=True,
                     help="ack the mesh join response, on the STATION protocol")
     ap.add_argument("--join-ack-seconds", type=float, default=8.0,
@@ -1698,13 +1771,12 @@ def build_parser():
 def main():
     ap = build_parser()
     args = ap.parse_args()
-    if args.trade_template:
-        fields = {k: v for k, v in (("nickname", args.trade_nickname), ("ot_name", args.trade_ot))
-                  if v is not None}
-        args.trade_template = pokemon_service.prepare_file("bdsp", args.trade_template,
-            fresh=args.fresh_pid, fields=fields)
-        args.trade_nickname = args.trade_ot = None
-        args.fresh_pid = False
+    fields = {k: v for k, v in (("nickname", args.trade_nickname), ("ot_name", args.trade_ot))
+              if v is not None}
+    args.trade_template = [pokemon_service.prepare_file("bdsp", path, fresh=args.fresh_pid, fields=fields)
+                           for path in args.trade_template]
+    args.trade_nickname = args.trade_ot = None
+    args.fresh_pid = False
     if needs_root():
         ap.error("must run as root")
     if args.complete_trade and not args.trade_reply:

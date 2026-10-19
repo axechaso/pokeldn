@@ -20,13 +20,13 @@ def _celebi(**kwargs):
 
 
 def test_a_built_mon_round_trips_through_the_wire_decoder():
-    mon = _celebi(moves=(93, 105), pp=(25, 20), ot_name="PkCamp")
+    mon = _celebi(moves=(93, 105), pp=(25, 20), ot_name="POKELDN")
     decoded = mon.decode()
 
     assert decoded["checksum_ok"]
     assert decoded["species"] == 251
     assert decoded["nickname"] == "CELEBI"
-    assert decoded["otName"] == "PkCamp"
+    assert decoded["otName"] == "POKELDN"
     assert decoded["level"] == 30
     assert decoded["moves"][:2] == [93, 105]
     assert len(mon.party_bytes()) == monmod.PARTY_MON_SIZE
@@ -53,6 +53,19 @@ def test_the_encryption_key_is_never_zero():
     assert mon.checksum_ok
 
 
+# A legal WISHMKR Jirachi .pk3 from PKHeX whose clear bytes also checksum-validate as wire bytes.
+CHANCE_VALID_PK3 = bytes.fromhex(
+    "e60250194b4e0000c4c3ccbbbdc2c3ff00000202d1c3cdc2c7c5cc00a9ff00009901a9009c0000000064000011015d00"
+    "9c0000000a190a0000000000000000000000000000ff0521b452f40a000000000000000005001a001a00100010000d00"
+    "0f001000")
+
+
+def test_a_pk3_that_checksums_as_wire_bytes_is_still_read_as_a_pk3():
+    assert monmod.decode_mon(CHANCE_VALID_PK3)["checksum_ok"]
+    mon = monmod.decode_mon(monmod.Mon.from_pk3(CHANCE_VALID_PK3).party_bytes())
+    assert (mon["species_name"], mon["otName"], mon["otid"] & 0xFFFF) == ("JIRACHI", "WISHMKR", 20043)
+
+
 def test_the_origins_halfword_packs_met_level_game_and_ball():
     canon = monmod.to_decrypted(_celebi(met_level=30).party_bytes())
     origins = int.from_bytes(canon[70:72], "little")
@@ -72,13 +85,13 @@ def test_a_species_with_no_base_stats_is_refused_rather_than_shipped_flat():
 
 
 def test_mail_is_the_struct_the_console_reads():
-    mail = mp.build_mail(("hello", "friend"), player_name="PkCamp", trainer_id=0x1234,
+    mail = mp.build_mail(("hello", "friend"), player_name="POKELDN", trainer_id=0x1234,
                          species=251, item_id=mp.ITEM_ORANGE_MAIL)
     assert len(mail) == mp.MAIL_SIZE
     words = [int.from_bytes(mail[i * 2:i * 2 + 2], "little") for i in range(9)]
     assert words[:2] == list(easychat.resolve_words(("hello", "friend"), 2))
     assert words[2:] == [easychat.UNDEFINED] * 7           # never 0: word 0 prints "???"
-    assert charmap.decode(mail[0x12:0x1A]) == "PkCamp"
+    assert charmap.decode(mail[0x12:0x1A]) == "POKELDN"
     assert int.from_bytes(mail[0x1A:0x1E], "little") == 0x1234
     assert int.from_bytes(mail[0x1E:0x20], "little") == 251
     assert int.from_bytes(mail[0x20:0x22], "little") == mp.ITEM_ORANGE_MAIL

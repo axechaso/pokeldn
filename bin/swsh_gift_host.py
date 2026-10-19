@@ -4,7 +4,7 @@
 The gift screen scans and never joins: the card rides the 0x180-byte advertise data, one fragment
 per advertisement.
 
-    sudo ./bin/swsh_gift_host.py --species 25 --level 25 --nickname PKCAMP --ot POKELDN
+    sudo ./bin/swsh_gift_host.py --species 25 --level 25 --nickname POKELDN --ot POKELDN
     sudo ./bin/swsh_gift_host.py --record scratchpad/card.bin --dwell 0.5
 
     (them) Mystery Gift -> Recevoir un Cadeau Mystere -> Via communication sans fil locale
@@ -18,7 +18,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from pokeldn import config, pokemon
+from pokeldn import config, gifts, pokemon
+from pokeldn.app import screen
 from pokeldn.host_support import write_file
 from pokeldn.ldn import transport
 from pokeldn.ldn.transport import HostTransport
@@ -27,7 +28,6 @@ from pokeldn.swsh import COMM_ID, PASSPHRASE, beacon, wc8
 SCENE_ID = 0            # the console's scan filter keys on the communication id, not the scene
 APP_VERSION = 4
 LDN_PROTOCOL = 1        # the retail gift screen advertises protocol 1 (AES-CTR); the GBA app uses 3
-VALIDATOR = 0x010b5de0  # the game's Wonder Card check: 0 sealed, 0x80000001 checksum (docs/swsh_gift.md)
 
 
 def build_record(args):
@@ -42,11 +42,11 @@ def build_record(args):
 
 def _base_record(args):
     if args.record:
-        rec = Path(args.record).read_bytes()
-        if len(rec) != wc8.RECORD:
-            raise SystemExit(f"{args.record} is {len(rec)} bytes, not {wc8.RECORD}")
-        return rec
-    fields = {"ot_gender": 2}            # every card a console has taken carried 2 at +0x272
+        from pokeldn.swsh.gift_file import record
+        return record(gifts.load(args.record, game="swsh"))
+    from pokeldn.swsh.gift_builder import card_gender
+    fields = {"ot_gender": 2,            # every card a console has taken carried 2 at +0x272
+              "gender": card_gender(args.species, args.form)}
     for item in args.set or ():
         name, _, value = item.partition("=")
         if name not in wc8.POKEMON:
@@ -59,24 +59,23 @@ def _base_record(args):
         region_mask=args.region_mask, ribbons=args.ribbon or (), **fields)
 
 
-def validate(record, image):
-    """-> the game's own validator's answer for `record`, run from `image` under unicorn. Covers
-    the seal only; an item id the bag cannot hold still passes."""
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                    "tools", "switch"))
-    from nso_run import SCRATCH, Runner
-    r = Runner(image)
-    card, header, rec = SCRATCH + 0x1000, SCRATCH + 0x3000, SCRATCH + 0x4000
-    r.write(card, bytes(0x3A8))
-    r.write(header, bytes(0x68))
-    r.write(rec, record)
-    return r.call(VALIDATOR, (0, card, header, rec, len(record)))[0]
+def show_card(args, record):
+    """The card on the board's screen: the gift file's name, or the Pokemon this run built, drawn
+    when the record carries one (kind 1)."""
+    off, fmt = wc8.POKEMON["species"]
+    species = (struct.unpack_from("<" + fmt, record, off)[0]
+               if record[wc8.GIFT_KIND_AT] == wc8.GIFT_KIND_POKEMON else None)
+    line = (gifts.load(args.record, game="swsh").name if args.record else
+            args.nickname or (f"Pokemon #{species}" if species else ""))
+    screen.gift("Mystery Gift", line, species=species)
 
 
 def build_parser():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--record", help="a 720-byte record to send instead of building one")
+    p.add_argument("--record", "--gift-file", dest="record",
+                   help="a .pokegift or 720-byte .wc8 record to send instead of building one")
+    p.add_argument("--export-gift", metavar="FILE", help="save a .pokegift file and exit without using the radio")
     p.add_argument("--species", type=int, default=25)
     p.add_argument("--level", type=int, default=25, help="0 makes the game roll one")
     p.add_argument("--form", type=int, default=0)
@@ -101,17 +100,13 @@ def build_parser():
     p.add_argument("--seconds", type=float, default=300)
     p.add_argument("--channel", type=int, default=None)
     p.add_argument("--phy", default="auto", help="the phy renumbers on every driver reload")
-    p.add_argument("--nickname-host", default="PkCamp", help="the network's own name")
+    p.add_argument("--nickname-host", default="POKELDN", help="the network's own name")
     p.add_argument("--keys", default=None, help="prod.keys; default from config/host.toml")
     p.add_argument("--scene-id", type=int, default=SCENE_ID)
     p.add_argument("--app-version", type=int, default=APP_VERSION)
     p.add_argument("--protocol", type=int, default=LDN_PROTOCOL, choices=(1, 3),
                    help="LDN advertisement protocol version")
     p.add_argument("--dump", help="write the record and its fragments here and exit")
-    p.add_argument("--image", default=None,
-                   help="optional research check using Sword's main NSO")
-    p.add_argument("--no-validate", action="store_true",
-                   help="skip the optional NSO check; PKHeX validation remains required")
     return p
 
 
@@ -120,23 +115,30 @@ def main(argv=None):
 
     try:
         record = build_record(args)
+        if not args.export_gift:
+            record = wc8.for_distribution(record)
         pokemon.SERVICE.validate_gift(record)
-    except (pokemon.BuilderError, ValueError, struct.error) as exc:
+    except (OSError, pokemon.BuilderError, ValueError, struct.error) as exc:
         print(str(exc), file=sys.stderr)
         return 1
+    if args.export_gift:
+        from pokeldn.swsh.gift_file import from_record
+        try:
+            gift = (gifts.load(args.record, game="swsh") if args.record and not args.patch else
+                    from_record(record, name=args.nickname or "Sword/Shield gift"))
+            gifts.save(args.export_gift, gift)
+        except (OSError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(f"Saved {args.export_gift}: {gift.summary}")
+        return 0
     fragments = beacon.build_message(record)
     print(f"record {len(record)} bytes, checksum {wc8.record_crc(record):#06x}, "
           f"{len(fragments)} fragments")
-    if args.image and not args.no_validate:
-        if not os.path.exists(args.image):
-            print(f"{args.image} is missing: the record cannot be validated; pass --image or "
-                  f"--no-validate", file=sys.stderr)
-            return 1
-        verdict = validate(record, args.image)
-        print(f"the game's validator returned {verdict:#x}")
-        if verdict != 0:
-            print("refusing to send a record the game rejects", file=sys.stderr)
-            return 1
+    if not wc8.sealed(record):
+        print("refusing to send a record whose checksum at +0x2CC does not match "
+              "(docs/swsh_gift.md, What a record must carry)", file=sys.stderr)
+        return 1
 
     if args.dump:
         write_file(args.dump, record)
@@ -154,6 +156,7 @@ def main(argv=None):
     host = make_host(args, fragments, os.path.expanduser(args.keys or machine.keys_path), phy,
                      machine)
     host.start()  # raises when the AP does not come up
+    show_card(args, record)
     print(f"advertising comm id {COMM_ID:#018x}, scene {args.scene_id}, protocol {args.protocol}, "
           f"walking {len(fragments)} fragments every {args.dwell}s")
     i = 0

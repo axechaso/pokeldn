@@ -61,12 +61,14 @@ def server_keywords(distribution):
         "questionnaire": distribution.questionnaire,
         "denied_message": distribution.denied_message,
         "buffer_code": distribution.buffer_code,
+        "buffer_lead": distribution.buffer_lead,
         "buffer_expect": distribution.buffer_expect,
         "buffer_dump_size": distribution.buffer_dump_size,
         "buffer_dump_blocks": distribution.buffer_dump_blocks,
         "buffer_dump_address": distribution.buffer_dump_address,
         "buffer_dump_addresses": distribution.buffer_dump_addresses,
         "buffer_decode": distribution.buffer_decode,
+        "game": distribution.game,
         "buffer_reference": distribution.buffer_reference,
     }
 
@@ -76,7 +78,8 @@ class HostMysteryGiftEngine:
                  link_player=None, trust_pia=True, timing=None, expect_console=None,
                  per_build=None, server=None, log=lambda *a: None):
         """`per_build` is {game code: distribution, or why none could be built}: the server
-        sends the one the console's game code names [mg_server._select_build]."""
+        sends the one the console's game code names [mg_server._select_build]. `server` replaces
+        the Mystery Gift server with another that keeps its contract [save_transfer.py]."""
         self.lp = link_player or linkplayer.LinkPlayer(
             name="EMU", version=linkplayer.VERSION_FIRE_RED)
         self.trust_pia = trust_pia
@@ -84,26 +87,25 @@ class HostMysteryGiftEngine:
         self.log = log
         self.info = getattr(log, "info", log)
         if server is not None:
-            if not isinstance(server, MysteryGiftServer):
-                raise ValueError("server must implement the MysteryGiftServer protocol")
             if any(x is not None for x in (card, ram_script, distribution, per_build, expect_console)):
                 raise ValueError("pass either a server or distribution configuration")
-            server_extras = {}
-        elif distribution is not None:
-            if card is not None or ram_script is not None:
-                raise ValueError("pass either distribution or card/ram_script")
-            server_extras = server_keywords(distribution)
-            card, ram_script = server_extras.pop("card"), server_extras.pop("ram_script")
-        else:
-            if card is None or ram_script is None:
-                raise ValueError("card and ram_script are required")
-            server_extras = {}
-        if per_build is not None:
-            server_extras["per_build"] = {
-                code: chosen if isinstance(chosen, str) else server_keywords(chosen)
-                for code, chosen in per_build.items()}
-        self.server = server if server is not None else MysteryGiftServer(
-            card, ram_script, log=log, expect_console=expect_console, **server_extras)
+        self.server = server
+        if server is None:
+            if distribution is not None:
+                if card is not None or ram_script is not None:
+                    raise ValueError("pass either distribution or card/ram_script")
+                server_extras = server_keywords(distribution)
+                card, ram_script = server_extras.pop("card"), server_extras.pop("ram_script")
+            else:
+                if card is None or ram_script is None:
+                    raise ValueError("card and ram_script are required")
+                server_extras = {}
+            if per_build is not None:
+                server_extras["per_build"] = {
+                    code: chosen if isinstance(chosen, str) else server_keywords(chosen)
+                    for code, chosen in per_build.items()}
+            self.server = MysteryGiftServer(
+                card, ram_script, log=log, expect_console=expect_console, **server_extras)
         self._server_waiting = False
 
         self.state = MG_LINK_PLAYER

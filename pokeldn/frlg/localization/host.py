@@ -24,9 +24,14 @@ class LocalizationHostApplication(MysteryGiftHostApplication):
                                              buffer_code=bs.payload(bs.TRAINER_ID_PROBE))
         super().__init__(config, distribution=descriptor, **kwargs)
 
-    def _make_engine(self, link_player, timing):
+    def _build_engine(self, link_player, timing):
         return self.operation.make_engine(link_player=link_player, timing=timing,
                                           trust_pia=self.config.trust_pia, log=self.log)
+
+    def _screen_card(self):
+        labels = {"probe": "Read-only ROM capture", "inspect": "Inspect ROM",
+                  "load": "Load localization", "restore": "Restore ROM"}
+        return "FRLG localization", labels[self.operation.operation], None
 
     def _log_identity(self, link_player):
         self.info(f"FRLG localization {self.operation.operation}: "
