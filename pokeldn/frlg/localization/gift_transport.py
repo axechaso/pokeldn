@@ -158,7 +158,9 @@ class LocalizationGiftServer(mg_server.MysteryGiftServer):
         messages = {"probe": ("Read-only probe complete.\nReturn to the game.",
                               "Read stopped.\nReturn to the menu."),
                     "display": ("Chinese display finished.\nPress A to return.",
-                                "Display test stopped.\nReturn to the menu.")}
+                                "Display test stopped.\nReturn to the menu."),
+                    "story": ("NPC Chinese test ready.\nLoad game, visit Pallet Town.",
+                              "NPC test stopped.\nRestart game before retrying.")}
         success, failure = messages.get(operation.operation,
                                         ("ROM pages verified.\nReturn to the game.",
                                          "ROM load stopped.\nKeep the recovery journal."))

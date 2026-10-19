@@ -11,7 +11,7 @@ class LocalizationHostApplication(MysteryGiftHostApplication):
     """A library entry point sharing the existing host config, radio, beacon and Pia stack.
 
     ROM modifications require the operation's independently measured observer. Bootstrap
-    reads and the bounded UI screen demo use their own preflight. No CLI flag fills wrapper
+    reads and the bounded RAM demos use their own preflight. No CLI flag fills wrapper
     identity from profile metadata to allow a ROM write.
     """
 
@@ -31,7 +31,8 @@ class LocalizationHostApplication(MysteryGiftHostApplication):
 
     def _screen_card(self):
         labels = {"probe": "Read-only ROM capture", "inspect": "Inspect ROM",
-                  "load": "Load localization", "restore": "Restore ROM", "display": "NS Chinese display"}
+                  "load": "Load localization", "restore": "Restore ROM", "display": "NS Chinese display",
+                  "story": "NS NPC Chinese test"}
         return "FRLG localization", labels[self.operation.operation], None
 
     def _log_identity(self, link_player):
@@ -46,6 +47,10 @@ class LocalizationHostApplication(MysteryGiftHostApplication):
             self.info("NS Chinese screen demo: 808-byte payload, no ROM capture, no save or ROM writes. "
                       "Watch for Chinese text. Wait for the English result message, then press A; "
                       "communication may extend the wait.")
+        elif self.operation.operation == "story":
+            self.info("NS NPC dialogue demo: two short RAM uploads, no ROM capture, save or ROM writes. "
+                      "After the result, load your game and talk to the south fat man in Pallet Town. "
+                      "Only his first sentence changes. A soft reset or full restart removes the demo.")
         else:
             self.info("The connected console must match game data, wrapper observation and full ROM fingerprint.")
 

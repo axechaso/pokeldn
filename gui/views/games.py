@@ -690,6 +690,7 @@ class SessionPanel:
         self.seen: dict[str, tuple] = {}   # a received file -> (size, mtime, what PKHeX read, or None)
         self.capture_output = None         # the current read-only localization test's output folder
         self.display_output = None         # the temporary NS screen demo's completion report
+        self.story_output = None           # temporary NPC demo, visual confirmation remains in game
         self.steps = ft.Container()
         self.action = ft.Container()
         command_block = CodeBlock(app)
@@ -1008,6 +1009,22 @@ class SessionPanel:
             ], spacing=8))
         self.received.update()
 
+    def show_localization_story_result(self) -> None:
+        localization.read_story(self.story_output)
+        self.received.visible = True
+        self.received.content = t.section(
+            tr('games.localization_story_done', 'NPC dialogue ready in RAM'), ft.Column([
+                t.text(tr('games.localization_story_visit', 'On your Switch, return to the title menu and choose Continue. In Pallet Town, talk to the fat man south of Oak’s lab.'),
+                       13, t.GREEN),
+                t.text(tr('games.localization_story_confirm', 'Check for “科学的力量真伟大！”, press A for the original English second page, and close the dialogue normally.'),
+                       12, t.TEXT),
+                t.text(tr('games.localization_story_scope', 'Only this first sentence is translated. Keep the game running: a soft reset or full restart removes the demo. The report confirms upload; the NPC display needs your confirmation.'),
+                       12, t.MUTED),
+                t.link_button(tr('games.localization_open_folder', 'Open output folder'),
+                              lambda e: open_folder(self.story_output)),
+            ], spacing=8))
+        self.received.update()
+
     async def _copy_log(self, e) -> None:
         await self.app.copy(self.log.text())
 
@@ -1053,6 +1070,8 @@ class SessionPanel:
                                if tool.key == "frlg-localization" else None)
         self.display_output = (args[args.index("--output-dir") + 1]
                                if tool.key == "frlg-localization-display" else None)
+        self.story_output = (args[args.index("--output-dir") + 1]
+                             if tool.key == "frlg-localization-story" else None)
         for folder in (SESSION / "captures", os.path.expanduser(s.received)):
             os.makedirs(folder, exist_ok=True)
         trace = f"captures/{tool.key}-{stamp}_esp32.trace" if s.board_trace else None
@@ -1143,6 +1162,12 @@ class SessionPanel:
                     self.show_localization_display_result()
                 except (OSError, ValueError) as error:
                     self.set_status(tr('games.localization_display_report_failed', 'Display report unavailable'), t.RED)
+                    self.log.add(f'[app] {error}')
+            if code == 0 and not self.stopping and getattr(self, "story_output", None) is not None:
+                try:
+                    self.show_localization_story_result()
+                except (OSError, ValueError) as error:
+                    self.set_status(tr('games.localization_story_report_failed', 'NPC demo report unavailable'), t.RED)
                     self.log.add(f'[app] {error}')
             self.log.add(f'[app] Exited with code {code}.')
             bank.prune(self.app.settings)     # the traded ones leave the queue too

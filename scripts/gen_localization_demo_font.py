@@ -39,12 +39,15 @@ def main():
     from PIL import Image, ImageDraw, ImageFont, __version__
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path)
+    parser.add_argument("--text", type=Path, help="UTF-8 dialogue whose glyphs should be included")
+    parser.add_argument("--output", type=Path, default=ROOT / "pokeldn/frlg/localization/assets/demo-font.json")
     args = parser.parse_args()
     data = args.source.read_bytes()
     if sha256(data) != SOURCE_SHA256:
         parser.error("source font does not match the pinned Noto source SHA-256")
     font = ImageFont.truetype(str(args.source), size=14)
-    chars = {t["char"] for t in tokenize(DEMO_DIALOGUE) if t["kind"] == "glyph"}
+    text = args.text.read_text(encoding="utf-8") if args.text else DEMO_DIALOGUE
+    chars = {t["char"] for t in tokenize(text) if t["kind"] == "glyph"}
     chars.update(chr(x) for x in range(32, 127))
     glyphs = {}
     for char in sorted(chars):
@@ -56,7 +59,7 @@ def main():
               "commit": SOURCE_COMMIT, "sha256": sha256(data), "license": "OFL-1.1",
               "copyright": copyrights(data), "rasterizer": f"Pillow {__version__}, 14px, baseline 13"}
     result = BitmapFont("FRLG Prototype Glyphs", source, glyphs)
-    output = ROOT / "pokeldn/frlg/localization/assets/demo-font.json"
+    output = args.output
     output.write_bytes(canonical(result.as_dict()) + b"\n")
     print(f"wrote {len(glyphs)} glyphs, {len(result.binary())} bytes: {output}")
 

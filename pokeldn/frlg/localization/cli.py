@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""BPRE 0x0A PokeLDN screen demo or read-only ROM capture; no local game file needed."""
+"""BPRE 0x0A PokeLDN Chinese demos or read-only ROM capture; no local game file needed."""
 
 import argparse
 import functools
@@ -35,8 +35,11 @@ def build_parser():
     parser.add_argument("--radio", help="defaults to existing POKELDN_RADIO or esp32:auto")
     parser.add_argument("--over-ip", nargs="?", const="auto")
     parser.add_argument("--verbose", action="store_true")
-    parser.add_argument("--display-demo", action="store_true",
-                        help="show a temporary Chinese message on the NS; wait for the English result before pressing A")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--display-demo", action="store_true",
+                      help="show a temporary Chinese message on the NS; wait for the English result before pressing A")
+    mode.add_argument("--story-demo", action="store_true",
+                      help="load a temporary NPC sentence translation in RAM; then visit Pallet Town in the game")
     parser.add_argument("--rom-size", type=lambda x: int(x, 0), default=0x1000000)
     parser.add_argument("--dump-rom", type=Path, help="optional local runtime capture; never an original-ROM claim")
     output = parser.add_mutually_exclusive_group(required=True)
@@ -67,8 +70,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     old_radio = os.environ.get("POKELDN_RADIO")
     try:
-        if args.display_demo and args.dump_rom is not None:
-            raise LocalizationError("the NS display demo does not capture a ROM")
+        if (args.display_demo or args.story_demo) and args.dump_rom is not None:
+            raise LocalizationError("the NS Chinese demos do not capture a ROM")
         if args.output_dir is not None:
             if args.dump_rom is not None:
                 raise LocalizationError("--output-dir already chooses the runtime capture path")
@@ -76,7 +79,7 @@ def main(argv=None):
                 raise LocalizationError("probe output directory already exists")
             args.output_dir.mkdir()
             args.report = args.output_dir / "report.json"
-            if not args.display_demo:
+            if not (args.display_demo or args.story_demo):
                 args.dump_rom = args.output_dir / ("runtime.gba" if args.rom_size == 0x1000000
                                                   else "runtime-sample.bin")
         if args.report.exists():
@@ -92,7 +95,10 @@ def main(argv=None):
             factory = functools.partial(ldn_mitm_host.IpHostTransport,
                                          our_ip=None if args.over_ip == "auto" else args.over_ip)
             factory.NEEDS_RADIO = False
-        if args.display_demo:
+        if args.story_demo:
+            from pokeldn.frlg.localization.ns_story import LocalizationStoryOperation
+            operation = LocalizationStoryOperation()
+        elif args.display_demo:
             from pokeldn.frlg.localization.ns_display import LocalizationDisplayOperation
             operation = LocalizationDisplayOperation()
         else:
@@ -112,7 +118,10 @@ def main(argv=None):
         with args.report.open("x", encoding="utf-8", newline="\n") as handle:
             json.dump(app.operation_result, handle, indent=2)
             handle.write("\n")
-        if args.display_demo:
+        if args.story_demo:
+            print("NPC dialogue ready in RAM. Load your game and talk to the south fat man in Pallet Town. "
+                  f"Confirm the Chinese first sentence visually. Report: {args.report}")
+        elif args.display_demo:
             print(f"NS display payload acknowledged. Confirm the Chinese screen visually. Report: {args.report}")
         else:
             print(f"Read-only runtime fingerprint written to {args.report}")

@@ -5,8 +5,8 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ["POKELDN_START_GAME"] = "frlg"
-os.environ["POKELDN_START_TOOL"] = "frlg-localization-display"
-os.environ["POKELDN_GUI_TITLE"] = "PokeLDN · NS 中文显示测试"
+os.environ["POKELDN_START_TOOL"] = "frlg-localization-story"
+os.environ["POKELDN_GUI_TITLE"] = "PokeLDN · NS 剧情汉化测试"
 
 from gui.main import run  # noqa: E402
 

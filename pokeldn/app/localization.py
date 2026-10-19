@@ -62,3 +62,24 @@ def read_display(folder: str) -> dict:
             or data.get("payload_sha256") != hashlib.sha256(build_display_payload()).hexdigest()):
         raise ValueError("The report does not confirm this NS screen demo completed.")
     return data
+
+
+def read_story(folder: str) -> dict:
+    """Validate upload evidence separately from in-game visual confirmation."""
+    from pokeldn.frlg.localization.ns_story import (
+        ALREADY_INSTALLED, INSTALLED, TEXT, build_story_blob, build_story_payloads,
+    )
+    data = json.loads((Path(folder) / "report.json").read_text(encoding="utf-8"))
+    payloads = [hashlib.sha256(code).hexdigest() for code in build_story_payloads()]
+    blob = build_story_blob()
+    if (not isinstance(data, dict) or data.get("state") != "STORY_DEMO_READY"
+            or data.get("game_code") != "BPRE" or data.get("revision") != 10
+            or data.get("text") != TEXT or data.get("rom_written") is not False
+            or data.get("save_written") is not False or data.get("write_eligible") is not False
+            or data.get("visual_confirmation_required") is not True
+            or data.get("resident_bytes") != len(blob)
+            or data.get("resident_sha256") != hashlib.sha256(blob).hexdigest()
+            or not ((data.get("reply") == INSTALLED and data.get("payload_sha256") == payloads)
+                    or (data.get("reply") == ALREADY_INSTALLED and data.get("payload_sha256") == payloads[:1]))):
+        raise ValueError("The report does not confirm this NPC dialogue demo was loaded.")
+    return data
