@@ -38,13 +38,23 @@ class LocalizationHostApplication(MysteryGiftHostApplication):
                   f"profile={self.operation.profile.profile_id}, "
                   f"game={self.operation.profile.identity.game_code}, "
                   f"revision={self.operation.profile.identity.revision:#x}")
-        self.info("The connected console must match game data, wrapper observation and full ROM fingerprint.")
+        if self.operation.operation == "probe":
+            self.info(f"Read-only ROM capture: {self.operation.rom_size} bytes in "
+                      f"{self.operation.read_batch_size}-byte requests.")
+        else:
+            self.info("The connected console must match game data, wrapper observation and full ROM fingerprint.")
 
     def _hosting_instructions(self):
         return ("Hosting FRLG localization. On the Switch choose "
                 "Mystery Gift -> Wonder Cards -> Friend.")
 
     def _log_activity_progress(self):
+        # A failed worker cannot complete a normal gift close. Surface the error here
+        # so HostApplication's finally block stops the network even when ACKs are stuck.
+        if self.operation.result.done():
+            error = self.operation.result.exception()
+            if error is not None:
+                raise error
         state = self.session.activity.state
         if state != self._last_state:
             self._last_state = state

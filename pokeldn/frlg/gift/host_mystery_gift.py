@@ -424,7 +424,9 @@ class HostMysteryGiftEngine:
             self._sender = None
             self.disconnect_requested = True
             self._set_state(MG_CLOSE)
-            return [0] * 7
+            # HostSession sends D only after a READY_CLOSE_LINK poll. An idle row
+            # leaves close_poll_sent false and can trap an aborted RPC in MG_CLOSE.
+            return rfu.close_link_words(self._exit_count)
         if self._server_waiting and self.state == MG_GIFT:
             self._pump_server()
         self._parent_polls += 1

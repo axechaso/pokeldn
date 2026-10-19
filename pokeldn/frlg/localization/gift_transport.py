@@ -109,8 +109,12 @@ class GiftBridge:
 
 
 class GiftTransport(BufferTransport):
-    def __init__(self, bridge, profile):
+    def __init__(self, bridge, profile, *, max_dump_blocks=4):
+        integer(max_dump_blocks, "maximum dump blocks", 1, mg_script.MAX_DUMP_BLOCKS)
         self.bridge, self.profile = bridge, profile
+        # Four blocks reproduce the retail-tested 4 KiB exchange. The protocol can
+        # encode 32, but its longer client script can stall a slow radio before any reply.
+        self.max_dump_blocks = max_dump_blocks
         super().__init__(lambda: bridge.exchange("observe"), self._read, self._run_code)
 
     def _read(self, address, size, *, on_chunk=None):
@@ -126,7 +130,7 @@ class GiftTransport(BufferTransport):
             def report_chunk(done, total):
                 progress(len(result) + done, size)
 
-            blocks = min(remaining // 1024, mg_script.MAX_DUMP_BLOCKS)
+            blocks = min(remaining // 1024, self.max_dump_blocks)
             if blocks > 1:
                 code = bs.build_memory_dump_multi(at, size=1024, blocks=blocks,
                                                   build=self.profile.identity.game_code)
@@ -166,6 +170,13 @@ class LocalizationGiftServer(mg_server.MysteryGiftServer):
                 return self.action
             self.action = None
         return super().run()
+
+    def on_sent(self):
+        super().on_sent()
+        if self.inflight is not None:
+            # Uploading the client script, cursor reset, and payload is real progress
+            # before the first reply. Repeated idle frames never refresh this deadline.
+            self.operation.bridge.progress(self.inflight)
 
     def _finish(self):
         self.buffer_matched = (self.operation.result.done()

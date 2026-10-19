@@ -44,6 +44,7 @@ class LocalizationProbeOperation(LocalizationGiftOperation):
             raise LocalizationError("probe dump parent directory does not exist")
         self.bridge = GiftBridge(timeout)
         self.transport = GiftTransport(self.bridge, self.profile)
+        self.read_batch_size = self.transport.max_dump_blocks * 1024
         self.result, self.worker = Future(), None
         self.server = LocalizationGiftServer(self, log=log)
 
@@ -59,9 +60,9 @@ class LocalizationProbeOperation(LocalizationGiftOperation):
         try:
             if self.dump_path is not None:
                 output = self.dump_path.open("xb")
-            for offset in range(0, self.rom_size, 32 * 1024):
+            for offset in range(0, self.rom_size, self.read_batch_size):
                 block = self.transport.read_memory(ROM_BASE + offset,
-                                                   min(32 * 1024, self.rom_size - offset),
+                                                   min(self.read_batch_size, self.rom_size - offset),
                                                    progress=lambda done, total, offset=offset:
                                                    self.progress(offset + done, self.rom_size))
                 digest.update(block)
@@ -69,6 +70,7 @@ class LocalizationProbeOperation(LocalizationGiftOperation):
                     prefix.extend(block)
                 if output is not None:
                     output.write(block)
+                    output.flush()
         finally:
             # A partial capture is retained for diagnosis. A report is emitted only after
             # completion; it must never be mistaken for a verified original cartridge.
@@ -76,6 +78,7 @@ class LocalizationProbeOperation(LocalizationGiftOperation):
                 output.close()
         result = {"state": "READ_ONLY_CAPTURED", "read_only": True, "game_code": "BPRE",
                   "revision": 10, "rom_size": self.rom_size, "runtime_sha256": digest.hexdigest(),
+                  "read_batch_bytes": self.read_batch_size,
                   "capture_elapsed_seconds": monotonic() - started,
                   "header_hex": header.hex(), "dump_path": str(self.dump_path) if self.dump_path else None,
                   "original_rom_verified": False, "wrapper_identity_verified": False,

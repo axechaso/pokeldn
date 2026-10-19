@@ -29,7 +29,7 @@ def model():
 def test_probe_captures_runtime_rom_without_a_base_input(model, tmp_path):
     output = tmp_path / "runtime.gba"
     operation = LocalizationProbeOperation(rom_size=model.profile.rom_size, dump_path=output)
-    drive(operation, PersistentConsole(model))
+    engine, _ = drive(operation, PersistentConsole(model))
     result = operation.result.result()
     expected = model.profile.runtime_base(model.base)
     assert output.read_bytes() == expected
@@ -38,6 +38,12 @@ def test_probe_captures_runtime_rom_without_a_base_input(model, tmp_path):
     assert not result["write_eligible"] and not result["wrapper_identity_verified"]
     assert not result["original_rom_verified"] and not model.machine.rom_writes
     assert result["capture_elapsed_seconds"] >= 0
+    responses = [item for item in operation.server.trace
+                 if isinstance(item, tuple) and item[0] == "localization_response"]
+    assert [item[3] for item in responses] == [192] + [4096] * 16
+    scripts = [item for item in engine.trace if item[0] == "send_message" and item[1] == 16]
+    assert max(item[2] for item in scripts) == 2
+    assert result["read_batch_bytes"] == 4096
     text = result["text_engine"]
     assert text["size"] == 65536 and not text["symbol_addresses_verified"]
     assert not text["game_encoding_assigned"] and not text["write_eligible"]
@@ -119,3 +125,24 @@ def test_probe_interrupt_exit_code_and_radio_environment_are_preserved(tmp_path,
                                     "--no-local-config", "--radio", "esp32:auto"]) == 130
     assert os.environ["POKELDN_RADIO"] == "esp32:COM7"
     assert not (tmp_path / "report.json").exists()
+
+
+def test_probe_timeout_exits_with_an_error_and_no_success_report(tmp_path, monkeypatch, capsys):
+    from pokeldn.frlg.link.host_app import HostApplication
+    from pokeldn.frlg.localization.gift_transport import GiftConnectionClosed
+
+    captured = []
+
+    def timeout(app):
+        captured.append(app.operation)
+        app.operation.result.set_exception(GiftConnectionClosed("Mystery Gift RPC timed out"))
+        app._log_activity_progress()
+        raise AssertionError("worker failure was swallowed")
+
+    monkeypatch.setattr(HostApplication, "run", timeout)
+    report = tmp_path / "report.json"
+    with pytest.raises(SystemExit) as error:
+        localization_probe.main(["--report", str(report), "--no-local-config"])
+    assert error.value.code == 2 and not report.exists()
+    assert "localization probe stopped: Mystery Gift RPC timed out" in capsys.readouterr().err
+    assert captured[0].bridge.closed

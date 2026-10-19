@@ -110,7 +110,8 @@ def test_pages_load_and_restore_through_one_continuous_gift_session(example, tmp
     responses = [x for x in engine.server.trace if isinstance(x, tuple) and x[0] == "localization_response"]
     blocks = [x for x in engine.server.trace if isinstance(x, tuple) and x[0] == "localization_block"]
     assert len(blocks) > 100 and len(responses) > 40
-    assert any(x[3] == 32 * 1024 for x in responses)
+    assert any(x[3] == 4096 for x in responses)
+    assert all(x[3] <= 4096 for x in responses)
     assert [x[1] for x in responses] == sorted({x[1] for x in responses})
     restoring = operation_for(example, tmp_path, model, operation="restore")
     drive(restoring, PersistentConsole(model))
@@ -196,13 +197,17 @@ def test_engine_server_injection_rejects_mixed_distribution(example, tmp_path):
     operation.close()
 
 
-def test_batched_dump_progress_extends_inactivity_deadline(monkeypatch):
+@pytest.mark.parametrize("phase", ["upload", "response"])
+def test_batched_dump_progress_extends_inactivity_deadline(monkeypatch, phase):
     from concurrent.futures import TimeoutError as FutureTimeout
     from pokeldn.frlg.localization import gift_transport
+    from types import SimpleNamespace
 
     # Simulate a block arriving during each wait. Real sleeps made this test depend on
     # a loaded CI worker being scheduled within 150 ms.
     bridge, clock, waits = GiftBridge(timeout=0.15), [100.0], []
+    server = gift_transport.LocalizationGiftServer(
+        SimpleNamespace(operation="probe", bridge=bridge, result=Future()))
     request_type = gift_transport.Request
 
     class ReceivingFuture(Future):
@@ -213,7 +218,12 @@ def test_batched_dump_progress_extends_inactivity_deadline(monkeypatch):
                 assert bridge.complete(request, b"done")
                 return super().result(timeout=0)
             clock[0] += timeout * 0.75
-            assert bridge.progress(request)
+            if phase == "upload":
+                server.inflight = request
+                server.action = ("send", 16, b"script", 6)
+                server.on_sent()
+            else:
+                assert bridge.progress(request)
             clock[0] += timeout * 0.25
             raise FutureTimeout
 
@@ -246,6 +256,58 @@ def test_short_dump_response_poisoning_wakes_the_waiting_worker(example, tmp_pat
     with pytest.raises(GiftConnectionClosed, match="short"):
         result.result()
     assert operation.bridge.closed and server.connection_lost
+
+
+def test_aborted_rpc_sends_the_close_poll_before_disconnect(monkeypatch):
+    from pokeldn.frlg.gift.host_mystery_gift import MG_GIFT
+    from pokeldn.frlg.localization.gift_transport import Request
+    from pokeldn.frlg.localization.probe import LocalizationProbeOperation
+    from pokeldn.gba.rfu_leader import UNI
+
+    operation = LocalizationProbeOperation(rom_size=4096)
+    engine = operation.make_engine()
+    engine.state = MG_GIFT
+    operation.server.inflight = Request(1, "dump", (b"code", 1024, 4))
+    operation.reject(GiftConnectionClosed("RPC timed out"))
+    session = host_session.HostSession(engine=engine)
+    session.rfu.state = UNI
+    session.reliable.local_opened = True
+    monkeypatch.setattr(session.rfu, "tick", lambda words: b"close poll")
+    monkeypatch.setattr(session.rfu, "disconnect_frame", lambda: b"disconnect")
+    try:
+        session.tick(0)
+        assert session.close_poll_sent and not session.disconnect_sent
+        session.tick(1)
+        assert session.disconnect_sent and engine.done
+        assert not engine.gift_sent and not engine._words and not engine._blocks
+    finally:
+        operation.close()
+
+
+def test_worker_failure_stops_network_without_waiting_for_normal_close():
+    from types import SimpleNamespace
+    from pokeldn.frlg.localization.host import LocalizationHostApplication
+    from test_host_app_runtime import _Network, _Injector, _Peer, _RuntimeApplication, _session
+
+    class Runtime(_RuntimeApplication):
+        _log_activity_progress = LocalizationHostApplication._log_activity_progress
+
+    network, injector, session = _Network(["switch"]), _Injector(), _session()
+    session.activity = session.trade
+    peer = _Peer(session, network)
+    app = Runtime(network, injector, session, peer)
+    app._last_state = None
+    app.operation = SimpleNamespace(result=Future())
+    app.operation.result.set_exception(GiftConnectionClosed("RPC timed out"))
+
+    def must_not_wait(network):
+        raise AssertionError("failed operation waited for a normal gift close")
+
+    network.on_wait = must_not_wait
+    with pytest.raises(GiftConnectionClosed, match="timed out"):
+        app.run()
+    assert network.stopped == injector.stopped == 1
+    assert network.waits == 0
 
 
 def test_host_application_reuses_configuration_and_closes_operation(example, tmp_path, monkeypatch):
