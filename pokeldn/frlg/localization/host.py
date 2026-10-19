@@ -10,8 +10,9 @@ from .gift_transport import GiftConnectionClosed
 class LocalizationHostApplication(MysteryGiftHostApplication):
     """A library entry point sharing the existing host config, radio, beacon and Pia stack.
 
-    The operation's independently measured observer is required. There is deliberately
-    no CLI flag that fills wrapper identity from profile metadata to allow a device write.
+    ROM modifications require the operation's independently measured observer. Bootstrap
+    reads and the bounded UI screen demo use their own preflight. No CLI flag fills wrapper
+    identity from profile metadata to allow a ROM write.
     """
 
     ACTIVITY_NOUN = "localization"
@@ -30,7 +31,7 @@ class LocalizationHostApplication(MysteryGiftHostApplication):
 
     def _screen_card(self):
         labels = {"probe": "Read-only ROM capture", "inspect": "Inspect ROM",
-                  "load": "Load localization", "restore": "Restore ROM"}
+                  "load": "Load localization", "restore": "Restore ROM", "display": "NS Chinese display"}
         return "FRLG localization", labels[self.operation.operation], None
 
     def _log_identity(self, link_player):
@@ -41,6 +42,9 @@ class LocalizationHostApplication(MysteryGiftHostApplication):
         if self.operation.operation == "probe":
             self.info(f"Read-only ROM capture: {self.operation.rom_size} bytes in "
                       f"{self.operation.read_batch_size}-byte requests.")
+        elif self.operation.operation == "display":
+            self.info("NS Chinese screen demo: 808-byte payload, no ROM capture, no save or ROM writes. "
+                      "Look for Chinese text for about 10 seconds, then press A on the result message.")
         else:
             self.info("The connected console must match game data, wrapper observation and full ROM fingerprint.")
 

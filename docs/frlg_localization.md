@@ -6,7 +6,7 @@ nav_exclude: true
 
 # 汉化运行时补丁工具
 
-2026-10-19 更新。已交付[汉化方案](pokeldn_localization_implementation_plan_zh.md)的软件基础：版本配置、差分包、ARM 页载荷、恢复日志，以及接入现有 PokeLDN RFU／Mystery Gift 主机的持续多步骤适配器。另有字库、排版预览，以及已在 mGBA 中运行的两页中文开场对话源码原型。**目前不能让 Switch 游戏显示中文**，也没有经过本项目验证的零售版本配置。桌面客户端提供只读连接测试和完整运行时 ROM 采集，CLI 继续提供相同采集入口及离线工具；实际写入适配器为库接口，保留独立观测的版本与写入门禁。
+2026-10-19 更新。已交付[汉化方案](pokeldn_localization_implementation_plan_zh.md)的软件基础：版本配置、差分包、ARM 页载荷、恢复日志，以及接入现有 PokeLDN RFU／Mystery Gift 主机的持续多步骤适配器。另有字库、排版预览，以及已在 mGBA 中运行的两页中文开场对话源码原型。**完整游戏汉化尚不能安装**，也没有经过本项目验证的零售 ROM 写入配置。桌面客户端新增 **NS Chinese display test**，用于实机临时显示“你好！”，尚待 NS 画面确认；只读采集入口继续保留。实际 ROM 写入适配器为库接口，保留独立观测的版本与写入门禁。
 
 | 阶段 | 当前状态 |
 | --- | --- |
@@ -53,10 +53,25 @@ GBA 头校验和正确，保存文件 SHA-256 与报告一致（`a5c8d8f89e801d4
 
 ## 在客户端测试
 
+当前桌面 **PokeLDN 汉化测试** 快捷方式进入 **NS Chinese display test**，窗口标题为
+**PokeLDN · NS 中文显示测试**。操作如下：
+
+1. 客户端点 **Start**。
+2. NS 英文火红进入 **Mystery Gift → Wonder Cards → Friend → POKELDN**。
+3. 看下方消息窗口是否出现 **“你好！”**，约 10 秒后出现英文结束提示，再按 **A** 返回。
+
+本入口仅发送一个 808 字节 ARM 载荷，服务器不先读取 ROM。载荷核对 `BPRE 0x0A` 头、
+`CopyWindowToVram` 的 64 字节 FNV-1a 指纹、消息窗口 1 的完整模板，以及像素缓冲在游戏堆内的范围；
+随后只清理这个窗口的 3,584 字节像素数据，将授权字形组成的 48×16 图块复制到窗口并请求游戏上传显示。
+它不修改 ROM、不访问存档闪存、不注册驻留任务，结束使用不保存的动态消息路径。
+`DISPLAY_DEMO_EXECUTED` 只确认脚本回执，报告明确保留 `visual_confirmation_required=true`；
+需要用户实际看到中文，才能确认这台 NS 的显示结果。这是短时窗口绘制测试，尚未接入剧情文本。
+
+既有只读采集入口位于单独的 **Localization test** 页面，不是当前这项中文显示测试：
+
 这次开发版客户端的 **Games → FireRed & LeafGreen → Localization test** 提供按钮入口。
 沿用 Board 页的无线板和 Settings 中的密钥，不需要手动填写命令或输出路径。
-本机的 **PokeLDN 汉化测试** 桌面快捷方式会直接打开此页；源码中的对应启动入口为
-`gui/localization_test.py`。
+源码中的 `gui/localization_test.py` 现已改为直接打开上述 NS 中文显示测试页。
 
 默认 **Quick connection test (4 KiB)** 先验证真实无线读取；点 Start 后，在英文火红选择
 **Mystery Gift → Wonder Cards → Friend → POKELDN**，等待 Session 显示

@@ -45,3 +45,20 @@ def read_capture(folder: str) -> Capture:
     if elapsed is not None and (type(elapsed) not in (int, float) or not math.isfinite(elapsed) or elapsed < 0):
         raise ValueError("The capture report has an invalid duration.")
     return Capture(report, runtime, size, digest, elapsed)
+
+
+def read_display(folder: str) -> dict:
+    """A code reply confirms execution; it cannot confirm what the user saw on NS."""
+    from pokeldn.frlg.localization.ns_display import DISPLAY_DONE, DISPLAY_FRAMES, build_display_payload
+    report = Path(folder) / "report.json"
+    data = json.loads(report.read_text(encoding="utf-8"))
+    if (not isinstance(data, dict) or data.get("state") != "DISPLAY_DEMO_EXECUTED"
+            or data.get("game_code") != "BPRE" or data.get("revision") != 10
+            or data.get("rom_written") is not False or data.get("save_written") is not False
+            or data.get("write_eligible") is not False or data.get("visual_confirmation_required") is not True
+            or data.get("reply") != DISPLAY_DONE or data.get("display_frames") != DISPLAY_FRAMES
+            or data.get("text") != "你好！"
+            or data.get("payload_bytes") != len(build_display_payload())
+            or data.get("payload_sha256") != hashlib.sha256(build_display_payload()).hexdigest()):
+        raise ValueError("The report does not confirm this NS screen demo completed.")
+    return data

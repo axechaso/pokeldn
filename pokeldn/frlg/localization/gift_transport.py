@@ -155,11 +155,15 @@ class LocalizationGiftServer(mg_server.MysteryGiftServer):
     def __init__(self, operation, *, log=lambda *args: None):
         self.operation = operation
         self.inflight = None
+        messages = {"probe": ("Read-only probe complete.\nReturn to the game.",
+                              "Read stopped.\nReturn to the menu."),
+                    "display": ("Chinese display finished.\nPress A to return.",
+                                "Display test stopped.\nReturn to the menu.")}
+        success, failure = messages.get(operation.operation,
+                                        ("ROM pages verified.\nReturn to the game.",
+                                         "ROM load stopped.\nKeep the recovery journal."))
         super().__init__(buffer_code=bs.payload(bs.TRAINER_ID_PROBE), log=log,
-                         buffer_success_message=("Read-only probe complete.\nReturn to the game."
-                                                 if operation.operation == "probe" else
-                                                 "ROM pages verified.\nReturn to the game."),
-                         buffer_failure_message="ROM load stopped.\nKeep the recovery journal.",
+                         buffer_success_message=success, buffer_failure_message=failure,
                          script=(*mg_server._GAME_DATA_PREFIX,
                                  ("SVR_LOCALIZATION_START",), ("SVR_LOCALIZATION_NEXT",)))
 
