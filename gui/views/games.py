@@ -11,7 +11,7 @@ from gui import board
 from gui.app import keys_found
 from pokeldn import pokemon as builder
 from pokeldn import panel, progress
-from pokeldn.app import bank, command, panels, events_gallery, gift_builder, online, received, runner
+from pokeldn.app import bank, command, panels, events_gallery, gift_builder, localization, online, received, runner
 from pokeldn.swsh import raid_event as swsh_raid_event
 from pokeldn.sv import raid_event as raid_events
 from gui import theme as t
@@ -688,6 +688,9 @@ class SessionPanel:
         self.received = ft.Container(visible=False)
         self.run = None                    # (process, stamp, game) of the last run started
         self.seen: dict[str, tuple] = {}   # a received file -> (size, mtime, what PKHeX read, or None)
+        self.capture_output = None         # the current read-only localization test's output folder
+        self.display_output = None         # the temporary NS screen demo's completion report
+        self.story_output = None           # temporary NPC demo, visual confirmation remains in game
         self.steps = ft.Container()
         self.action = ft.Container()
         command_block = CodeBlock(app)
@@ -960,6 +963,68 @@ class SessionPanel:
         self.command_box.visible = not self.command_box.visible
         self.command_box.update()
 
+    def show_localization_result(self) -> None:
+        result = localization.read_capture(self.capture_output)
+
+        async def copy_fingerprint(e):
+            await self.app.copy(result.sha256)
+
+        if result.full_rom:
+            title = tr('games.localization_full_done', 'Runtime ROM captured')
+        elif result.text_engine:
+            title = tr('games.localization_text_done', 'Text engine captured')
+        elif result.size == 4096:
+            title = tr('games.localization_quick_done', 'Quick connection test passed')
+        else:
+            title = tr('games.localization_sample_done', 'Runtime sample captured')
+        self.received.visible = True
+        self.received.content = t.section(title, ft.Column([
+            t.text(tr('games.localization_result', 'Read-only test completed. {value0} KiB read from English FireRed.',
+                      value0=result.size // 1024), 12, t.GREEN),
+            t.text(tr('games.localization_duration', 'Reading took {value0} seconds.',
+                      value0=f'{result.elapsed:.1f}'), 12, t.MUTED, visible=result.elapsed is not None)
+            if result.elapsed is not None else ft.Container(),
+            t.text('SHA-256', 11, t.MUTED),
+            t.text(result.sha256, 11, font_family=t.MONO, selectable=True),
+            t.text(f'{result.runtime.name} · {result.report.name}', 12, t.MUTED, selectable=True),
+            ft.Row([
+                t.link_button(tr('games.localization_open_folder', 'Open output folder'),
+                              lambda e: open_folder(str(result.report.parent))),
+                t.link_button(tr('games.localization_copy_hash', 'Copy fingerprint'), copy_fingerprint),
+            ], wrap=True),
+        ], spacing=8))
+        self.received.update()
+
+    def show_localization_display_result(self) -> None:
+        localization.read_display(self.display_output)
+        self.received.visible = True
+        self.received.content = t.section(
+            tr('games.localization_display_done', 'NS display script completed'), ft.Column([
+                t.text(tr('games.localization_display_confirm', 'Check your Switch: did the message window show “你好！”?'),
+                       13, t.GREEN),
+                t.text(tr('games.localization_display_scope', 'This confirms the script reply. The visible text still needs your confirmation. No ROM translation was installed.'),
+                       12, t.MUTED),
+                t.link_button(tr('games.localization_open_folder', 'Open output folder'),
+                              lambda e: open_folder(self.display_output)),
+            ], spacing=8))
+        self.received.update()
+
+    def show_localization_story_result(self) -> None:
+        localization.read_story(self.story_output)
+        self.received.visible = True
+        self.received.content = t.section(
+            tr('games.localization_story_done', 'NPC dialogue ready in RAM'), ft.Column([
+                t.text(tr('games.localization_story_visit', 'On your Switch, return to the title menu and choose Continue. In Pallet Town, talk to the fat man south of Oak’s lab.'),
+                       13, t.GREEN),
+                t.text(tr('games.localization_story_confirm', 'Check for “科学的力量真伟大！”, press A for the original English second page, and close the dialogue normally.'),
+                       12, t.TEXT),
+                t.text(tr('games.localization_story_scope', 'Only this first sentence is translated. Keep the game running: a soft reset or full restart removes the demo. The report confirms upload; the NPC display needs your confirmation.'),
+                       12, t.MUTED),
+                t.link_button(tr('games.localization_open_folder', 'Open output folder'),
+                              lambda e: open_folder(self.story_output)),
+            ], spacing=8))
+        self.received.update()
+
     async def _copy_log(self, e) -> None:
         await self.app.copy(self.log.text())
 
@@ -1001,6 +1066,12 @@ class SessionPanel:
             return
         stamp = time.strftime("%Y%m%d-%H%M%S")
         args = command.build(tool, self.games.values, self.games.extra, s, stamp)
+        self.capture_output = (args[args.index("--output-dir") + 1]
+                               if tool.key == "frlg-localization" else None)
+        self.display_output = (args[args.index("--output-dir") + 1]
+                               if tool.key == "frlg-localization-display" else None)
+        self.story_output = (args[args.index("--output-dir") + 1]
+                             if tool.key == "frlg-localization-story" else None)
         for folder in (SESSION / "captures", os.path.expanduser(s.received)):
             os.makedirs(folder, exist_ok=True)
         trace = f"captures/{tool.key}-{stamp}_esp32.trace" if s.board_trace else None
@@ -1080,6 +1151,24 @@ class SessionPanel:
                 self.set_status(tr('games.finished_7804f7', 'Finished'), t.GREEN)
             else:
                 self.set_status(tr('games.failed_1df702', 'Failed ({value0})', value0=code), t.RED)
+            if code == 0 and not self.stopping and getattr(self, "capture_output", None) is not None:
+                try:
+                    self.show_localization_result()
+                except (OSError, ValueError) as error:
+                    self.set_status(tr('games.localization_report_failed', 'Capture report unavailable'), t.RED)
+                    self.log.add(f'[app] {error}')
+            if code == 0 and not self.stopping and getattr(self, "display_output", None) is not None:
+                try:
+                    self.show_localization_display_result()
+                except (OSError, ValueError) as error:
+                    self.set_status(tr('games.localization_display_report_failed', 'Display report unavailable'), t.RED)
+                    self.log.add(f'[app] {error}')
+            if code == 0 and not self.stopping and getattr(self, "story_output", None) is not None:
+                try:
+                    self.show_localization_story_result()
+                except (OSError, ValueError) as error:
+                    self.set_status(tr('games.localization_story_report_failed', 'NPC demo report unavailable'), t.RED)
+                    self.log.add(f'[app] {error}')
             self.log.add(f'[app] Exited with code {code}.')
             bank.prune(self.app.settings)     # the traded ones leave the queue too
             if self.games.visible and self.games.tool is self.running_tool:

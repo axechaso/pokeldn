@@ -35,8 +35,10 @@ def render():
         if len(code) % 4:
             raise SystemExit(f"{source.name}: {len(code)} bytes is not a whole number of words, "
                              f"and an installer writes words")
-        digest = hashlib.sha256(source.read_bytes() + b"".join(
-            inc.read_bytes() for inc in sorted(ASM_DIR.glob("*.inc")))).hexdigest()
+        # Match the LF source identity on Windows too, including the shared asm includes.
+        sources = [source, *sorted(ASM_DIR.glob("*.inc"))]
+        digest = hashlib.sha256(b"".join(
+            path.read_bytes().replace(b"\r\n", b"\n") for path in sources)).hexdigest()
         lines.append(f"    {source.stem!r}: (")
         lines.append(f"        bytes.fromhex({code.hex()!r}),")
         lines.append(f"        {digest!r},")

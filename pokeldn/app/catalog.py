@@ -194,6 +194,46 @@ FRLG = Game("frlg", tr('catalog.firered_leafgreen_2b757f', 'FireRed & LeafGreen'
           Field("--channel", tr('catalog.channel_ce4683', 'Channel'), "choice", default="11", choices=CHANNELS, help=CHANNEL_HELP, hidden=True)),
          fixed=("--live", "--ot", "{ot}", "--id", "{tid}:{sid}", "--dump-file",
                 "{received}/frlg-dump-{stamp}.bin"), doc="frlg_gift.md"),
+    Tool("frlg-localization-story", tr('catalog.localization_story', 'NS NPC dialogue test'),
+         "bin/frlg_localization_probe.py",
+         tr('catalog.localization_story_summary', 'Translate the Pallet Town south fat man’s first sentence to “科学的力量真伟大！”. The second page stays in English. A full game restart removes this temporary test.'),
+         (tr('catalog.localization_display_start', 'Press Start here, then use English FireRed on your Switch.'),
+          tr('catalog.localization_menu', 'On English FireRed, choose Mystery Gift, Wonder Cards, Friend, then POKELDN.'),
+          tr('catalog.localization_story_load', 'Wait for “NPC Chinese test ready”. Press A, return to the title menu, then choose Continue. Keep the game running.'),
+          tr('catalog.localization_story_visit', 'In Pallet Town, talk to the fat man south of Oak’s lab. Check the Chinese first sentence, press A for the English continuation, then close the dialogue.'),
+          tr('catalog.localization_story_reset', 'Other dialogue stays in English. A soft reset or full game restart removes the test. If another game boost occupies RAM, restart before loading this test.')),
+         (Field("--channel", tr('catalog.channel_ce4683', 'Channel'), "choice", default="11",
+                choices=CHANNELS, help=CHANNEL_HELP, hidden=True),),
+         fixed=("--story-demo", "--ot", "{ot}", "--id", "{tid}:{sid}", "--output-dir",
+                "{received}/frlg-story-{stamp}-{src_var}"), doc="frlg_localization.md"),
+    Tool("frlg-localization-display", tr('catalog.localization_display', 'NS Chinese display test'),
+         "bin/frlg_localization_probe.py",
+         tr('catalog.localization_display_summary', 'Show “你好！” on the Switch Mystery Gift screen. Wait for the English result message before pressing A; timing depends on the connection. This does not install a game translation.'),
+         (tr('catalog.localization_display_start', 'Press Start here, then use English FireRed on your Switch.'),
+          tr('catalog.localization_menu', 'On English FireRed, choose Mystery Gift, Wonder Cards, Friend, then POKELDN.'),
+          tr('catalog.localization_display_watch', 'Watch the lower message window for “你好！”. When the English result appears, press A to return.'),
+          tr('catalog.localization_display_result', 'The app reports whether the display script completed. Confirm the Chinese text by looking at the Switch.'),
+          tr('catalog.back_out_of_the_search_screen_between_two_runs_f0a1d7', 'Back out of the search screen between two runs.')),
+         (Field("--channel", tr('catalog.channel_ce4683', 'Channel'), "choice", default="11",
+                choices=CHANNELS, help=CHANNEL_HELP, hidden=True),),
+         fixed=("--display-demo", "--ot", "{ot}", "--id", "{tid}:{sid}", "--output-dir",
+                "{received}/frlg-display-{stamp}-{src_var}"), doc="frlg_localization.md"),
+    Tool("frlg-localization", tr('catalog.localization_test', 'Localization test'),
+         "bin/frlg_localization_probe.py",
+         tr('catalog.localization_summary', 'Test the read-only connection to English FireRed, or capture its runtime ROM for localization. Chinese text is not installed yet.'),
+         (tr('catalog.localization_start', 'Choose Quick connection test for the first run, then press Start.'),
+          tr('catalog.localization_menu', 'On English FireRed, choose Mystery Gift, Wonder Cards, Friend, then POKELDN.'),
+          tr('catalog.localization_wait', 'Keep the Switch near the board until the progress bar completes. The result and files appear in Session.'),
+          tr('catalog.back_out_of_the_search_screen_between_two_runs_f0a1d7', 'Back out of the search screen between two runs.')),
+         (Field("--rom-size", tr('catalog.localization_mode', 'Test'), "choice", default="0x1000",
+                choices=(("0x1000", tr('catalog.localization_quick', 'Quick connection test (4 KiB)')),
+                         ("0x10000", tr('catalog.localization_text_engine', 'Capture text engine (64 KiB)')),
+                         ("0x1000000", tr('catalog.localization_full', 'Capture runtime ROM (16 MiB)'))),
+                help=tr('catalog.localization_mode_help', 'After the quick test passes, capture the text engine for localization research. A full ROM capture can take many hours on a slow link.')),
+          Field("--channel", tr('catalog.channel_ce4683', 'Channel'), "choice", default="11",
+                choices=CHANNELS, help=CHANNEL_HELP, hidden=True)),
+         fixed=("--ot", "{ot}", "--id", "{tid}:{sid}", "--output-dir",
+                "{received}/frlg-localization-{stamp}-{src_var}"), doc="frlg_localization.md"),
 ))
 
 RSE_VERSIONS = (("emerald", tr('catalog.emerald', 'Emerald')), ("ruby", tr('catalog.ruby', 'Ruby')),
@@ -220,7 +260,8 @@ def rse_tool(tool: Tool) -> Tool:
 
 # Unreleased on the Switch: shown only while pokeldn.app.preview is enabled (docs/rse.md).
 RSE = Game("rse", tr('catalog.rse_name', 'Ruby, Sapphire & Emerald'), tr('catalog.rse_short', 'RSE'), "rse.md",
-           tuple(rse_tool(tool) for tool in FRLG.tools))
+           tuple(rse_tool(tool) for tool in FRLG.tools
+                 if tool.key not in ("frlg-localization", "frlg-localization-display", "frlg-localization-story")))
 
 LGPE_STEPS = tr('catalog.x_communicate_local_communication_trade_enter_the_same__d54e70', 'X, Communicate, Local Communication, Trade, enter the same link code, then search.')
 

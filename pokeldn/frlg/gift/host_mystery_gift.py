@@ -86,6 +86,9 @@ class HostMysteryGiftEngine:
         self.timing = timing if timing is not None else DEFAULT_MYSTERY_GIFT_TIMING
         self.log = log
         self.info = getattr(log, "info", log)
+        if server is not None:
+            if any(x is not None for x in (card, ram_script, distribution, per_build, expect_console)):
+                raise ValueError("pass either a server or distribution configuration")
         self.server = server
         if server is None:
             if distribution is not None:
@@ -103,6 +106,7 @@ class HostMysteryGiftEngine:
                     for code, chosen in per_build.items()}
             self.server = MysteryGiftServer(
                 card, ram_script, log=log, expect_console=expect_console, **server_extras)
+        self._server_waiting = False
 
         self.state = MG_LINK_PLAYER
         self.state_history = [self.state]
@@ -206,6 +210,7 @@ class HostMysteryGiftEngine:
         self._pump_server()
 
     def _pump_server(self):
+        self._server_waiting = False
         while self.state == MG_GIFT:
             action = self.server.run()
             kind = action[0]
@@ -225,6 +230,15 @@ class HostMysteryGiftEngine:
             if kind == "done":
                 self._finish_gift(action[1])
                 return
+            if kind == "wait":
+                self._server_waiting = True
+                return
+            raise ValueError(f"unknown Mystery Gift server action: {kind!r}")
+
+    def on_host_stop(self):
+        abort = getattr(self.server, "abort", None)
+        if abort is not None:
+            abort("Mystery Gift host stopped or disconnected")
 
     def _queue_message(self, ident, payload, size):
         blocks = mg_link.build_message(ident, payload, size)
@@ -403,6 +417,18 @@ class HostMysteryGiftEngine:
 
     def tick(self):
         """One VBlank; returns the parent's seven-word gSendCmd row."""
+        if self.state == MG_GIFT and getattr(self.server, "connection_lost", False):
+            self.on_host_stop()
+            self._words.clear()
+            self._blocks.clear()
+            self._sender = None
+            self.disconnect_requested = True
+            self._set_state(MG_CLOSE)
+            # HostSession sends D only after a READY_CLOSE_LINK poll. An idle row
+            # leaves close_poll_sent false and can trap an aborted RPC in MG_CLOSE.
+            return rfu.close_link_words(self._exit_count)
+        if self._server_waiting and self.state == MG_GIFT:
+            self._pump_server()
         self._parent_polls += 1
         if self.state in (MG_LINK_PLAYER, MG_START, MG_GIFT):
             self._status_countdown -= 1

@@ -139,3 +139,6 @@ use those trademarks or any other Pokemon intellectual property is granted.
 
 The authors do not endorse using pokeldn for commercial, promotional or branded events, including
 Mystery Gift distributions. Anyone who does so is responsible for obtaining the rights it requires.
+
+The prototype bitmap glyphs in [localization assets](pokeldn/frlg/localization/assets/README.md)
+are separately licensed under SIL OFL 1.1, with their source copyright and license included.

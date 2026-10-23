@@ -193,4 +193,7 @@ class HostSession:
 
     def on_ldn_leave(self):
         self.stopped = True
+        on_stop = getattr(self.activity, "on_host_stop", None)
+        if on_stop is not None:
+            on_stop()
         self.rfu.on_ldn_leave()

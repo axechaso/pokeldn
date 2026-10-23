@@ -406,6 +406,9 @@ class HostApplication:
             self.interrupted = True
             self.log("[host] interrupted; shutting down")
         finally:
+            on_stop = getattr(getattr(self.session, "activity", None), "on_host_stop", None)
+            if on_stop is not None:
+                on_stop()
             screen.drain()
             if self.injector is not None:
                 self.injector.stop()
