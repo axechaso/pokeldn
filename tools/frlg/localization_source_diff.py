@@ -10,7 +10,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from pokeldn.frlg.localization import LocalizationError, canonical
-from pokeldn.frlg.localization.chinese import coverage_texts, parse_charmap
+from pokeldn.frlg.localization.chinese import (coverage_texts, encode_text,
+                                                parse_definitions)
 from pokeldn.frlg.localization.source_diff import compare_sources, translation_map
 
 
@@ -38,10 +39,17 @@ def main(argv=None):
         result["translation_map"] = str(args.output.resolve())
         result["translation_entries"] = len(translations)
         if args.charmap:
-            mapping = parse_charmap(args.charmap)
+            mapping, macros = parse_definitions(args.charmap)
             result["translation_coverage"] = {
                 "charmap_characters": len(mapping),
                 **coverage_texts(translations.values(), mapping),
+            }
+            encoded_lengths = [len(encode_text(text, mapping, macros))
+                               for text in translations.values()]
+            result["encoding"] = {
+                "macros": len(macros), "entries": len(encoded_lengths),
+                "bytes": sum(encoded_lengths),
+                "max_entry_bytes": max(encoded_lengths, default=0),
             }
         encoded = canonical(result) + b"\n"
         if args.report:

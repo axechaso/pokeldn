@@ -10,7 +10,8 @@ import pytest
 from pokeldn.frlg.localization import LocalizationError
 from pokeldn.frlg.localization.catalog import (manifest, report, scan_source,
                                                 validate_translations)
-from pokeldn.frlg.localization.chinese import coverage, coverage_texts, parse_charmap
+from pokeldn.frlg.localization.chinese import (coverage, coverage_texts, encode_text,
+                                                parse_charmap, parse_definitions)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -111,6 +112,14 @@ def test_parse_charmap_and_coverage(tmp_path):
     assert result["two_byte_characters"] == 2
     assert result["code_min"] == 0x0100 and result["code_max"] == 0x0101
     assert coverage_texts(["你好"], mapping)["mapped_all"]
+
+
+def test_encode_text_uses_two_byte_glyphs_and_source_controls(tmp_path):
+    path = tmp_path / "charmap.txt"
+    path.write_text("'你' = 0100\nPLAYER = FD 01\nCLEAR = FC 11\n", encoding="utf-8")
+    mapping, macros = parse_definitions(path)
+    assert encode_text("你{PLAYER}\n{CLEAR 0x01}$", mapping, macros) == bytes.fromhex(
+        "0100fd01fefc1101ff")
 
 
 def test_parse_charmap_rejects_conflicts(tmp_path):
