@@ -39,6 +39,22 @@ python tools/frlg/localization_catalog.py `
 完整盘点，仍不会生成可安装的 ROM 补丁；下一步才是把源码构建产物接入版本专用差分并
 在 mGBA 中逐批验收。
 
+要把英文键和中文源逐条对齐，使用：
+
+```powershell
+python tools/frlg/localization_source_diff.py `
+  --base-dir C:/private/pokefirered `
+  --translated-dir C:/private/PretFRLG `
+  --charmap C:/private/PretFRLG/charmap.txt `
+  --output C:/private/frlg-translations.json `
+  --report C:/private/frlg-source-diff.json
+```
+
+当前外部源码的对齐结果是 12,791 条共同文本、9,146 条已变化、0 条英文键缺失；
+另有 415 条中文分支独有记录。报告还标出 397 条占位符不一致、1 条结束符不一致和
+935 条有意为空的字符串。`--strict` 会在这些控制项未复核前拒绝输出，避免把语义
+不同的变量直接送入 ROM 编码阶段。
+
 ## 上游与固件基线
 
 2026-10-19 从 GitHub 重新获取并同步上游 `main`，固定提交为
