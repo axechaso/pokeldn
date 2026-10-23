@@ -38,6 +38,21 @@ def test_intro_fits_two_native_dialogue_pages(font):
     assert b"\xfd" not in encoded  # Player has not been named in Oak's first speech.
 
 
+def test_extended_dialogue_covers_more_glyphs_and_controls(font):
+    text = ("{PLAYER}，你好！Route 1\n欢迎来到宝可梦的世界。{CLEAR}"
+            "。一世界伙伴你冒到可吧和好宝\n展开探新来梦欢迎界的索起迎险！")
+    encoded, subset, selectors, report = encode_demo(text, font)
+    assert report["pages"] == 2
+    assert report["max_line_width"] == 218
+    assert len(selectors) == 28
+    assert set(selectors) == set(char for char in text if ord(char) > 127)
+    assert encoded.count(b"\xfe") == 2
+    assert encoded.count(b"\xfb") == 2
+    assert encoded.endswith(b"\xfb\xff")
+    assert len(encoded) == 102
+    assert len(subset.glyphs) == 28
+
+
 def test_source_difference_refuses_before_mutation(tmp_path, font):
     (tmp_path / "src").mkdir()
     path = tmp_path / "src/text.c"
