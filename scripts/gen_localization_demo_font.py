@@ -41,23 +41,30 @@ def main():
     parser.add_argument("source", type=Path)
     parser.add_argument("--text", type=Path, help="UTF-8 dialogue whose glyphs should be included")
     parser.add_argument("--output", type=Path, default=ROOT / "pokeldn/frlg/localization/assets/demo-font.json")
+    parser.add_argument("--size", type=int, default=14, help="font size in pixels")
+    parser.add_argument("--stroke-width", type=int, default=0,
+                        help="extra outline pixels used to thicken the rasterized glyph")
     args = parser.parse_args()
+    if args.size < 1 or args.stroke_width < 0:
+        parser.error("--size must be positive and --stroke-width must be non-negative")
     data = args.source.read_bytes()
     if sha256(data) != SOURCE_SHA256:
         parser.error("source font does not match the pinned Noto source SHA-256")
-    font = ImageFont.truetype(str(args.source), size=14)
+    font = ImageFont.truetype(str(args.source), size=args.size)
     text = args.text.read_text(encoding="utf-8") if args.text else DEMO_DIALOGUE
     chars = {t["char"] for t in tokenize(text) if t["kind"] == "glyph"}
     chars.update(chr(x) for x in range(32, 127))
     glyphs = {}
     for char in sorted(chars):
         image = Image.new("L", (16, 16))
-        ImageDraw.Draw(image).text((0, 13), char, font=font, fill=255, anchor="ls")
+        ImageDraw.Draw(image).text((0, 13), char, font=font, fill=255, anchor="ls",
+                                    stroke_width=args.stroke_width, stroke_fill=255)
         glyphs[char] = Glyph(min(16, max(1, math.ceil(font.getlength(char)))),
                              pack_pixels(bytes((value * 3 + 127) // 255 for value in image.tobytes())))
     source = {"url": f"https://github.com/notofonts/noto-cjk/blob/{SOURCE_COMMIT}/{SOURCE_PATH}",
               "commit": SOURCE_COMMIT, "sha256": sha256(data), "license": "OFL-1.1",
-              "copyright": copyrights(data), "rasterizer": f"Pillow {__version__}, 14px, baseline 13"}
+              "copyright": copyrights(data),
+              "rasterizer": f"Pillow {__version__}, {args.size}px, baseline 13, stroke {args.stroke_width}"}
     result = BitmapFont("FRLG Prototype Glyphs", source, glyphs)
     output = args.output
     output.write_bytes(canonical(result.as_dict()) + b"\n")

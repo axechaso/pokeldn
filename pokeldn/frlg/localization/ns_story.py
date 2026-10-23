@@ -17,6 +17,9 @@ from .gift_transport import GiftBridge, GiftTransport, LocalizationGiftOperation
 from .probe import ProbeTarget
 
 TEXT = "科学的力量真伟大！"
+# The 2bpp source contains a light anti-alias level. Keeping that level as ink
+# gives the 1bpp resident renderer a fuller stroke at the GBA's native scale.
+GLYPH_INK_THRESHOLD = 1
 RESIDENT = 0x0203FC00
 SLOT_SIZE = 1024
 STAGED, INSTALLED, ALREADY_INSTALLED = 0x5A485331, 0x5A485332, 0x5A485341
@@ -52,7 +55,7 @@ def build_story_blob():
     mono = bytearray()
     for char in TEXT:
         pixels = unpack_pixels(font.glyphs[char].packed)
-        mono.extend(sum(int(pixels[i + bit] >= 2) << bit for bit in range(8))
+        mono.extend(sum(int(pixels[i + bit] >= GLYPH_INK_THRESHOLD) << bit for bit in range(8))
                     for i in range(0, 256, 8))
     if len(mono) != 288 or len(blob) > SLOT_SIZE:
         raise LocalizationError("NPC dialogue resident layout changed")
