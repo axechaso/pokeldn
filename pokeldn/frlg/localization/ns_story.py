@@ -17,9 +17,9 @@ from .gift_transport import GiftBridge, GiftTransport, LocalizationGiftOperation
 from .probe import ProbeTarget
 
 TEXT = "科学的力量真伟大！"
-# The 2bpp source contains a light anti-alias level. Keeping that level as ink
-# gives the 1bpp resident renderer a fuller stroke at the GBA's native scale.
-GLYPH_INK_THRESHOLD = 1
+# Drop the lightest 2bpp anti-alias level so adjacent Chinese strokes stay separate
+# when the resident renderer reduces each glyph to 1bpp at the GBA's native scale.
+GLYPH_INK_THRESHOLD = 2
 RESIDENT = 0x0203FC00
 SLOT_SIZE = 1024
 STAGED, INSTALLED, ALREADY_INSTALLED = 0x5A485331, 0x5A485332, 0x5A485341

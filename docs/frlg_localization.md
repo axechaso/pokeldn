@@ -275,7 +275,7 @@ python tools/frlg/localization_emulator_smoke.py --core PATH_TO_MGBA_LIBRETRO --
 
 实验复用游戏现有 `F9` 额外字形解码，限定国际版 normal／male 字体的 `40..CF` 选择符区间，
 现有 `00..17` 符号、`D0..FE` 表情和日文字体继续走原有分支。
-剧情首句的 9 个汉字从提交的 13 px、16×16、2bpp 位图生成；常驻代码将 2bpp 的一级以上墨色
+剧情首句的 9 个汉字从提交的 14 px、16×16、2bpp 位图生成；常驻代码将 2bpp 的二级以上墨色
 压成 1bpp，再转换成游戏需要的四块 8×8、4bpp 像素，使用游戏当前文字颜色。游戏推进仍固定为
 14 px，原有换行、按键清页、终止符沿用；姓名与联机字段未改变。这个小字库通道不作为完整汉化的通用编码。
 
@@ -285,7 +285,7 @@ python tools/frlg/localization_emulator_smoke.py --core PATH_TO_MGBA_LIBRETRO --
 外部核心、游戏映像与截图留在本机忽略目录中。
 
 2026-10-23 的字体复验使用同一 mGBA 核心和 `scratchpad/verify-ns-story-gba.py`，
-以 13 px 字形、1bpp 一级墨色阈值运行 10,440 帧；两个 RAM 上传阶段分别返回
+以 14 px 字形、1bpp 二级墨色阈值运行 10,440 帧；两个 RAM 上传阶段分别返回
 `0x5A485331` 和 `0x5A485332`，`frame-009240.png` 显示完整中文首句，之后英文续页和清页路径继续通过，
 软复位回读确认常驻槽已清空。该复验仍是离线模拟器结果，`switch_verified` 与 `retail_write_eligible` 保持 `false`。
 
