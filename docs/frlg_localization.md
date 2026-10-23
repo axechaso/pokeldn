@@ -14,7 +14,30 @@ nav_exclude: true
 | P1 修改版 Ryubing 复现 | 未执行；已构建匹配原版并用 mGBA 验证源码渲染原型，仍未验证 Switch 包装器 |
 | P2 零售机单页验证 | 4 KiB 实机只读采集及正常断开已通过；页写入、恢复与取指尚待验收 |
 | P3 中文编码、字库、渲染 | NS 神秘礼物窗口临时中文显示已由用户确认；新增一处 NPC 首句的 RAM 字体分发原型，等待 NS 实机验收。另有 mGBA 两页中文开场源码原型；完整内容和通用编码仍未交付 |
-| P4 内容、P5 插件 | 客户端已有 NS 中文显示及只读测试入口；正式内容及完整汉化插件未实现 |
+| P4 内容、P5 插件 | 已加入完整文本目录扫描和中文字符覆盖检查；客户端已有 NS 中文显示及只读测试入口，正式 ROM 内容补丁及完整汉化插件未实现 |
+
+## 全文文本目录与中文字符覆盖
+
+现在可以把外部的完整 FRLG 源码检出转换成可审阅的文本目录。扫描器覆盖
+`data`、`src` 和 `include` 下的 `.string`／`.braille` 记录，以及 C 源码中的
+`_()`／`__()` 字符串；会保留换行、滚动、清页和变量占位符，并处理跨行拼接的 C
+字面量。源码、字库和 ROM 都不进入本仓库。
+
+可用已有的完整中文源码作为覆盖检查输入，例如[开源 PretFRLG 中文分支](https://github.com/Xzonn/PretFRLG)：
+
+```powershell
+python tools/frlg/localization_catalog.py `
+  --source-dir C:/private/PretFRLG `
+  --charmap C:/private/PretFRLG/charmap.txt `
+  --output C:/private/frlg-text-catalog.json `
+  --report C:/private/frlg-text-report.json
+```
+
+报告会给出文本条目、字符、控制符和占位符数量，以及中文字符表是否覆盖全部出现的
+字符。当前验证结果为 13,206 个条目、398 个文件、2,794 个不同字符，中文字符表覆盖
+率为 2,794/2,794，包含 2,558 个双字节字符。这个阶段只证明文本资源和编码表可以
+完整盘点，仍不会生成可安装的 ROM 补丁；下一步才是把源码构建产物接入版本专用差分并
+在 mGBA 中逐批验收。
 
 ## 上游与固件基线
 
