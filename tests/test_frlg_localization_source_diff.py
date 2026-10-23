@@ -30,3 +30,25 @@ def test_compare_sources_reports_changes_and_control_mismatches(tmp_path):
         "data/text/sample.inc::Greeting": "你好 {STR_VAR_1}$"}
     with pytest.raises(LocalizationError, match="incompatible"):
         translation_map(comparison, strict=True)
+
+
+def test_compare_sources_normalizes_alias_macros_to_game_bytes(tmp_path):
+    base = _tree(tmp_path / "base", 'Greeting::\n    .string "Hello {STR_VAR_1}$"\n')
+    translated = _tree(tmp_path / "translated",
+                        'Greeting::\n    .string "你好 {B_COPY_VAR_1}$"\n')
+    comparison = compare_sources(base, translated,
+                                 macros={"STR_VAR_1": b"\\xfd\\x02",
+                                         "B_COPY_VAR_1": b"\\xfd\\x02"})
+    assert comparison["placeholder_mismatches"] == []
+    assert comparison["translation_compatible"] is True
+
+
+def test_compare_sources_normalizes_split_macro_arguments(tmp_path):
+    base = _tree(tmp_path / "base",
+                 'Greeting::\n    .string "Ready {PLAY_BGM}{MUS_TEST}$"\n')
+    translated = _tree(tmp_path / "translated",
+                        'Greeting::\n    .string "准备 {PLAY_BGM 0x1B 0x01}$"\n')
+    comparison = compare_sources(
+        base, translated,
+        macros={"PLAY_BGM": b"\xfc\x0b", "MUS_TEST": b"\x1b\x01"})
+    assert comparison["placeholder_mismatches"] == []

@@ -1,16 +1,31 @@
 """Align two complete FRLG source catalogs without modifying either checkout."""
 
-from collections import Counter
 import re
 
 from . import LocalizationError
 from .catalog import report, scan_source
+from .chinese import encode_text
 
 
 _PLACEHOLDER = re.compile(r"\{[^{}]+\}")
 
 
-def compare_sources(base_root, translated_root):
+def _placeholder_signature(text, macros):
+    placeholders = _PLACEHOLDER.findall(text)
+    if macros is None:
+        return tuple(placeholders)
+    signature = bytearray()
+    for placeholder in placeholders:
+        try:
+            encoded = encode_text(placeholder, {}, macros)
+        except LocalizationError:
+            # An unknown macro must remain visible as a source-level mismatch.
+            return tuple(placeholders)
+        signature.extend(encoded)
+    return bytes(signature)
+
+
+def compare_sources(base_root, translated_root, *, macros=None):
     """Return deterministic source alignment and translation-map diagnostics.
 
     Matching is by the catalog key (relative path plus symbol/line identity).
@@ -28,8 +43,8 @@ def compare_sources(base_root, translated_root):
     changed = sorted(key for key in common if base[key].text != translated[key].text)
     placeholder_mismatches = sorted(
         key for key in common
-        if Counter(_PLACEHOLDER.findall(base[key].text))
-        != Counter(_PLACEHOLDER.findall(translated[key].text)))
+        if _placeholder_signature(base[key].text, macros)
+        != _placeholder_signature(translated[key].text, macros))
     terminator_mismatches = sorted(
         key for key in common
         if base[key].text.endswith("$") != translated[key].text.endswith("$"))

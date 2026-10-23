@@ -31,7 +31,10 @@ def main(argv=None):
                         help="refuse output when keys or controls do not align exactly")
     args = parser.parse_args(argv)
     try:
-        comparison = compare_sources(args.base_dir, args.translated_dir)
+        mapping = macros = None
+        if args.charmap:
+            mapping, macros = parse_definitions(args.charmap)
+        comparison = compare_sources(args.base_dir, args.translated_dir, macros=macros)
         translations = translation_map(comparison, strict=args.strict)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_bytes(canonical(translations) + b"\n")
@@ -39,7 +42,6 @@ def main(argv=None):
         result["translation_map"] = str(args.output.resolve())
         result["translation_entries"] = len(translations)
         if args.charmap:
-            mapping, macros = parse_definitions(args.charmap)
             result["translation_coverage"] = {
                 "charmap_characters": len(mapping),
                 **coverage_texts(translations.values(), mapping),
