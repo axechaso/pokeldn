@@ -29,6 +29,7 @@ def test_rng_assist_patches_each_build_and_fits(code):
     assert _word(blob, "p_cb2_overworld") == build.cb2_overworld | 1
     assert _word(blob, "p_original") == build.vblank_intr | 1
     assert _word(blob, "p_input_shim") == ns.RESIDENT_BASE + SYMBOLS["rng_assist_input_shim"]
+    assert SYMBOLS["OVERLAY_TWO_ROWS"] == 1
     assert len(bs.build_install_resident("rng-assist", build=code)) <= bs.MAX_BUFFER_SCRIPT_SIZE
 
 
@@ -41,4 +42,9 @@ def test_rng_assist_input_shim_follows_custom_destination():
 def test_rng_assist_state_reserves_the_whole_record():
     assert bs.RESIDENT_DATA["p_state"] == 64
     with pytest.raises(bs.BufferScriptError, match="runs into its state"):
-        bs.build_install_resident("rng-assist", dest=0x0203FD00)
+        bs.build_install_resident("rng-assist", dest=0x0203FC80)
+
+
+def test_rng_assist_rejects_an_unbounded_prediction_offset():
+    with pytest.raises(bs.BufferScriptError, match="0..255 advances"):
+        bs.build_install_resident("rng-assist", offset=256)

@@ -31,6 +31,7 @@
     .set    FLAG_ARMED,       16
     .set    FLAG_TARGET_FOUND,32
     .set    FLAG_MISSED,      64
+    .set    OVERLAY_TWO_ROWS, 1
 
     .global rng_assist_hook, rng_assist_input_shim
 rng_assist_hook:
@@ -146,6 +147,13 @@ rng_assist_hook:
     cmp     r1, r2
     bne     .Larm_done
 
+    @ A calibrated offset above 255 would make the VBlank hook unbounded.  Reject it in the
+    @ resident image as well as in the host builder, even if a stale or hand-written payload is run.
+    ldr     r5, p_offset
+    ldr     r5, [r5]
+    cmp     r5, #255
+    bhi     .Larm_invalid_offset
+
     ldr     r1, [r7]
     str     r1, [r7, #0x10]        @ trigger_seed
     str     r1, [r7, #0x18]        @ hit_seed
@@ -159,8 +167,6 @@ rng_assist_hook:
 
     @ Convert the calibrated offset from advances into a predicted state.  The bounded parameter
     @ keeps interrupt latency deterministic; host-side validation rejects values above 255.
-    ldr     r5, p_offset
-    ldr     r5, [r5]
     ldr     r1, [r7, #0x0C]
     add     r1, r5
     str     r1, [r7, #0x0C]
@@ -190,6 +196,13 @@ rng_assist_hook:
     pop     {r0}
     bx      r0
 
+.Larm_invalid_offset:
+    ldr     r0, [r7, #0x34]
+    mov     r1, #FLAG_MISSED
+    orr     r0, r1
+    str     r0, [r7, #0x34]
+    b       .Larm_done
+
 @ Inject one A after ReadKeys and run the original overworld callback exactly once.
 rng_assist_input_shim:
     push    {r4, r5, lr}
@@ -202,7 +215,7 @@ rng_assist_input_shim:
     ldr     r2, p_input_shim
     add     r2, #1
     cmp     r1, r2
-    bne     .Lshim_return
+    bne     .Lshim_abandon
     ldr     r1, [r5, #4]
     ldr     r2, p_cb2_overworld
     cmp     r1, r2
@@ -212,6 +225,14 @@ rng_assist_input_shim:
     mov     r1, #FLAG_PENDING_A
     tst     r0, r1
     beq     .Lshim_restore
+
+    @ The shim is a one-main-loop-pass handoff.  If VBlank has advanced twice before it runs,
+    @ abandon it instead of pressing A in a later scene or against a new RNG epoch.
+    ldr     r1, [r4, #0x24]
+    ldr     r2, [r4, #0x20]
+    sub     r1, r2
+    cmp     r1, #1
+    bhi     .Lshim_abort
 
     ldrh    r1, [r5, #0x2E]
     mov     r2, #1                 @ A
@@ -245,6 +266,16 @@ rng_assist_input_shim:
     str     r0, [r4, #0x34]
     ldr     r1, p_cb1_overworld
     str     r1, [r5]
+
+.Lshim_abandon:
+    @ callback1 no longer belongs to us, so leave the game's replacement in place.  Clear the
+    @ pending request to prevent a stale A from being delivered if the callback is reused later.
+    ldr     r0, [r4, #0x34]
+    mov     r1, #FLAG_PENDING_A
+    bic     r0, r1
+    mov     r1, #FLAG_MISSED
+    orr     r0, r1
+    str     r0, [r4, #0x34]
 
 .Lshim_return:
     pop     {r4, r5}

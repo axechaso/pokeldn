@@ -2129,6 +2129,7 @@ RESIDENT_HOOKS = {
 # A hook's IWRAM and ROM words are the build's [Build.hook_literals]. RESIDENT_DATA: the data a hook
 # keeps past its code, in bytes.
 RESIDENT_DATA = {"p_frames": 20, "p_ring": 140, "p_state": 64, "p_words": 12}
+RNG_ASSIST_MAX_OFFSET = 0xFF  # the resident VBlank prediction loop is bounded to 255 LCG steps
 R_BUTTON = 0x100
 # gHelpSystemToggleWithRButtonDisabled, French [RunHelpSystemCallback's literal, 0x0813F6FC].
 HELP_R_DISABLED = 0x0203F171
@@ -2152,6 +2153,14 @@ def resident_blob(name, *, build=None, dest=None, **params):
         params["overlay"] = params["state"] + 24  # the word the hook shows
     if name == "ivs" and "words" in explicit:
         params["overlay"], params["overlay2"] = params["words"], params["words"] + 4
+    if name == "rng-assist":
+        try:
+            offset = int(params["offset"])
+        except (KeyError, TypeError, ValueError):
+            raise BufferScriptError("rng-assist offset must be an integer") from None
+        if not 0 <= offset <= RNG_ASSIST_MAX_OFFSET:
+            raise BufferScriptError(
+                f"rng-assist offset must be 0..{RNG_ASSIST_MAX_OFFSET} advances to keep VBlank bounded")
     symbols = STUBS[name][2]
     if name == "rng-assist":
         # The input shim is part of the resident image.  Patch its runtime address after the
