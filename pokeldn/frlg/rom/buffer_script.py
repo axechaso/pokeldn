@@ -2120,16 +2120,21 @@ RESIDENT_HOOKS = {
     "ivs": ("ivs_hook", {"mon": 0x02024280, "words": 0x0203FF80, "overlay": 0x0203FF80,
                          "overlay2": 0x0203FF84}),
     "noencounter": ("noencounter_hook", {"flag": 0x020386D8}),
+    "rng-assist": ("rng_assist_hook", {
+        "auto_a": 0, "trigger_index": 0, "offset": 0, "target_pid": 0, "target_nature": 0,
+        "mode": 0, "state": 0x0203FF80, "overlay": 0x0203FF80, "overlay2": 0x0203FFBC,
+        "overlay_tiles": 0x06017E00, "overlay_pal": 0x020379D6,
+    }),
 }
 # A hook's IWRAM and ROM words are the build's [Build.hook_literals]. RESIDENT_DATA: the data a hook
 # keeps past its code, in bytes.
-RESIDENT_DATA = {"p_frames": 20, "p_ring": 140, "p_state": 36, "p_words": 12}
+RESIDENT_DATA = {"p_frames": 20, "p_ring": 140, "p_state": 64, "p_words": 12}
 R_BUTTON = 0x100
 # gHelpSystemToggleWithRButtonDisabled, French [RunHelpSystemCallback's literal, 0x0813F6FC].
 HELP_R_DISABLED = 0x0203F171
 
 
-def resident_blob(name, *, build=None, **params):
+def resident_blob(name, *, build=None, dest=None, **params):
     """-> (THUMB bytes, entry offset, p_original offset) for one of RESIDENT_HOOKS, on `build`."""
     from pokeldn.frlg.rom import native_script
     from pokeldn.frlg.rom.resident_stubs import STUBS
@@ -2148,6 +2153,11 @@ def resident_blob(name, *, build=None, **params):
     if name == "ivs" and "words" in explicit:
         params["overlay"], params["overlay2"] = params["words"], params["words"] + 4
     symbols = STUBS[name][2]
+    if name == "rng-assist":
+        # The input shim is part of the resident image.  Patch its runtime address after the
+        # final destination is known instead of relying on ARMv4T's short-range ADR encoding.
+        image_base = native_script.RESIDENT_BASE if dest is None else int(dest)
+        params["input_shim"] = image_base + symbols["rng_assist_input_shim"]
     literals = {key: value for key, value in builds.resolve(build).hook_literals().items()
                 if f"p_{key}" in symbols}
     words = native_script.resident_words(name, **params, **literals)
@@ -2161,7 +2171,7 @@ def build_install_resident(name, *, dest=None, table=None, build=None, **params)
     build = builds.resolve(build)
     dest = native_script.RESIDENT_BASE if dest is None else dest
     table = build.intr_vblank if table is None else table
-    blob, entry, original = resident_blob(name, build=build, **params)
+    blob, entry, original = resident_blob(name, build=build, dest=dest, **params)
     code = bytearray(payload(INSTALL_RESIDENT))
     if len(code) + len(blob) > MAX_BUFFER_SCRIPT_SIZE:
         raise BufferScriptError(
