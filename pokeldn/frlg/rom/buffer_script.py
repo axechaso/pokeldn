@@ -86,7 +86,7 @@ INSTALL_RESIDENT = "install-resident"
 INSTALL_KEPT = "install-kept"
 
 # Save flash: 32 sectors of 0x1000 [decomp:include/save.h]. Only swi 0x48 and swi 0x56 write it
-# [docs/frlg_rom.md, the Sloop syscall boundary].
+# [docs/frlg_rom.md, the dispatcher and its jump table].
 FLASH_BASE, FLASH_SIZE = 0x0E000000, 0x00020000
 FLASH_SECTOR_SIZE = 0x1000
 # 0x48 writes a sector; 0x56 writes and then voids the destination's signature at +0xFF8.
@@ -1007,24 +1007,6 @@ def chain_call(function, args=(), *, arg_from_prev=False):
                      arg_from_prev=bool(arg_from_prev))
 
 
-def chain_read(address, size=4, *, from_prev=False, keep_prev=False):
-    """A READ step of 1, 2 or 4 bytes; `keep_prev` leaves the pointer as prev."""
-    op = {4: CHAIN_READ32, 2: CHAIN_READ16, 1: CHAIN_READ8}.get(int(size))
-    if op is None:
-        raise BufferScriptError(f"a read is 1, 2 or 4 bytes, got {size}")
-    return ChainStep(op, int(address), target_from_prev=bool(from_prev),
-                     keep_prev=bool(keep_prev))
-
-
-def chain_write(address, value=0, size=2, *, from_prev=False, value_from_prev=False):
-    """A WRITE step of 1, 2 or 4 bytes, which reads itself back into the answer."""
-    op = {4: CHAIN_WRITE32, 2: CHAIN_WRITE16, 1: CHAIN_WRITE8}.get(int(size))
-    if op is None:
-        raise BufferScriptError(f"a write is 1, 2 or 4 bytes, got {size}")
-    return ChainStep(op, int(address), (int(value) & 0xFFFFFFFF,),
-                     target_from_prev=bool(from_prev), arg_from_prev=bool(value_from_prev))
-
-
 def parse_chain_step(text, resolve=None):
     """-> a ChainStep from `OP[+keep]:TARGET[,ARG]...`: `call:FlagSet,0x828`, `write16:prev,7`,
     `read32:prev+4`. Only the first argument may be `prev[+N]`. A named call keeps its name so
@@ -1652,7 +1634,7 @@ SCRIPT_REGISTRY = {
     FLASH_WRITE: BufferScriptSpec(
         FLASH_WRITE,
         "compose 4 KB in EWRAM on the console and write it straight into a flash sector with "
-        "swi 0x48, bypassing the game's save code entirely - no counter, checksum or signature "
+        "swi 0x48, instead of going through the game's save code entirely - no counter, checksum or signature "
         "(--flash-sector, --flash-fill-base, --flash-fill-step, --flash-words; a sector inside "
         "the save bands needs --write-unsafe)",
         None),
@@ -1836,7 +1818,7 @@ def build_flash_write(sector, *, source=FLASH_WRITE_SCRATCH, fill_base=0x4657000
                       footer=False, sector_id=0, counter=0, signature=SECTOR_SIGNATURE,
                       derive=False, counter_bias=0, position=None, build=None):
     """The flash-write payload: fill `words` words at `source`, then swi `number` into `sector`,
-    bypassing the game's save code. Refuses a save-band sector unless `unsafe`. `derive` reads
+    instead of going through the game's save code. Refuses a save-band sector unless `unsafe`. `derive` reads
     `build`'s save globals."""
     build = builds.resolve(build)
     sector = int(sector)
@@ -2125,6 +2107,7 @@ INSTALL_ENTRY_OFFSET = 0x10
 INSTALL_ORIGINAL_OFFSET = 0x14
 INSTALL_BLOB_OFFSET = 0x18
 # Entry symbol and tunable parameters per hook.
+SHINY_PRESS_OFFSET = 1  # measured on Mewtwo in mGBA: its PID is two calls after the press frame's seed
 RESIDENT_HOOKS = {
     "turbo": ("turbo_hook", {"extra": 4, "field": 0, "battle": 0, "overlay": 0, "hold": 0,
                              "help": 0, "budget": 0, "ring": 0,
@@ -2135,6 +2118,10 @@ RESIDENT_HOOKS = {
     "shiny": ("shiny_hook", {"method": 0, "offset": 4, "search": 16, "slow": 0x100,
                              "slow_frames": 3, "help": 0x0203F171, "state": 0x0203FF80,
                              "overlay": 0x0203FF98}),
+    # shiny with no slow motion: A pressed at a waitbuttonpress when the countdown is 0, a scripted
+    # CreateMon by default [asm/resident/shiny.inc, PRESS]
+    "shiny-press": ("shiny_hook", {"method": 1, "offset": SHINY_PRESS_OFFSET, "search": 16,
+                                   "state": 0x0203FF80, "overlay": 0x0203FF98}),
     "ivs": ("ivs_hook", {"mon": 0x02024280, "words": 0x0203FF80, "overlay": 0x0203FF80,
                          "overlay2": 0x0203FF84}),
     "noencounter": ("noencounter_hook", {"flag": 0x020386D8}),
@@ -2160,9 +2147,9 @@ HELP_R_DISABLED = 0x0203F171
 # Several hooks resident at once: "turbo+noencounter", settings as "turbo.field=2". Laid out back to
 # back from RESIDENT_BASE, each one's p_original the next one's entry, so the installers see one hook.
 CHAIN = "+"
-CHAIN_ORDER = ("turbo", "turbo-lite", "noclip", "shiny", "ivs", "noencounter")   # turbo's passes last
+CHAIN_ORDER = ("turbo", "turbo-lite", "noclip", "shiny", "shiny-press", "ivs", "noencounter")   # turbo's passes last
 # Data a hook keeps outside its code, by parameter, and its size.
-CHAIN_DATA = {"turbo": {"frames": 20}, "turbo-lite": {"frames": 20}, "shiny": {"state": 36}, "ivs": {"words": 12}, "noclip": {"state": 24}}
+CHAIN_DATA = {"turbo": {"frames": 20}, "turbo-lite": {"frames": 20}, "shiny": {"state": 36}, "shiny-press": {"state": 36}, "ivs": {"words": 12}, "noclip": {"state": 24}}
 # The free word range under the kept handler: RESIDENT_DATA_FLOOR..0x0203FBFC.
 CHAIN_LOW = (RESIDENT_DATA_FLOOR, 0x0203FBFC)
 
@@ -2192,7 +2179,7 @@ def _chain_blob(names, build, params):
         if hook not in own or not field:
             raise BufferScriptError(f"{key}: a setting of a chain is HOOK.NAME, HOOK one of {names}")
         own[hook][field] = value
-    drawing = [n for n in names if n in ("shiny", "ivs") or (n == "turbo" and own[n].get("overlay"))]
+    drawing = [n for n in names if n in ("shiny", "shiny-press", "ivs") or (n == "turbo" and own[n].get("overlay"))]
     if len(drawing) > 1:
         raise BufferScriptError(f"{' and '.join(drawing)} both draw in the screen's top-right corner")
     sizes = [len(STUBS[n][0]) for n in names]
@@ -2244,7 +2231,7 @@ def resident_blob(name, *, build=None, **params):
     params = {**defaults, **params}
     if name in ("turbo", "turbo-lite") and params["hold"] & R_BUTTON and "help" not in explicit:
         params["help"] = build.ewram.get("help", HELP_R_DISABLED)  # held R would open the Help System
-    if name == "shiny" and "state" in explicit and "overlay" not in explicit:
+    if name in ("shiny", "shiny-press") and "state" in explicit and "overlay" not in explicit:
         params["overlay"] = params["state"] + 24  # the word the hook shows
     if name == "follower" and params["deoxys"] is None:
         # the version's form: Attack on FireRed, Defense on LeafGreen [asm/resident/follower.s]

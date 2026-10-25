@@ -221,6 +221,11 @@ BOOST_LIST = (
           _plain("No grass, water or roaming encounters; fishing and Sweet Scent still work")),
     Boost("hook-shiny", "Shiny countdown", "Counts down to the next shiny in the grass.", "shiny", _shiny,
           (Option("button", "Slow the game down", R, BUTTONS), Option("slower", "By", "3", SLOWER))),
+    Boost("hook-shiny-press", "Shiny Mewtwo", "Presses A for you at Mewtwo's cry, on a shiny frame.",
+          "shiny-press", _plain(
+              "Counts down to the next shiny Mewtwo, top right of the screen",
+              "Talk to Mewtwo, then let go of the buttons: when its cry ends, the game presses A by itself "
+              "on a shiny frame. This can take a few minutes")),
     Boost("hook-ivs", "Lead's IVs on screen", "The lead Pokemon's IVs and nature, top right.", "ivs",
           _plain("The lead Pokemon's six IVs and its nature, top right of the overworld")),
     Boost("hook-follower", "Pokemon follower", "Your lead Pokemon walks behind you.", "follower",
@@ -229,7 +234,7 @@ BOOST_LIST = (
 )
 BOOST = {b.key: b for b in BOOST_LIST}
 # Each draws in the top-right corner [docs/frlg_rom.md, turbo overlay]; one at a time.
-DRAWING = ("hook-shiny", "hook-ivs")
+DRAWING = ("hook-shiny", "hook-shiny-press", "hook-ivs")
 
 
 def _hook_args(name, params, keep):
@@ -600,19 +605,24 @@ def _where(path):
 def _step_line(step, name):
     kind = step.get("type")
     if kind == "pokemon":
-        return f"Gives {species_name(step.get('species'))}, level {step.get('level') or 5}"
+        return f"Gives {name('species', step.get('species'))}, level {step.get('level') or 5}"
     if kind == "egg":
-        return f"Gives a {species_name(step.get('species'))} egg"
+        return f"Gives a {name('species', step.get('species'))} egg"
     if kind == "item":
         quantity = int(step.get("quantity") or 1)
         return f"Gives {name('item', step.get('item'))}" + (f" x{quantity}" if quantity > 1 else "")
     if kind == "battle":
-        return f"Starts a battle with a wild {species_name(step.get('species'))}, level {step.get('level') or 5}"
+        return f"Starts a battle with a wild {name('species', step.get('species'))}, level {step.get('level') or 5}"
     return f"Says “{str(step.get('text', '')).splitlines()[0] if step.get('text') else ''}”"
 
 
-def describe(state, name=lambda kind, n: f"{kind} #{n}"):
-    """(when it runs, [what happens]) for the summary before sending; `name(kind, id)` names an item."""
+def _name(kind, n):
+    return species_name(n) if kind == "species" else f"{kind} #{n}"
+
+
+def describe(state, name=_name):
+    """(when it runs, [what happens]) for the summary before sending; `name(kind, id)` names an item, or a
+    species by its cartridge id."""
     kind = state.get("kind", "card")
     if kind == "news":
         return "Shown on the Wonder News screen as soon as it is received.", [
