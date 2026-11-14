@@ -19,6 +19,7 @@
 #include "pro_report.h"
 
 #define LED_GPIO 2 // the DevKit's blue LED, lit while paired
+#define PAIR_GPIO 0 // hold BOOT for two seconds while running to pair with a different receiver
 #define PAYLOAD 48 // 0x21 and 0x30 after the report ID
 
 static const char *TAG = "pad"; // compiled out at CONFIG_LOG_DEFAULT_LEVEL_NONE
@@ -46,6 +47,7 @@ static uint8_t descriptor[] = {
     0x02, 0xc0};
 
 static volatile bool open_, paired, full_mode;
+static volatile bool registered;
 static uint8_t timer;
 static uint8_t mac[6];
 static QueueHandle_t replies; // 48-byte 0x21 payloads, sent ahead of 0x30
@@ -141,7 +143,18 @@ static void sender_task(void *arg)
 {
     uint8_t p[PAYLOAD], sent[9] = {0};
     TickType_t last = 0;
+    TickType_t pair_since = xTaskGetTickCount();
+    bool pair_requested = false;
     for (;;) {
+        TickType_t pair_now = xTaskGetTickCount();
+        if (gpio_get_level(PAIR_GPIO)) {
+            pair_since = pair_now;
+            pair_requested = false;
+        } else if (registered && !pair_requested && pair_now - pair_since >= pdMS_TO_TICKS(2000)) {
+            // A normal disconnect retains the HID virtual cable and can reject a new BlueRetro host.
+            pair_requested = true;
+            esp_bt_hid_device_virtual_cable_unplug();
+        }
         // A reply goes first; 0x30 waits while the Switch still sets the controller up.
         if (xQueueReceive(replies, p, pdMS_TO_TICKS(5)) == pdTRUE) {
             if (open_)
@@ -206,6 +219,7 @@ static void hidd_cb(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param)
             esp_bt_hid_device_register_app(&app, &qos, &qos);
         break;
     case ESP_HIDD_REGISTER_APP_EVT: {
+        registered = param->register_app.status == ESP_HIDD_SUCCESS;
         pad_stage(5);
         esp_bt_cod_t cod = {.service = 1, .major = 5, .minor = 2}; // 0x002508, a gamepad
         esp_bt_gap_set_cod(cod, ESP_BT_SET_COD_ALL);
@@ -230,6 +244,16 @@ static void hidd_cb(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param)
         gpio_set_level(LED_GPIO, 0);
         pad_disconnected();
         discoverable(true);
+        break;
+    case ESP_HIDD_VC_UNPLUG_EVT:
+        if (param->vc_unplug.status == ESP_HIDD_SUCCESS) {
+            open_ = paired = full_mode = false;
+            xQueueReset(replies);
+            gpio_set_level(LED_GPIO, 0);
+            pad_disconnected();
+            pad_stage(5);
+            discoverable(true);
+        }
         break;
     case ESP_HIDD_INTR_DATA_EVT:
         if (param->intr_data.report_id == 0x01)
@@ -292,6 +316,9 @@ void app_main(void)
     gpio_reset_pin(LED_GPIO);
     gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
     gpio_set_level(LED_GPIO, 0);
+    gpio_reset_pin(PAIR_GPIO);
+    gpio_set_direction(PAIR_GPIO, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(PAIR_GPIO, GPIO_PULLUP_ONLY);
     replies = xQueueCreate(8, PAYLOAD);
     uart_link_start(mounted);
 
