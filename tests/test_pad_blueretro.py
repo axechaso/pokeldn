@@ -1,19 +1,15 @@
 """Interoperate with BlueRetro v25.10-beta's actual Nintendo receiver, not a mirrored handshake."""
 import ctypes
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
 
 from pokeldn.pad import macro
+from pad_compile import compile_c
 
 
 @pytest.fixture(scope="module")
 def blue(tmp_path_factory):
-    cc = shutil.which("cc") or shutil.which("gcc")
-    if not cc:
-        pytest.skip("no C compiler")
     root = Path(__file__).resolve().parents[1]
     fixture = root / "tests/fixtures/blueretro"
     folder = tmp_path_factory.mktemp("blueretro")
@@ -21,12 +17,12 @@ def blue(tmp_path_factory):
                  "tools/util.h", "tests/cmds.h"):
         path = folder / name
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text('#include "host.h"\n', encoding="utf-8")
+        path.write_text('#include "blue_host.h"\n', encoding="utf-8")
     library = folder / "receiver.so"
-    subprocess.run([cc, "-shared", "-fPIC", "-O1", "-I", str(folder), "-I", str(fixture),
-                    "-I", str(fixture / "upstream"), "-I", str(root / "firmware/pad/main"),
-                    str(fixture / "upstream/sw.c"), str(fixture / "host.c"),
-                    str(root / "firmware/pad/main/pro_report.c"), "-o", str(library)], check=True)
+    compile_c(library, [fixture / "upstream/sw.c", fixture / "host.c", root / "firmware/pad/main/pro_report.c"],
+              includes=(folder, fixture, fixture / "upstream", root / "firmware/pad/main"),
+              exports=("blue_name", "blue_begin", "blue_next", "blue_deliver", "blue_ready",
+                       "blue_calibration", "blue_last_report", "pro_reply", "pro_state"))
     so = ctypes.CDLL(str(library))
     so.pro_reply.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p,
                             ctypes.c_void_p, ctypes.c_uint8, ctypes.c_void_p)

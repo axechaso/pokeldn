@@ -3,7 +3,12 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+#ifdef _MSC_VER
+#define __packed
+#pragma pack(push, 1)
+#else
 #define __packed __attribute__((packed))
+#endif
 #include "hidp.h"
 #define BT_MAX_DEV 1
 #define BT_HCI_H4_HDR_SIZE 1
@@ -37,7 +42,8 @@ struct bt_hci_pkt {
     uint8_t hidp_data[1024];
 };
 struct bt_data { struct { uint8_t output[128]; struct bt_ids *pids; } base; };
-extern struct { struct bt_data data[BT_MAX_DEV]; } bt_adapter;
+struct bt_host_adapter { struct bt_data data[BT_MAX_DEV]; };
+extern struct bt_host_adapter bt_adapter;
 extern struct bt_hci_pkt bt_hci_pkt_tmp;
 void bt_type_update(int32_t id, int32_t type, uint32_t subtype);
 void bt_host_bridge(struct bt_dev *device, uint8_t report, uint8_t *data, uint32_t len);

@@ -1,18 +1,17 @@
 """Run the actual macro player on a threaded host to exercise STOP/LOAD during long holds."""
-import shutil
+import os
 import subprocess
 from pathlib import Path
 
-import pytest
+from pad_compile import compile_c
 
 
 def test_long_holds_stop_reload_and_replay_without_an_old_player_resuming(tmp_path):
-    cc = shutil.which("cc") or shutil.which("gcc")
-    if not cc:
-        pytest.skip("no C compiler")
     root = Path(__file__).resolve().parents[1]
     headers = tmp_path / "freertos"
     headers.mkdir()
+    if os.name == "nt":
+        (tmp_path / "pthread.h").write_bytes((root / "tests/fixtures/pad_win_pthread.h").read_bytes())
     (tmp_path / "host_rtos.h").write_text(r'''
 #pragma once
 #include <assert.h>
@@ -46,10 +45,7 @@ void vTaskDelay(TickType_t ticks);
     for path in ("freertos/FreeRTOS.h", "freertos/task.h", "freertos/queue.h",
                  "esp_app_desc.h", "esp_attr.h", "esp_system.h"):
         (tmp_path / path).write_text('#include "host_rtos.h"\n', encoding="utf-8")
-    binary = tmp_path / "player-test"
-    subprocess.run([cc, "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-pthread", "-Wall", "-Wextra",
-                    "-Wno-unused-parameter", "-Werror", "-I", str(tmp_path),
-                    "-I", str(root / "firmware/pad/main"),
-                    str(root / "firmware/pad/main/player.c"),
-                    str(root / "tests/fixtures/pad_player_host.c"), "-o", str(binary)], check=True)
+    binary = tmp_path / ("player-test.exe" if os.name == "nt" else "player-test")
+    compile_c(binary, [root / "firmware/pad/main/player.c", root / "tests/fixtures/pad_player_host.c"],
+              includes=(tmp_path, root / "firmware/pad/main"), threaded=True)
     subprocess.run([str(binary)], check=True, timeout=10)

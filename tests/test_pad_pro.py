@@ -1,24 +1,20 @@
 """The classic ESP32's Pro Controller encoding (firmware/pad/main/pro_report.c), compiled and run on the
 host, against the bit layout in dekuNukem's bluetooth_hid_notes.md and spi_flash_notes.md."""
 import ctypes
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
 
 from pokeldn.pad import macro
+from pad_compile import compile_c
 
 SOURCE = Path(__file__).resolve().parents[1] / "firmware" / "pad" / "main" / "pro_report.c"
 
 
 @pytest.fixture(scope="module")
 def pro_library(tmp_path_factory):
-    cc = shutil.which("cc") or shutil.which("gcc")
-    if not cc:
-        pytest.skip("no C compiler")
     lib = tmp_path_factory.mktemp("pro") / "pro.so"
-    subprocess.run([cc, "-shared", "-fPIC", "-O1", "-o", str(lib), str(SOURCE)], check=True)
+    compile_c(lib, [SOURCE], exports=("pro_state", "pro_spi_byte", "pro_subcommand_valid", "pro_reply"))
     so = ctypes.CDLL(str(lib))
     so.pro_spi_byte.restype = ctypes.c_uint8
     so.pro_subcommand_valid.argtypes = (ctypes.c_void_p, ctypes.c_size_t)

@@ -38,6 +38,7 @@ jobs:
             pokeldn-radio.bin
             pokeldn-pad.bin
             pokeldn-pad.json
+            SHA256SUMS
 
   app:
     needs: firmware

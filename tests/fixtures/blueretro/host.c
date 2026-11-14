@@ -1,11 +1,11 @@
 // Drive the real BlueRetro Nintendo receiver without its ESP32 radio or hardware timers.
-#include "host.h"
+#include "blue_host.h"
 #include "sw.h"
 #include "pro_report.h"
 #include <assert.h>
 #include <stddef.h>
 
-__typeof__(bt_adapter) bt_adapter;
+struct bt_host_adapter bt_adapter;
 struct bt_hci_pkt bt_hci_pkt_tmp;
 const uint8_t bt_hid_led_dev_id_map[] = {1, 2, 4, 8};
 static struct bt_dev device;

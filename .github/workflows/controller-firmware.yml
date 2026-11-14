@@ -6,6 +6,11 @@ on:
     paths:
       - 'firmware/pad/**'
       - 'pokeldn/firmware.py'
+      - 'pokeldn/pad/**'
+      - 'tests/test_pad*.py'
+      - 'tests/pad_compile.py'
+      - 'tests/fixtures/pad_*'
+      - 'tests/fixtures/blueretro/**'
       - 'scripts/package_controller_firmware.py'
       - '.github/workflows/controller-firmware.yml'
   pull_request:
@@ -16,7 +21,8 @@ on:
       - 'scripts/package_controller_firmware.py'
       - 'tests/test_controller_firmware.py'
       - 'tests/test_pad*.py'
-      - 'tests/fixtures/pad_player_host.c'
+      - 'tests/pad_compile.py'
+      - 'tests/fixtures/pad_*'
       - 'tests/fixtures/blueretro/**'
       - '.github/workflows/controller-firmware.yml'
   workflow_dispatch:
