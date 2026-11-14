@@ -72,6 +72,11 @@ Gift below with the tested settings. The only file it asks for is `prod.keys`.
   `python -m pokeldn --radio esp32:auto swsh-host --offer-file offer.pk8`.
   See [code organization](docs/architecture.md) for the shared modules and legality checks.
 
+The **Controller** page supports manual buttons, both sticks and `.pokemacro` playback. A classic
+ESP32 stays on the computer's USB serial port and pairs with the Switch over Bluetooth Classic as
+a Pro Controller. Firmware `1.3.1` is built from `firmware/pad` and verified before installation.
+Use a separate radio board for wireless trades. See [controller setup](docs/hardware_pad.md).
+
 ## Requirements
 
 - A classic ESP32 board on USB (tested: ESP32-D0WD-V3, ELEGOO board, CP2102 bridge), flashed with

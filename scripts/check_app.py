@@ -12,12 +12,15 @@ def check() -> None:
     import gui.app
     import gui.views.games
     import gui.views.pokemon
+    import gui.views.controller
     from serial.tools import list_ports
 
     assert getattr(sys, "frozen", False)
     root = Path(sys._MEIPASS)
     assert Path(pokemon.HERE) == root / "services/pkhex"
     assert (root / "gui/firmware/pokeldn-radio.bin").is_file()
+    from pokeldn.firmware import controller_image
+    assert controller_image("esp32").parent == root / "gui/firmware"
     assert not (root / "config/host.local.toml").exists()
     assert not (root / "scratchpad").exists()
     trainer = {"ot": "PkCamp", "tid": 12345, "sid": 54321, "language": 2, "gender": 0}

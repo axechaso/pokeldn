@@ -39,8 +39,20 @@ To package an app, install ESP-IDF v6.1 and activate its environment, then build
 mkdir -p gui/firmware
 idf.py -C firmware/esp32 build
 idf.py -C firmware/esp32 merge-bin -o ../../../gui/firmware/pokeldn-radio.bin
+idf.py -C firmware/pad build
+idf.py -C firmware/pad merge-bin -o pokeldn-pad.bin
+python scripts/package_controller_firmware.py firmware/pad/build/pokeldn-pad.bin
 python scripts/pack_app.py
 ```
 
 The output path is relative to the firmware build directory.
-The release workflow performs this build and supplies the image to each desktop packer.
+The release workflow builds both firmware projects and supplies their images to each desktop packer.
+The controller image is bundled with its version, target and SHA-256 manifest. The packer rejects
+missing or mismatched controller builds; installation uses the bundled image.
+
+## The controller
+
+The Controller page installs this project's classic ESP32 controller firmware, connects over USB
+serial, sends buttons and plays `.pokemacro` files on the board. The board pairs with the Switch
+over Bluetooth Classic. Choose its port explicitly and use a separate board for wireless trades.
+See [Controller board](hardware_pad.md) for installation and CLI use.

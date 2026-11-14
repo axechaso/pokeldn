@@ -1,0 +1,54 @@
+name: Controller firmware
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'firmware/pad/**'
+      - 'pokeldn/firmware.py'
+      - 'scripts/package_controller_firmware.py'
+      - '.github/workflows/controller-firmware.yml'
+  pull_request:
+    paths:
+      - 'firmware/pad/**'
+      - 'pokeldn/pad/**'
+      - 'pokeldn/firmware.py'
+      - 'scripts/package_controller_firmware.py'
+      - 'tests/test_controller_firmware.py'
+      - 'tests/test_pad*.py'
+      - 'tests/fixtures/pad_player_host.c'
+      - '.github/workflows/controller-firmware.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container: espressif/idf:v6.1
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build classic ESP32 controller
+        shell: bash
+        run: |
+          . "$IDF_PATH/export.sh"
+          idf.py -C firmware/pad build
+          idf.py -C firmware/pad merge-bin -o pokeldn-pad.bin
+          python scripts/package_controller_firmware.py firmware/pad/build/pokeldn-pad.bin --output-dir dist/controller --revision "$GITHUB_SHA"
+          python -m pokeldn.firmware --image dist/controller/pokeldn-pad.bin
+      - uses: actions/upload-artifact@v7
+        with:
+          name: classic-esp32-controller
+          path: dist/controller/
+          if-no-files-found: error
+
+  protocol:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - run: python -m pip install pytest==9.1.1 pyserial==3.5
+      - run: python -m pytest tests/test_controller_firmware.py tests/test_pad_macro.py tests/test_pad_serial.py tests/test_pad_pro.py tests/test_pad_player.py -q -W error

@@ -1,0 +1,7 @@
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_BT_ENABLED=y
+CONFIG_ESP_TASK_WDT_EN=y
+CONFIG_ESP_TASK_WDT_PANIC=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=5
+# The macro player schedules durations in whole milliseconds (docs/hardware_pad.md).
+CONFIG_FREERTOS_HZ=1000

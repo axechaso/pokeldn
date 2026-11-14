@@ -12,11 +12,20 @@ from pokeldn.app.paths import ROOT
 # Session and flash runs are child processes of the app itself (`--run` / `--module`), which
 # also works inside a packaged app where no separate python executable exists.
 
+_closing: list[Callable[[], None]] = []
+
+
+def at_app_close(hook: Callable[[], None]) -> None:
+    """Allow an asyncio service to exit when its owning app closes stdin."""
+    _closing.append(hook)
+
 
 def _stop_on_stdin_close() -> None:
     # The app stops a run by closing its stdin; this raises the same KeyboardInterrupt as Ctrl-C,
     # which a windowless child on Windows cannot receive as a signal.
     sys.stdin.read()
+    for hook in list(_closing):
+        hook()
     _thread.interrupt_main()
 
 

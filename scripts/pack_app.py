@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 FIRMWARE = ROOT / "gui" / "firmware" / "pokeldn-radio.bin"
 APP_ID = "io.github.decryptu.pokeldn"
 
@@ -21,7 +22,7 @@ def runtime_id() -> str:
 
 def runtime_files() -> list[str]:
     tracked = subprocess.check_output(["git", "ls-files", "-z"], cwd=ROOT).decode().split("\0")
-    folders = ("bin/", "pokeldn/", "vendor/LDN/ldn/", "docs/", "gui/assets/")
+    folders = ("bin/", "pokeldn/", "vendor/LDN/ldn/", "docs/", "gui/assets/", "config/macros/")
     return [name for name in tracked if (name.startswith(folders) or name in
             ("config/host.toml", "gui/guide.md")) and (ROOT / name).is_file()]
 
@@ -45,6 +46,9 @@ def main() -> int:
                          "as described in docs/gui.md before packing.")
     if importlib.util.find_spec("PyInstaller") is None:
         raise SystemExit("Install desktop build dependencies: python -m pip install -r gui/requirements.txt")
+    from pokeldn.firmware import controller_image
+    controller = controller_image("esp32")
+    controllers = (controller, controller.with_suffix(".json"))
     service = ROOT / "services" / "pkhex"
     subprocess.run(["dotnet", "publish", str(service), "-c", "Release", "-r", runtime_id(),
                     "-o", str(service / "dist"), "-warnaserror"], check=True)
@@ -70,7 +74,7 @@ def main() -> int:
         data = [(stage / name, name) for name in
                 ("bin", "pokeldn", "vendor/LDN/ldn", "docs", "config", "gui/assets")]
         data += [(stage / "gui/guide.md", "gui"), (executable, "services/pkhex/dist"),
-                 (FIRMWARE, "gui/firmware")]
+                 (FIRMWARE, "gui/firmware"), *[(path, "gui/firmware") for path in controllers]]
         args = [sys.executable, "-m", "flet_cli.cli", "pack", str(ROOT / "gui" / "main.py"),
                 "--name", "pokeldn", "-y",
                 "--distpath", str(ROOT / "dist"), "--product-name", "pokeldn",

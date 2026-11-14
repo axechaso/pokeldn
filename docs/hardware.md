@@ -14,6 +14,8 @@ longer developed.
 ## Pages
 
 - [ESP32 radio](hardware_esp32.md): the board, its firmware, serial protocol and measurements.
+- [Controller board](hardware_pad.md): classic ESP32 Bluetooth Pro Controller firmware, verified
+  installation, serial commands and macros.
 - [Switch keys](hardware_switch_keys.md): installing `prod.keys` safely.
 - [Adapters](hardware_adapters.md): the Linux Wi-Fi cards, their configuration and failure modes.
 - [Raspberry Pi host](hardware_raspberry_pi.md): the Linux deployment and the supervised Mystery Gift

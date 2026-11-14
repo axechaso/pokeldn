@@ -24,10 +24,20 @@ jobs:
           idf.py build
           idf.py merge-bin -o pokeldn-radio.bin
           cp "$(find . -name pokeldn-radio.bin | head -n 1)" "$GITHUB_WORKSPACE/pokeldn-radio.bin"
+      - name: Build and package the classic ESP32 controller
+        shell: bash
+        run: |
+          . "$IDF_PATH/export.sh"
+          idf.py -C firmware/pad build
+          idf.py -C firmware/pad merge-bin -o pokeldn-pad.bin
+          python scripts/package_controller_firmware.py firmware/pad/build/pokeldn-pad.bin --output-dir "$GITHUB_WORKSPACE" --revision "$GITHUB_SHA"
       - uses: actions/upload-artifact@v7
         with:
           name: firmware
-          path: pokeldn-radio.bin
+          path: |
+            pokeldn-radio.bin
+            pokeldn-pad.bin
+            pokeldn-pad.json
 
   app:
     needs: firmware

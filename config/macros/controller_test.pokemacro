@@ -1,0 +1,13 @@
+{
+  "format": "pokeldn-macro",
+  "version": 1,
+  "name": "Controller test: one A press",
+  "description": "Press A once for 100 ms and release. Use on a screen where A is safe to press.",
+  "author": "",
+  "game": "",
+  "press_ms": 100,
+  "gap_ms": 150,
+  "setup": [],
+  "loop": [{"press": "A"}],
+  "loops": 1
+}

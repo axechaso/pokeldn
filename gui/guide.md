@@ -21,6 +21,14 @@ the radio. Nothing is installed on the console.
 
 The Pokemon the console sends you are saved in `Documents/pokeldn/Received`.
 
+## Controller
+
+The Controller page sends buttons, moves both sticks and plays `.pokemacro` files. Use a classic
+ESP32 on the computer's USB serial port. Install the controller firmware from that page, then open
+Controllers → Change Grip/Order on the Switch to pair it as a Pro Controller. Choose the board's
+serial port and press Connect. Installation replaces its firmware; wireless trades need a separate
+radio board. Stop ends a macro and releases every button. This firmware requires a classic ESP32.
+
 ## Basic and All options
 
 Basic shows the fields most runs need; the tested settings for each game are applied underneath. All
