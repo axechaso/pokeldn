@@ -21,6 +21,15 @@ the radio. Nothing is installed on the console.
 
 The Pokemon the console sends you are saved in `Documents/pokeldn/Received`.
 
+## Controller
+
+The Controller page sends buttons, moves both sticks and plays `.pokemacro` files. Use a classic
+ESP32 on the computer's USB serial port. Install the controller firmware, select its port and press
+Connect. Use Pair with BlueRetro / new host, then start controller inquiry on the BlueRetro receiver.
+The receiver sees a Pro Controller. Pair removes the previous Bluetooth host binding; it also stops
+the macro and releases inputs. Installation replaces the firmware; wireless trades need a separate
+radio board. Stop ends a macro and releases every button. This firmware requires a classic ESP32.
+
 ## Basic and All options
 
 Basic shows the fields most runs need; the tested settings for each game are applied underneath. All

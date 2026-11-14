@@ -153,7 +153,7 @@ class BoardView:
         note = ("Identify restarts the board, reads its firmware and MAC, and blinks its blue LED for five "
                 "seconds so you can tell the boards apart.")
         if not p.supported:
-            note = "This is an ESP32-S3, C3 or C6. pokeldn runs on the classic ESP32 only."
+            note = "This branch's wireless and Bluetooth controller firmware require a classic ESP32."
         return t.card(self.name_of(p.device) or "ESP32 board", body, note)
 
     def _rename(self, e, field=None) -> None:
@@ -296,6 +296,7 @@ class BoardView:
                     link("CH340", board.DRIVERS["WCH CH340"])], spacing=6, wrap=True),
             t.text("Linux: allow serial ports, then log out and back in:", 12.5),
             CodeBlock(self.app, "sudo usermod -aG dialout $USER").control,
-            t.text("pokeldn needs a classic ESP32 (ESP32-D0WD, WROOM-32E). S3, C3 and C6 boards are not "
-                   "supported.", 12.5, t.MUTED),
+            t.text("The wireless radio and Controller page use classic ESP32 boards "
+                   "(ESP32-D0WD, WROOM-32E). A controller board emulates a Pro Controller for "
+                   "BlueRetro or Switch over Bluetooth Classic and stays on this computer's USB port.", 12.5, t.MUTED),
         ], spacing=8))

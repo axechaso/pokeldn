@@ -23,6 +23,7 @@ from pokeldn.app.paths import ROOT  # noqa: E402
 PAGES = (
     ("games", "Games", "gamepad"),
     ("board", "Board", "cpu"),
+    ("controller", "Controller", "gamepad"),
     ("docs", "Docs", "book-open"),
 )
 SETTINGS = ("settings", "Settings", "gear")
@@ -52,6 +53,9 @@ def main(page: ft.Page) -> None:
         if key == "board":
             from gui.views.boards import BoardView
             return BoardView(app)
+        if key == "controller":
+            from gui.views.controller import ControllerView
+            return ControllerView(app)
         if key == "docs":
             from gui.views.docs import DocsView
             return DocsView(app)
