@@ -5,12 +5,13 @@ from dataclasses import dataclass
 from pokeldn.pad.macro import Program, encode_entry
 
 LOAD, DATA, PLAY, STOP, RESTART = 0x10, 0x11, 0x12, 0x13, 0xB0
+PAIR = 0xB1
 CHUNK = 18      # keep the upstream program chunk size for serial protocol compatibility
 
 
 @dataclass(frozen=True)
 class Status:
-    mounted: bool           # the Switch has assigned the Bluetooth controller player lights
+    mounted: bool           # the Bluetooth host (BlueRetro or Switch) assigned player lights
     writes: int
     playing: bool = False
     loops_done: int = 0

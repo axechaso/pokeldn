@@ -167,6 +167,13 @@ class ControllerView:
     def stop(self, e=None):
         self._submit(lambda: self.client.call("stop"))
 
+    def pair(self, e=None):
+        def work():
+            self.client.call("pair")
+            self.status = {}
+            self.message = "Previous Bluetooth host unplugged. Start controller inquiry on BlueRetro to pair."
+        self._submit(work)
+
     async def choose_macro(self, e):
         files = await self.app.picker.pick_files(allowed_extensions=["pokemacro"],
                                                  file_type=ft.FilePickerFileType.CUSTOM)
@@ -227,7 +234,7 @@ class ControllerView:
         self.port.disabled = self.working or self.connected
         status = self.status
         progress = (f"Firmware {status.get('version', '?')} · "
-                    f"Switch {'connected' if status.get('mounted') else 'not connected'} · "
+                    f"Bluetooth host {'ready' if status.get('mounted') else 'not ready'} · "
                     f"{'Playing' if status.get('playing') else 'Idle'} · "
                     f"Entry {status.get('index', 0)}/{status.get('count', 0)} · "
                     f"Loops {status.get('loops_done', 0)}")
@@ -237,13 +244,14 @@ class ControllerView:
 
         self.body.controls = [
             t.card("Controller connection", ft.Column([
-                t.text("Classic ESP32 · USB serial to this computer · Bluetooth to the Switch", 13),
+                t.text("Classic ESP32 · USB serial to this computer · Bluetooth to BlueRetro", 13),
                 ft.Row([self.port, t.secondary_button("Refresh ports", self.scan,
                            disabled=self.working or self.connected)], spacing=8),
-                t.text("Leave the ESP32 plugged into this computer. On the Switch, open "
-                       "Controllers → Change Grip/Order to pair it as a Pro Controller.", 12, t.MUTED),
+                t.text("Leave the ESP32 on this computer's USB port. Connect here, then use Pair with BlueRetro "
+                       "and start controller inquiry on the BlueRetro receiver. It sees a Pro Controller.", 12, t.MUTED),
                 ft.Row([t.button("Connect", self.connect, disabled=self.working or self.connected),
                         t.secondary_button("Disconnect", self.disconnect, disabled=self.working)], spacing=8),
+                t.secondary_button("Pair with BlueRetro / new host", self.pair, disabled=not ready),
                 t.text(self.message, 12, t.BLUE),
                 t.text(progress if self.connected else "", 12, t.MUTED),
             ], spacing=10)),

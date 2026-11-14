@@ -117,6 +117,7 @@ def test_classic_controller_round_trip_without_platform_specific_pty(monkeypatch
         await pad.play()
         state = await pad.status()
         await pad.stop()
+        await pad.pair()
         await pad.close()
         assert not pad.connected
         return state, program
@@ -124,4 +125,4 @@ def test_classic_controller_round_trip_without_platform_specific_pty(monkeypatch
     state, program = asyncio.run(exercise())
     assert state.mounted and state.version == "1.3.0" and state.boots == 2
     assert reports == [macro.state(["B"]), macro.NEUTRAL]
-    assert commands == [*link.program_writes(program), bytes([link.PLAY]), bytes([link.STOP])]
+    assert commands == [*link.program_writes(program), bytes([link.PLAY]), bytes([link.STOP]), bytes([link.PAIR])]

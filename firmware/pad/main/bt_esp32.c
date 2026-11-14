@@ -1,5 +1,5 @@
-// The classic ESP32 transport: a Pro Controller over Bluetooth Classic HID, paired from the Switch's
-// Change Grip/Order, with the host on UART0 (docs/hardware_pad.md, The Bluetooth Classic side).
+// The classic ESP32 transport: emulate a Pro Controller accepted by a BlueRetro receiver or Switch.
+// The computer's input/macros arrive on UART0 (docs/hardware_pad.md).
 // Protocol: dekuNukem Nintendo_Switch_Reverse_Engineering (bluetooth_hid_notes, subcommands, spi_flash).
 #include <string.h>
 #include "freertos/FreeRTOS.h"
@@ -19,7 +19,7 @@
 #include "pro_report.h"
 
 #define LED_GPIO 2 // the DevKit's blue LED, lit while paired
-#define PAYLOAD 48 // 0x21 and 0x30 after the report ID
+#define PAYLOAD PRO_PAYLOAD_LEN // 0x21 and 0x30 after the report ID
 
 static const char *TAG = "pad"; // compiled out at CONFIG_LOG_DEFAULT_LEVEL_NONE
 
@@ -45,10 +45,11 @@ static uint8_t descriptor[] = {
     0x30, 0x91, 0x02, 0x85, 0x12, 0x09, 0x12, 0x75, 0x08, 0x95, 0x30, 0x91,
     0x02, 0xc0};
 
-static volatile bool open_, paired, full_mode;
+static volatile bool open_, paired;
 static uint8_t timer;
 static uint8_t mac[6];
 static QueueHandle_t replies; // 48-byte 0x21 payloads, sent ahead of 0x30
+static QueueHandle_t pairing_result;
 
 // The 12 bytes every input report starts with, from the shared HORI-format state.
 static void fill_state(uint8_t *p)
@@ -58,69 +59,20 @@ static void fill_state(uint8_t *p)
     pro_state(r, timer++, p);
 }
 
-static void reply(uint8_t ack, uint8_t sub, const uint8_t *data, size_t len)
-{
-    uint8_t p[PAYLOAD] = {0};
-    fill_state(p);
-    p[12] = ack;
-    p[13] = sub;
-    if (len > PAYLOAD - 14)
-        len = PAYLOAD - 14;
-    if (len)
-        memcpy(p + 14, data, len);
-    xQueueSend(replies, p, 0);
-}
-
 static void subcommand(const uint8_t *d, uint16_t len)
 {
-    if (!pro_subcommand_valid(d, len))
+    uint8_t p[PAYLOAD], report[REPORT_LEN];
+    pad_get_report(report);
+    if (!pro_reply(d, len, mac, report, timer++, p))
         return;
     uint8_t sub = d[9];
     ESP_LOGI(TAG, "sub %02x len %u", sub, len);
-    const uint8_t *arg = d + 10;
-    switch (sub) {
-    case 0x02: { // device info: firmware 4.00, Pro Controller, MAC, colours from SPI
-        uint8_t info[12] = {0x04, 0x00, 0x03, 0x02, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], 0x01, 0x01};
-        reply(0x82, sub, info, sizeof(info));
-        break;
-    }
-    case 0x10: { // SPI flash read: address u32, length u8
-        if (len < 15)
-            return;
-        uint32_t a = arg[0] | arg[1] << 8 | arg[2] << 16 | (uint32_t)arg[3] << 24;
-        uint8_t n = arg[4] > 0x1D ? 0x1D : arg[4];
-        uint8_t data[5 + 0x1D];
-        memcpy(data, arg, 5);
-        data[4] = n;
-        for (uint8_t i = 0; i < n; i++)
-            data[5 + i] = pro_spi_byte(a + i);
-        reply(0x90, sub, data, 5 + n);
-        break;
-    }
-    case 0x03: // input report mode; 0x30 streams full reports
-        full_mode = arg[0] == 0x30;
-        reply(0x80, sub, NULL, 0);
-        break;
-    case 0x04: { // trigger buttons elapsed time, 10 ms units: L and R held 3 s
-        static const uint8_t t[14] = {0x2C, 0x01, 0x2C, 0x01};
-        reply(0x83, sub, t, sizeof(t));
-        break;
-    }
-    case 0x21: { // NFC/IR MCU configuration (joycontrol protocol.py)
-        uint8_t m[34] = {0x01, 0x00, 0xFF, 0x00, 0x08, 0x00, 0x1B, 0x01};
-        m[33] = 0xC8;
-        reply(0xA0, sub, m, sizeof(m));
-        break;
-    }
-    case 0x30: // player lights: the Switch has taken the controller
+    if (sub == 0x30) { // both BlueRetro and Switch finish setup by assigning player lights
         paired = true;
         pad_stage(7);
         gpio_set_level(LED_GPIO, 1);
-        reply(0x80, sub, NULL, 0);
-        break;
-    default: // shipment state, IMU, vibration, HOME light, MCU state and the rest: a plain ACK
-        reply(0x80, sub, NULL, 0);
     }
+    xQueueSend(replies, p, 0);
 }
 
 // Pacing after friendmaker's Switch Lite profile (classic_bt_controller_transport.cpp, SWITCH_LITE):
@@ -153,6 +105,8 @@ static void sender_task(void *arg)
         TickType_t now = xTaskGetTickCount();
         if (!open_ || (int32_t)(quiet_until - now) > 0)
             continue;
+        // BlueRetro builds can omit SET_REP_MODE. Keep streaming native 0x30 reports without
+        // waiting for 0x03, as BlueRetro accepts this report type in either initialization path.
         memset(p, 0, sizeof(p));
         fill_state(p);
         bool changed = memcmp(sent, p + 2, sizeof(sent)) != 0;
@@ -169,7 +123,7 @@ static void sender_task(void *arg)
 // ---- Bluetooth ----
 
 static esp_hidd_app_param_t app = {
-    .name = "Wireless Gamepad",
+    .name = PRO_DEVICE_NAME,
     .description = "Gamepad",
     .provider = "Nintendo",
     .subclass = 0x08,
@@ -211,7 +165,7 @@ static void hidd_cb(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param)
         esp_bt_cod_t cod = {.service = 1, .major = 5, .minor = 2}; // 0x002508, a gamepad
         esp_bt_gap_set_cod(cod, ESP_BT_SET_COD_ALL);
         discoverable(true);
-        if (param->register_app.in_use) // a Switch it paired with before: reconnect to it
+        if (param->register_app.in_use) // reconnect to the last receiver/console
             esp_bt_hid_device_connect(param->register_app.bd_addr);
         break;
     }
@@ -221,17 +175,34 @@ static void hidd_cb(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param)
             pad_stage(6);
             quiet_for(OPEN_QUIET_MS);
             discoverable(false);
-            full_mode = paired = false;
+            xQueueReset(replies);
+            paired = false;
             open_ = true;
         }
         break;
     case ESP_HIDD_CLOSE_EVT:
         ESP_LOGI(TAG, "close status %d conn %d", param->close.status, param->close.conn_status);
-        open_ = paired = full_mode = false;
+        open_ = paired = false;
+        xQueueReset(replies);
         gpio_set_level(LED_GPIO, 0);
         pad_disconnected();
         discoverable(true);
         break;
+    case ESP_HIDD_VC_UNPLUG_EVT: {
+        if (param->vc_unplug.status == ESP_HIDD_SUCCESS) {
+            // A normal disconnect keeps the virtual cable and rejects another host. Unplug
+            // removes that binding/bond so a BlueRetro can pair after a previous Switch host.
+            open_ = paired = false;
+            xQueueReset(replies);
+            pad_disconnected();
+            gpio_set_level(LED_GPIO, 0);
+            pad_stage(5);
+            discoverable(true);
+        }
+        int result = param->vc_unplug.status == ESP_HIDD_SUCCESS ? 0 : PAD_REFUSED;
+        xQueueSend(pairing_result, &result, 0);
+        break;
+    }
     case ESP_HIDD_INTR_DATA_EVT:
         if (param->intr_data.report_id == 0x01)
             subcommand(param->intr_data.data, param->intr_data.len);
@@ -281,6 +252,15 @@ static bool mounted(void)
     return paired;
 }
 
+int pad_pair(void)
+{
+    xQueueReset(pairing_result);
+    if (esp_bt_hid_device_virtual_cable_unplug() != ESP_OK)
+        return PAD_REFUSED;
+    int result;
+    return xQueueReceive(pairing_result, &result, pdMS_TO_TICKS(3000)) == pdTRUE ? result : PAD_REFUSED;
+}
+
 // ROM download mode is entered through BOOT or the serial bridge's DTR/RTS sequence.
 void pad_restart(void)
 {
@@ -294,6 +274,8 @@ void app_main(void)
     gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
     gpio_set_level(LED_GPIO, 0);
     replies = xQueueCreate(8, PAYLOAD);
+    pairing_result = xQueueCreate(1, sizeof(int));
+    configASSERT(replies && pairing_result);
     uart_link_start(mounted);
 
     esp_err_t err = nvs_flash_init(); // Bluedroid keeps the Switch's link key here
@@ -317,7 +299,7 @@ void app_main(void)
     pad_stage(3);
 
     esp_bt_gap_register_callback(gap_cb);
-    esp_bt_gap_set_device_name("Pro Controller");
+    esp_bt_gap_set_device_name(PRO_DEVICE_NAME);
     esp_bt_io_cap_t iocap = ESP_BT_IO_CAP_NONE;
     esp_bt_gap_set_security_param(ESP_BT_SP_IOCAP_MODE, &iocap, sizeof(iocap));
     esp_bt_pin_code_t pin = {0};

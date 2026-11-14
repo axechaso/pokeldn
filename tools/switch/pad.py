@@ -10,12 +10,13 @@
     pad.py --stop                 stop the board's macro
     pad.py --status               mounted, macro progress, firmware version
     pad.py --restart              restart the board's firmware
+    pad.py --pair                 forget the last host and pair with BlueRetro or a new console
 
 A step list runs from this host, a macro on the board's own clock. Requests go to the controller
 service (pokeldn.pad.service) on 127.0.0.1, which this starts in-process when none is running.
 
 Select the classic ESP32 explicitly with --serial COM5 (or a /dev/... port). The board stays
-plugged into the computer and pairs with the Switch over Bluetooth Classic.
+plugged into the computer and emulates a Pro Controller for BlueRetro or a Switch.
 """
 import argparse
 import asyncio
@@ -78,6 +79,7 @@ def main():
     ap.add_argument("--play", metavar="FILE", help="load a .pokemacro onto the board and start it")
     ap.add_argument("--stop", action="store_true", help="stop the board's macro")
     ap.add_argument("--restart", action="store_true", help="restart the board's firmware (not the ROM loader)")
+    ap.add_argument("--pair", action="store_true", help="forget the last Bluetooth host; pair with BlueRetro/a new console")
     ap.add_argument("--serial", default="", help="classic ESP32 port; required unless a service is already running")
     args = ap.parse_args()
     plan = [item for step in args.steps for item in parse(step)]
@@ -89,6 +91,10 @@ def main():
     except (OSError, service.ServiceError) as error:
         ap.exit(1, f"{error}\n")
     try:
+        if args.pair:
+            c.call("pair")
+            print("Previous host unplugged; start controller inquiry on BlueRetro to pair this Pro Controller.")
+            return
         if args.restart:
             c.call("restart")
             print("restarting the controller firmware")
@@ -108,7 +114,7 @@ def main():
         if args.status or not (plan or text or args.stop):
             c.call("connect")
             s = c.call("status")["status"]
-            print(f"mounted {'yes' if s['mounted'] else 'no'}, writes {s['writes']}, "
+            print(f"Bluetooth host ready {'yes' if s['mounted'] else 'no'}, writes {s['writes']}, "
                   f"{'playing' if s['playing'] else 'idle'} entry {s['index']}/{s['count']} "
                   f"loops done {s['loops_done']}, firmware {s['version'] or 'before 1.0.0'}, "
                   f"reset {s['reset_reason']} previous boot stage {s['stage_before']} boots {s['boots']}")

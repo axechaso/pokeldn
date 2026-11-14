@@ -53,6 +53,7 @@ missing or mismatched controller builds; installation uses the bundled image.
 ## The controller
 
 The Controller page installs this project's classic ESP32 controller firmware, connects over USB
-serial, sends buttons and plays `.pokemacro` files on the board. The board pairs with the Switch
-over Bluetooth Classic. Choose its port explicitly and use a separate board for wireless trades.
+serial, sends buttons and plays `.pokemacro` files on the board. Pair with BlueRetro removes the
+previous HID virtual cable/bond so the simulated Pro Controller can connect to the BlueRetro receiver.
+The firmware also retains its existing Switch protocol. Choose its port explicitly and use a separate board for wireless trades.
 See [Controller board](hardware_pad.md) for installation and CLI use.

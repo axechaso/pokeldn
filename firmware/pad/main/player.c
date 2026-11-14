@@ -29,7 +29,8 @@ enum { PLAYER_PLAY, PLAYER_STOP };
 RTC_NOINIT_ATTR static uint32_t stage_now, boots;
 static uint8_t stage_before;
 
-enum { CMD_LOAD = 0x10, CMD_DATA = 0x11, CMD_PLAY = 0x12, CMD_STOP = 0x13, CMD_RESTART = 0xB0 };
+enum { CMD_LOAD = 0x10, CMD_DATA = 0x11, CMD_PLAY = 0x12, CMD_STOP = 0x13,
+       CMD_RESTART = 0xB0, CMD_PAIR = 0xB1 };
 
 static void set_report(const uint8_t *r)
 {
@@ -171,6 +172,11 @@ int pad_command(const uint8_t *buf, size_t len)
             return PAD_BAD_LENGTH;
         xTaskCreate(restart_task, "pad_reset", 3072, NULL, 1, NULL);
         return 0;
+    case CMD_PAIR:
+        if (len != 1)
+            return PAD_BAD_LENGTH;
+        stop_playing();
+        return pad_pair();
     }
     return PAD_REFUSED;
 }

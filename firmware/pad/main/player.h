@@ -17,7 +17,7 @@ void pad_live_report(const uint8_t *r);          // from the host; ignored while
 void pad_disconnected(void);                     // the host left: release unless a macro plays
 bool pad_playing(void);
 
-// A command from the host (0x10 load, 0x11 data, 0x12 play, 0x13 stop, 0xB0 restart).
+// A command from the host (0x10 load, 0x11 data, 0x12 play, 0x13 stop, 0xB0 restart, 0xB1 pair).
 // Returns 0, PAD_BAD_LENGTH or PAD_REFUSED.
 #define PAD_BAD_LENGTH (-1)
 #define PAD_REFUSED (-2)
@@ -28,3 +28,5 @@ size_t pad_status(uint8_t *out, size_t cap, bool mounted);
 
 // Provided by the transport: restart the running firmware (not the ROM loader).
 void pad_restart(void);
+// Unplug the previous HID host/bond and accept a new receiver such as BlueRetro.
+int pad_pair(void);

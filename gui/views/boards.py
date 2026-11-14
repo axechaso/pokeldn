@@ -297,6 +297,6 @@ class BoardView:
             t.text("Linux: allow serial ports, then log out and back in:", 12.5),
             CodeBlock(self.app, "sudo usermod -aG dialout $USER").control,
             t.text("The wireless radio and Controller page use classic ESP32 boards "
-                   "(ESP32-D0WD, WROOM-32E). A controller board pairs with the Switch over "
-                   "Bluetooth Classic and stays on this computer's USB port.", 12.5, t.MUTED),
+                   "(ESP32-D0WD, WROOM-32E). A controller board emulates a Pro Controller for "
+                   "BlueRetro or Switch over Bluetooth Classic and stays on this computer's USB port.", 12.5, t.MUTED),
         ], spacing=8))

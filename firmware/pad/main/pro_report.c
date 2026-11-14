@@ -1,6 +1,7 @@
 // Pro Controller report bytes from the shared state, and the SPI flash a Switch reads; no ESP-IDF here,
 // so tests/test_pad_pro.py compiles it on the host (docs/hardware_pad.md, The Bluetooth Classic side).
 #include <stdbool.h>
+#include <string.h>
 #include "pro_report.h"
 
 bool pro_subcommand_valid(const uint8_t *data, size_t len)
@@ -16,6 +17,54 @@ bool pro_subcommand_valid(const uint8_t *data, size_t len)
     default:
         return true; // the remaining handlers do not read arguments
     }
+}
+
+bool pro_reply(const uint8_t *d, size_t len, const uint8_t *mac,
+               const uint8_t *report, uint8_t timer, uint8_t *out)
+{
+    if (!pro_subcommand_valid(d, len))
+        return false;
+    memset(out, 0, PRO_PAYLOAD_LEN);
+    pro_state(report, timer, out);
+    uint8_t sub = d[9];
+    const uint8_t *arg = d + 10;
+    out[12] = 0x80;
+    out[13] = sub;
+    switch (sub) {
+    case 0x02: { // device info, also BlueRetro's first initialization request
+        uint8_t info[12] = {0x04, 0x00, 0x03, 0x02, 0, 0, 0, 0, 0, 0, 0x01, 0x01};
+        memcpy(info + 4, mac, 6);
+        out[12] = 0x82;
+        memcpy(out + 14, info, sizeof(info));
+        break;
+    }
+    case 0x10: { // SPI reads include BlueRetro's 603D -> 6086 -> 6098 -> 8010 sequence
+        uint32_t address = arg[0] | arg[1] << 8 | arg[2] << 16 | (uint32_t)arg[3] << 24;
+        uint8_t n = arg[4] > 0x1D ? 0x1D : arg[4];
+        out[12] = 0x90;
+        memcpy(out + 14, arg, 4);
+        out[18] = n;
+        for (uint8_t i = 0; i < n; i++)
+            out[19 + i] = pro_spi_byte(address + i);
+        break;
+    }
+    case 0x04: { // trigger time: L and R held for 3 seconds, in 10 ms units
+        static const uint8_t elapsed[14] = {0x2C, 0x01, 0x2C, 0x01};
+        out[12] = 0x83;
+        memcpy(out + 14, elapsed, sizeof(elapsed));
+        break;
+    }
+    case 0x21: { // NFC/IR configuration, retained for Switch compatibility
+        static const uint8_t mcu[8] = {0x01, 0x00, 0xFF, 0x00, 0x08, 0x00, 0x1B, 0x01};
+        out[12] = 0xA0;
+        memcpy(out + 14, mcu, sizeof(mcu));
+        out[47] = 0xC8;
+        break;
+    }
+    default: // report mode, LEDs, vibration, IMU, shipment and HOME light: plain ACK
+        break;
+    }
+    return true;
 }
 
 // ---- SPI flash the Switch reads (spi_flash_notes) ----

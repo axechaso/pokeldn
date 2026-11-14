@@ -1,7 +1,7 @@
 """Hold one explicitly selected classic ESP32 serial port and serve local controller requests.
 
 One JSON object per line each way. Requests: status, connect, send {report}, tap {report, ms},
-play {macro}, stop, restart, disconnect, quit.
+play {macro}, stop, pair (forget the previous Bluetooth host), restart, disconnect, quit.
 """
 import argparse
 import asyncio
@@ -120,6 +120,8 @@ class Service:
                 await pad.stop()
             elif op == "restart":
                 await pad.restart()
+            elif op == "pair":
+                await pad.pair()
             else:
                 return {"ok": False, "error": f"unknown request {op!r}"}
             return {"ok": True}

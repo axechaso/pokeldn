@@ -1,5 +1,5 @@
 """The serial link to a controller board on its USB-to-serial port: the classic ESP32, which reaches
-the Switch over Bluetooth Classic [docs/hardware_pad.md, The serial side].
+BlueRetro or a Switch over Bluetooth Classic [docs/hardware_pad.md].
 
 Frames both ways: A5 5A, length u16 (type and payload), type u8, payload, sum of type and payload
 mod 256. Host to board: 0x01 report, 0x02 status, 0x03 command. Board to host: 0x81 result (i8),
@@ -10,7 +10,7 @@ import struct
 import threading
 import time
 
-from pokeldn.pad.link import RESTART, PLAY, STOP, Status, parse_status, program_writes
+from pokeldn.pad.link import RESTART, PAIR, PLAY, STOP, Status, parse_status, program_writes
 from pokeldn.pad.macro import NEUTRAL, Program
 
 MAGIC = b"\xa5\x5a"
@@ -140,6 +140,9 @@ class SerialPad:
 
     async def restart(self):
         await asyncio.to_thread(self._call, COMMAND, bytes([RESTART]))
+
+    async def pair(self):
+        await asyncio.to_thread(self._call, COMMAND, bytes([PAIR]))
 
     async def close(self):
         if self.serial.is_open:

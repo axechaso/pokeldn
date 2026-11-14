@@ -2,7 +2,7 @@ name: Controller firmware
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'codex/**']
     paths:
       - 'firmware/pad/**'
       - 'pokeldn/firmware.py'
@@ -17,6 +17,7 @@ on:
       - 'tests/test_controller_firmware.py'
       - 'tests/test_pad*.py'
       - 'tests/fixtures/pad_player_host.c'
+      - 'tests/fixtures/blueretro/**'
       - '.github/workflows/controller-firmware.yml'
   workflow_dispatch:
 
@@ -51,4 +52,4 @@ jobs:
         with:
           python-version: '3.13'
       - run: python -m pip install pytest==9.1.1 pyserial==3.5
-      - run: python -m pytest tests/test_controller_firmware.py tests/test_pad_macro.py tests/test_pad_serial.py tests/test_pad_pro.py tests/test_pad_player.py -q -W error
+      - run: python -m pytest tests/test_controller_firmware.py tests/test_pad_macro.py tests/test_pad_serial.py tests/test_pad_pro.py tests/test_pad_player.py tests/test_pad_blueretro.py -q -W error

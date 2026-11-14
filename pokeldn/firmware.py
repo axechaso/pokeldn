@@ -16,7 +16,7 @@ IMAGE_NAME = "pokeldn-pad.bin"
 def require_classic(chip: str) -> None:
     if chip != "esp32":
         raise ValueError("this Bluetooth controller firmware requires a classic ESP32; "
-                         "ESP32-S3/C3/C6 cannot emulate a Switch Bluetooth Classic controller")
+                         "ESP32-S3/C3/C6 cannot emulate this Bluetooth Classic Pro Controller")
 
 
 def image_metadata(path: Path) -> dict:

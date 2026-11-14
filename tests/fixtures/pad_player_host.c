@@ -105,6 +105,8 @@ const esp_app_desc_t *esp_app_get_description(void)
 }
 int esp_reset_reason(void) { return ESP_RST_POWERON; }
 void pad_restart(void) { abort(); }
+static unsigned pair_requests;
+int pad_pair(void) { pair_requests++; return 0; }
 
 static void command(uint8_t cmd)
 {
@@ -165,6 +167,11 @@ int main(void)
     command(0x12);
     wait_button(4);
     command(0x13);
+    wait_button(0);
+    command(0x12);
+    wait_button(4);
+    command(0xB1);
+    assert(pair_requests == 1 && !pad_playing());
     wait_button(0);
     return 0;
 }
