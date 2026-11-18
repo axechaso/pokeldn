@@ -1,6 +1,7 @@
 // The controller state and the macro player (docs/hardware_pad.md, The Bluetooth side).
 #include <string.h>
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "esp_app_desc.h"
 #include "esp_attr.h"
@@ -8,8 +9,6 @@
 #include "player.h"
 
 const uint8_t pad_neutral[REPORT_LEN] = {0, 0, 8, 128, 128, 128, 128, 0};
-static uint8_t report[REPORT_LEN];
-static portMUX_TYPE report_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t writes;
 
 // A macro: entries [0, loop_start) once, then [loop_start, count) `loops` times (0 = until
@@ -22,19 +21,32 @@ static uint32_t loops;
 static volatile bool playing;
 static volatile uint32_t loops_done;
 static volatile uint16_t play_index;
-static TaskHandle_t player;
+static QueueHandle_t commands, stopped;
+enum { PLAYER_PLAY, PLAYER_STOP };
 
 RTC_NOINIT_ATTR static uint32_t stage_now, boots;
 static uint8_t stage_before;
 
 enum { CMD_LOAD = 0x10, CMD_DATA = 0x11, CMD_PLAY = 0x12, CMD_STOP = 0x13, CMD_DOWNLOAD = 0xB0 };
 
-static void set_report(const uint8_t *r)
+#if CONFIG_IDF_TARGET_ESP32
+#include "bt_input.h"
+static bool set_report(const uint8_t *r) { return bt_input_write(r); }
+static void release_report(void) { bt_input_neutral(); }
+void pad_get_report(uint8_t *out) { bt_input_latest(out); }
+#else
+static uint8_t report[REPORT_LEN];
+static portMUX_TYPE report_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static bool set_report(const uint8_t *r)
 {
     taskENTER_CRITICAL(&report_lock);
     memcpy(report, r, REPORT_LEN);
     taskEXIT_CRITICAL(&report_lock);
+    return true;
 }
+
+static void release_report(void) { set_report(pad_neutral); }
 
 void pad_get_report(uint8_t *out)
 {
@@ -42,6 +54,7 @@ void pad_get_report(uint8_t *out)
     memcpy(out, report, REPORT_LEN);
     taskEXIT_CRITICAL(&report_lock);
 }
+#endif
 
 void pad_stage(uint32_t stage)
 {
@@ -53,28 +66,44 @@ bool pad_playing(void)
     return playing;
 }
 
-void pad_live_report(const uint8_t *r)
+int pad_live_report(const uint8_t *r)
 {
-    if (!playing) // a running macro owns the report until it ends or is stopped
-        set_report(r);
+    if (!playing && !set_report(r))
+        return PAD_REFUSED;
     writes++;
+    return 0;
 }
 
 void pad_disconnected(void)
 {
     // A host that vanishes must not leave a button held; a macro keeps running.
     if (!playing)
-        set_report(pad_neutral);
+        release_report();
+}
+
+// A full radio queue applies backpressure to the macro. STOP must still interrupt the wait.
+static bool publish(const uint8_t *r, TickType_t *wake)
+{
+    uint8_t command;
+    while (!set_report(r)) {
+        if (xQueueReceive(commands, &command, pdMS_TO_TICKS(5)) == pdTRUE)
+            return false;
+        *wake = xTaskGetTickCount();
+    }
+    return true;
 }
 
 static void player_task(void *arg)
 {
     for (;;) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        uint8_t command;
+        xQueueReceive(commands, &command, portMAX_DELAY);
+        bool stop = command == PLAYER_STOP;
         TickType_t wake = xTaskGetTickCount();
         uint16_t i = 0;
-        loops_done = 0;
-        while (playing && program_count) {
+        if (!stop)
+            loops_done = 0;
+        while (!stop && program_count) {
             if (i == program_count) {
                 loops_done++;
                 if (loops && loops_done >= loops)
@@ -84,22 +113,32 @@ static void player_task(void *arg)
                     break;
             }
             play_index = i;
-            set_report(program[i]);
+            if (!publish(program[i], &wake)) {
+                stop = true;
+                break;
+            }
             uint16_t ms = program[i][REPORT_LEN] | program[i][REPORT_LEN + 1] << 8;
-            if (ms)
-                vTaskDelayUntil(&wake, pdMS_TO_TICKS(ms));
+            wake += pdMS_TO_TICKS(ms);
+            TickType_t now = xTaskGetTickCount();
+            TickType_t wait = (int32_t)(wake - now) > 0 ? wake - now : 0;
+            stop = xQueueReceive(commands, &command, wait) == pdTRUE;
             i++;
         }
+        if (!stop)
+            stop = !publish(pad_neutral, &wake);
+        if (stop)
+            release_report();
         playing = false;
-        set_report(pad_neutral);
+        if (stop)
+            xQueueSend(stopped, &command, portMAX_DELAY);
     }
 }
 
 static void stop_playing(void)
 {
-    playing = false;
-    for (int n = 0; n < 50 && eTaskGetState(player) != eBlocked; n++)
-        vTaskDelay(1);
+    uint8_t command = PLAYER_STOP;
+    xQueueSend(commands, &command, portMAX_DELAY);
+    xQueueReceive(stopped, &command, portMAX_DELAY);
 }
 
 static void loader_task(void *arg)
@@ -137,14 +176,15 @@ int pad_command(const uint8_t *buf, size_t len)
         memcpy(program[first], buf + 3, n * ENTRY_LEN);
         return 0;
     }
-    case CMD_PLAY:
+    case CMD_PLAY: {
         stop_playing();
         playing = true;
-        xTaskNotifyGive(player);
+        uint8_t command = PLAYER_PLAY;
+        xQueueSend(commands, &command, portMAX_DELAY);
         return 0;
+    }
     case CMD_STOP:
         stop_playing();
-        set_report(pad_neutral);
         return 0;
     case CMD_DOWNLOAD:
         xTaskCreate(loader_task, "pad_dl", 3072, NULL, 1, NULL);
@@ -185,6 +225,10 @@ void pad_init(void)
     stage_before = stage_now;
     stage_now = 0;
     boots++;
-    set_report(pad_neutral);
-    xTaskCreate(player_task, "pad_play", 3072, NULL, 6, &player);
+    release_report();
+    commands = xQueueCreate(1, sizeof(uint8_t));
+    stopped = xQueueCreate(1, sizeof(uint8_t));
+    configASSERT(commands && stopped);
+    BaseType_t created = xTaskCreate(player_task, "pad_play", 3072, NULL, 6, NULL);
+    configASSERT(created == pdPASS);
 }

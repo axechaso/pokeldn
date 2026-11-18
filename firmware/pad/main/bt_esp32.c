@@ -2,11 +2,14 @@
 // Change Grip/Order, with the host on UART0 (docs/hardware_pad.md, The Bluetooth Classic side).
 // Protocol: dekuNukem Nintendo_Switch_Reverse_Engineering (bluetooth_hid_notes, subcommands, spi_flash).
 #include <string.h>
+#include <stdlib.h>
+#include <stdatomic.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "esp_bt.h"
 #include "esp_bt_main.h"
 #include "esp_gap_bt_api.h"
@@ -17,8 +20,10 @@
 #include "player.h"
 #include "uart_link.h"
 #include "pro_report.h"
+#include "bt_input.h"
 
-#define LED_GPIO 2 // the DevKit's blue LED, lit while paired
+#define LED_GPIO 2
+#define BOOT_GPIO 0
 #define PAYLOAD 48 // 0x21 and 0x30 after the report ID
 
 static const char *TAG = "pad"; // compiled out at CONFIG_LOG_DEFAULT_LEVEL_NONE
@@ -45,30 +50,37 @@ static uint8_t descriptor[] = {
     0x30, 0x91, 0x02, 0x85, 0x12, 0x09, 0x12, 0x75, 0x08, 0x95, 0x30, 0x91,
     0x02, 0xc0};
 
-static volatile bool open_, paired, full_mode;
+static atomic_bool open_, paired, recovering;
+static atomic_uint session;
 static uint8_t timer;
 static uint8_t mac[6];
-static QueueHandle_t replies; // 48-byte 0x21 payloads, sent ahead of 0x30
+struct reply_frame {
+    unsigned link;
+    uint8_t payload[PAYLOAD];
+};
+static QueueHandle_t replies;
+static QueueHandle_t completions;
+struct completion {
+    uint8_t id;
+    bool ok;
+};
 
-// The 12 bytes every input report starts with, from the shared HORI-format state.
-static void fill_state(uint8_t *p)
-{
-    uint8_t r[REPORT_LEN];
-    pad_get_report(r);
-    pro_state(r, timer++, p);
-}
+static portMUX_TYPE peer_lock = portMUX_INITIALIZER_UNLOCKED;
+static uint8_t peer[6];
+static bool registered, known_peer, forget_pending;
+static TickType_t last_attempt, retry_delay, opened_at;
 
 static void reply(uint8_t ack, uint8_t sub, const uint8_t *data, size_t len)
 {
-    uint8_t p[PAYLOAD] = {0};
-    fill_state(p);
+    struct reply_frame response = {.link = session};
+    uint8_t *p = response.payload;
     p[12] = ack;
     p[13] = sub;
     if (len > PAYLOAD - 14)
         len = PAYLOAD - 14;
     if (len)
         memcpy(p + 14, data, len);
-    xQueueSend(replies, p, 0);
+    xQueueSend(replies, &response, 0);
 }
 
 static void subcommand(const uint8_t *d, uint16_t len)
@@ -76,7 +88,6 @@ static void subcommand(const uint8_t *d, uint16_t len)
     if (len < 10)
         return;
     uint8_t sub = d[9];
-    ESP_LOGI(TAG, "sub %02x arg %02x %02x %02x %02x %02x", sub, d[10], d[11], d[12], d[13], d[14]);
     const uint8_t *arg = d + 10;
     switch (sub) {
     case 0x02: { // device info: firmware 4.00, Pro Controller, MAC, colours from SPI
@@ -97,7 +108,6 @@ static void subcommand(const uint8_t *d, uint16_t len)
         break;
     }
     case 0x03: // input report mode; 0x30 streams full reports
-        full_mode = arg[0] == 0x30;
         reply(0x80, sub, NULL, 0);
         break;
     case 0x04: { // trigger buttons elapsed time, 10 ms units: L and R held 3 s
@@ -111,57 +121,160 @@ static void subcommand(const uint8_t *d, uint16_t len)
         reply(0xA0, sub, m, sizeof(m));
         break;
     }
-    case 0x30: // player lights: the Switch has taken the controller
-        paired = true;
-        pad_stage(7);
-        gpio_set_level(LED_GPIO, 1);
-        reply(0x80, sub, NULL, 0);
-        break;
     default: // shipment state, IMU, vibration, HOME light, MCU state and the rest: a plain ACK
         reply(0x80, sub, NULL, 0);
     }
 }
 
-// Pacing after friendmaker's Switch Lite profile (classic_bt_controller_transport.cpp, SWITCH_LITE):
-// a 15 ms 0x30 stream congests the link once it enters sniff, and the Switch then drops it.
-#define IDLE_MS 100      // an unchanged 0x30; before the 0x03 mode switch too, or the Switch never starts the handshake
-#define OPEN_QUIET_MS 1000
-#define SNIFF_QUIET_MS 250
-#define CONGESTED_MS 45
-static volatile TickType_t quiet_until;
-
-static void quiet_for(uint32_t ms)
+// Some IDF builds restore a GAP bond without the HID virtual-cable flag. With multiple
+// bonds, only page a receiver that completed the player-light handshake on this board.
+static bool restore_peer(esp_bd_addr_t *address)
 {
-    TickType_t until = xTaskGetTickCount() + pdMS_TO_TICKS(ms);
-    if ((int32_t)(until - quiet_until) > 0)
-        quiet_until = until;
+    int n = esp_bt_gap_get_bond_device_num();
+    if (n == 1)
+        return esp_bt_gap_get_bond_device_list(&n, address) == ESP_OK && n == 1;
+    nvs_handle_t storage;
+    if (n < 1 || nvs_open("pad_bt", NVS_READONLY, &storage) != ESP_OK)
+        return false;
+    size_t len = sizeof(esp_bd_addr_t);
+    esp_err_t err = nvs_get_blob(storage, "last_host", *address, &len);
+    nvs_close(storage);
+    if (err != ESP_OK || len != sizeof(esp_bd_addr_t))
+        return false;
+    esp_bd_addr_t *bonds = calloc(n, sizeof(*bonds));
+    bool found = false;
+    if (bonds && esp_bt_gap_get_bond_device_list(&n, bonds) == ESP_OK) {
+        for (int i = 0; i < n && !found; i++)
+            found = memcmp(bonds[i], *address, len) == 0;
+    }
+    free(bonds);
+    return found;
+}
+
+static void remember_peer(const uint8_t *address)
+{
+    nvs_handle_t storage;
+    if (nvs_open("pad_bt", NVS_READWRITE, &storage) != ESP_OK)
+        return;
+    esp_bd_addr_t saved;
+    size_t len = sizeof(saved);
+    if (address && nvs_get_blob(storage, "last_host", saved, &len) == ESP_OK &&
+        len == sizeof(saved) && memcmp(saved, address, len) == 0) {
+        nvs_close(storage);
+        return;
+    }
+    esp_err_t err = address ? nvs_set_blob(storage, "last_host", address, sizeof(saved))
+                            : nvs_erase_key(storage, "last_host");
+    if (err == ESP_OK)
+        nvs_commit(storage);
+    nvs_close(storage);
+}
+
+// Keep a discovery window between pages. BOOT retries the remembered host without erasing its key.
+static void maintain_link(void)
+{
+    static bool button_down;
+    static int last_led = -1;
+    bool pressed = gpio_get_level(BOOT_GPIO) == 0;
+    bool manual = pressed && !button_down;
+    button_down = pressed;
+    uint8_t address[6];
+    bool connect = false, disconnect = false;
+    taskENTER_CRITICAL(&peer_lock);
+    TickType_t now = xTaskGetTickCount();
+    bool up = open_, ready = paired && !recovering;
+    bool forget = forget_pending;
+    forget_pending = false;
+    if (up && ((!ready && now - opened_at >= pdMS_TO_TICKS(12000)) || recovering)) {
+        if (!recovering || now - last_attempt >= pdMS_TO_TICKS(3000)) {
+            recovering = true;
+            last_attempt = now;
+            disconnect = true;
+        }
+    } else if (!up && registered && known_peer && (manual || now - last_attempt >= retry_delay)) {
+        memcpy(address, peer, sizeof(peer));
+        last_attempt = now;
+        retry_delay = pdMS_TO_TICKS(15000);  // allow the stack to finish an outstanding page
+        connect = true;
+    }
+    int led = registered && (ready || ((now / pdMS_TO_TICKS(up ? 125 : 500)) & 1));
+    taskEXIT_CRITICAL(&peer_lock);
+    if (forget)
+        remember_peer(NULL);
+    if (led != last_led) {
+        gpio_set_level(LED_GPIO, led);
+        last_led = led;
+    }
+    if (disconnect)
+        esp_bt_hid_device_disconnect();
+    if (connect && esp_bt_hid_device_connect(address) != ESP_OK) {
+        taskENTER_CRITICAL(&peer_lock);
+        retry_delay = pdMS_TO_TICKS(3000);
+        taskEXIT_CRITICAL(&peer_lock);
+    }
+}
+
+// A successful API return only posts a request. Serialize replies and inputs so that even an
+// ID-less Bluedroid error belongs to exactly one submission. CLOSE wakes the wait.
+static bool send_packet(uint8_t id, uint8_t *p, unsigned link)
+{
+    struct completion result;
+    xQueueReset(completions);
+    if (link != session || !open_ || recovering ||
+        esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, id, PAYLOAD, p) != ESP_OK)
+        return false;
+    if (xQueueReceive(completions, &result, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        // Reopen the session before issuing another report whose callback could be ambiguous.
+        if (link == session && open_)
+            recovering = true;
+        return false;
+    }
+    return link == session && result.id == id && result.ok;
 }
 
 static void sender_task(void *arg)
 {
-    uint8_t p[PAYLOAD], sent[9] = {0};
-    TickType_t last = 0;
+    uint8_t p[PAYLOAD], r[REPORT_LEN];
+    struct reply_frame response;
+    bool retry_reply = false;
     for (;;) {
-        // A reply goes first; 0x30 waits while the Switch still sets the controller up.
-        if (xQueueReceive(replies, p, pdMS_TO_TICKS(5)) == pdTRUE) {
-            if (open_)
-                esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, PAYLOAD, p);
-            last = xTaskGetTickCount();
+        maintain_link();
+        if (retry_reply && response.link != session)
+            retry_reply = false;
+        if (!open_ || recovering) {
+            vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
-        TickType_t now = xTaskGetTickCount();
-        if (!open_ || (int32_t)(quiet_until - now) > 0)
-            continue;
-        memset(p, 0, sizeof(p));
-        fill_state(p);
-        bool changed = memcmp(sent, p + 2, sizeof(sent)) != 0;
-        if (!changed && now - last < pdMS_TO_TICKS(IDLE_MS))
-            continue;
-        if (changed)
-            ESP_LOGI(TAG, "0x30 buttons %02x %02x %02x", p[2], p[3], p[4]);
-        memcpy(sent, p + 2, sizeof(sent));
-        esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x30, PAYLOAD, p);
-        last = now;
+        if (retry_reply || xQueueReceive(replies, &response, pdMS_TO_TICKS(3)) == pdTRUE) {
+            if (response.link != session)
+                continue;
+            pad_get_report(r);
+            pro_state(r, timer++, response.payload);
+            retry_reply = !send_packet(0x21, response.payload, response.link);
+            if (retry_reply)
+                vTaskDelay(pdMS_TO_TICKS(15));
+            else if (response.payload[13] == 0x30) {
+                esp_bd_addr_t address;
+                bool first = false;
+                taskENTER_CRITICAL(&peer_lock);
+                if (response.link == session && open_ && !paired) {
+                    paired = true;
+                    first = true;
+                    memcpy(address, peer, sizeof(peer));
+                    pad_stage(7);
+                }
+                taskEXIT_CRITICAL(&peer_lock);
+                if (first)
+                    remember_peer(address);
+            }
+        } else {
+            unsigned link = session;
+            if (!bt_input_next(r))
+                continue;
+            memset(p, 0, sizeof(p));
+            pro_state(r, timer++, p);
+            bt_input_complete(send_packet(0x30, p, link));
+        }
     }
 }
 
@@ -183,12 +296,33 @@ static void discoverable(bool on)
                              on ? ESP_BT_GENERAL_DISCOVERABLE : ESP_BT_NON_DISCOVERABLE);
 }
 
+static void close_link(bool forget_peer)
+{
+    taskENTER_CRITICAL(&peer_lock);
+    open_ = paired = recovering = false;
+    session++;
+    last_attempt = xTaskGetTickCount();
+    retry_delay = pdMS_TO_TICKS(3000);
+    if (forget_peer) {
+        known_peer = false;
+        forget_pending = true;
+    }
+    taskEXIT_CRITICAL(&peer_lock);
+    bt_input_link(false);
+    xQueueReset(replies);
+    struct completion closed = {0};
+    xQueueOverwrite(completions, &closed);
+    pad_disconnected();
+    pad_stage(5);
+    discoverable(true);
+}
+
 static void hidd_cb(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param)
 {
     static uint32_t sent, failed;
     if (event == ESP_HIDD_SEND_REPORT_EVT) {
-        if (param->send_report.status != ESP_HIDD_SUCCESS && param->send_report.reason == 8)
-            quiet_for(CONGESTED_MS);
+        struct completion result = {param->send_report.report_id, param->send_report.status == ESP_HIDD_SUCCESS};
+        xQueueOverwrite(completions, &result);
         if (param->send_report.status != ESP_HIDD_SUCCESS && failed++ % 50 == 0)
             ESP_LOGW(TAG, "send %02x failed status %d reason %d (%lu ok)", param->send_report.report_id,
                      param->send_report.status, param->send_report.reason, (unsigned long)sent);
@@ -206,30 +340,57 @@ static void hidd_cb(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param)
             esp_bt_hid_device_register_app(&app, &qos, &qos);
         break;
     case ESP_HIDD_REGISTER_APP_EVT: {
+        if (param->register_app.status != ESP_HIDD_SUCCESS)
+            break;
+        esp_bd_addr_t address;
+        bool have_address = param->register_app.in_use;
+        if (have_address)
+            memcpy(address, param->register_app.bd_addr, sizeof(address));
+        else
+            have_address = restore_peer(&address);
+        taskENTER_CRITICAL(&peer_lock);
+        registered = true;
+        known_peer = have_address;
+        if (known_peer)
+            memcpy(peer, address, sizeof(peer));
+        retry_delay = 0;
+        taskEXIT_CRITICAL(&peer_lock);
         pad_stage(5);
         esp_bt_cod_t cod = {.service = 1, .major = 5, .minor = 2}; // 0x002508, a gamepad
         esp_bt_gap_set_cod(cod, ESP_BT_SET_COD_ALL);
         discoverable(true);
-        if (param->register_app.in_use) // a Switch it paired with before: reconnect to it
-            esp_bt_hid_device_connect(param->register_app.bd_addr);
         break;
     }
     case ESP_HIDD_OPEN_EVT:
         ESP_LOGI(TAG, "open status %d conn %d", param->open.status, param->open.conn_status);
-        if (param->open.conn_status == ESP_HIDD_CONN_STATE_CONNECTED) {
-            pad_stage(6);
-            quiet_for(OPEN_QUIET_MS);
-            discoverable(false);
-            full_mode = paired = false;
+        if (param->open.status == ESP_HIDD_SUCCESS && param->open.conn_status == ESP_HIDD_CONN_STATE_CONNECTED) {
+            bt_input_link(true);
+            taskENTER_CRITICAL(&peer_lock);
+            known_peer = true;
+            memcpy(peer, param->open.bd_addr, sizeof(peer));
+            opened_at = xTaskGetTickCount();
+            session++;
+            recovering = paired = false;
             open_ = true;
+            taskEXIT_CRITICAL(&peer_lock);
+            pad_stage(6);
+            discoverable(false);
+        } else if (param->open.conn_status == ESP_HIDD_CONN_STATE_DISCONNECTED && !open_) {
+            taskENTER_CRITICAL(&peer_lock);
+            last_attempt = xTaskGetTickCount();
+            retry_delay = pdMS_TO_TICKS(3000);
+            taskEXIT_CRITICAL(&peer_lock);
         }
         break;
     case ESP_HIDD_CLOSE_EVT:
         ESP_LOGI(TAG, "close status %d conn %d", param->close.status, param->close.conn_status);
-        open_ = paired = full_mode = false;
-        gpio_set_level(LED_GPIO, 0);
-        pad_disconnected();
-        discoverable(true);
+        if ((param->close.status == ESP_HIDD_SUCCESS || param->close.status == ESP_HIDD_NO_CONNECTION) &&
+            param->close.conn_status == ESP_HIDD_CONN_STATE_DISCONNECTED)
+            close_link(false);
+        break;
+    case ESP_HIDD_VC_UNPLUG_EVT:
+        if (param->vc_unplug.status == ESP_HIDD_SUCCESS)
+            close_link(true);
         break;
     case ESP_HIDD_INTR_DATA_EVT:
         if (param->intr_data.report_id == 0x01)
@@ -255,7 +416,7 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
     case ESP_BT_GAP_MODE_CHG_EVT:
         ESP_LOGI(TAG, "mode %d", param->mode_chg.mode);
         if (param->mode_chg.mode != ESP_BT_PM_MD_ACTIVE)
-            quiet_for(SNIFF_QUIET_MS);
+            bt_input_sniff();
         break;
     case ESP_BT_GAP_CFM_REQ_EVT:
         esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, true);
@@ -277,7 +438,7 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
 
 static bool mounted(void)
 {
-    return paired;
+    return paired && !recovering;
 }
 
 // Classic boards reset into the ROM loader through their serial chip's DTR/RTS; a restart is enough.
@@ -292,7 +453,12 @@ void app_main(void)
     gpio_reset_pin(LED_GPIO);
     gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
     gpio_set_level(LED_GPIO, 0);
-    replies = xQueueCreate(8, PAYLOAD);
+    gpio_reset_pin(BOOT_GPIO);
+    gpio_set_direction(BOOT_GPIO, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(BOOT_GPIO, GPIO_PULLUP_ONLY);
+    replies = xQueueCreate(8, sizeof(struct reply_frame));
+    completions = xQueueCreate(1, sizeof(struct completion));
+    configASSERT(replies && completions);
     uart_link_start(mounted);
 
     esp_err_t err = nvs_flash_init(); // Bluedroid keeps the Switch's link key here

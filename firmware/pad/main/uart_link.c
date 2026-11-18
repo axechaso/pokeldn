@@ -39,8 +39,7 @@ static void handle(uint8_t kind, const uint8_t *p, size_t len)
             reply(PAD_BAD_LENGTH);
             return;
         }
-        pad_live_report(p);
-        reply(0);
+        reply((int8_t)pad_live_report(p));
     } else if (kind == STATUS) {
         uint8_t s[64];
         size_t n = pad_status(s, sizeof(s), mounted_fn && mounted_fn());

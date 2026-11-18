@@ -13,7 +13,7 @@ void pad_stage(uint32_t stage);
 
 void pad_init(void);                             // first thing in app_main
 void pad_get_report(uint8_t *out);               // the state to send now
-void pad_live_report(const uint8_t *r);          // from the host; ignored while a macro plays
+int pad_live_report(const uint8_t *r);           // UART returns PAD_REFUSED if the input queue is full
 void pad_disconnected(void);                     // the host left: release unless a macro plays
 bool pad_playing(void);
 
