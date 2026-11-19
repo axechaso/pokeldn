@@ -81,8 +81,10 @@ first five bytes only.
 | `0x13` stop | | stops it and releases every button |
 | `0xB0` download | | restarts the chip into the ROM loader |
 
-The program holds 8192 entries. Entries before the loop start play once; the rest repeat. The player
-waits with `vTaskDelayUntil` on the 1 kHz tick, so holds add up without drift.
+The program holds 8192 entries. Entries before the loop start play once and the rest repeat.
+The player uses absolute deadlines on the 1 kHz tick. STOP interrupts the current hold and
+releases the pad before acknowledging the command. When the classic radio queue fills, playback
+waits for space and resumes its clock from there.
 
 Trap: through bleak on macOS a write without response is lost when CoreBluetooth's queue is full, and
 bleak never reads `canSendWriteWithoutResponse` (67 of 300 back-to-back reports arrive).
@@ -124,18 +126,29 @@ descriptor, service "Wireless Gamepad", provider "Nintendo", subclass 0x08, clas
 reads, 0x03 report mode, 0x04 trigger times, 0x21 MCU configuration, a plain ACK for the rest; 0x30
 (player lights) marks the controller as taken. A reply goes out ahead of any 0x30.
 
-The 0x30 report goes out at once when the buttons or sticks change and otherwise every 100 ms, from
-the moment the link opens; the Switch starts no handshake while the board sends none. The board waits
-1 s after the link opens, 250 ms after a change to sniff mode and 45 ms after a send refused as
-congested (reason 8): friendmaker's Switch Lite values (`classic_bt_controller_transport.cpp`,
-`SWITCH_LITE`). Trap: a 0x30 every 15 ms congests the link and the Switch disconnects (HCI 0x13)
-within 20 s of the player lights.
+The classic pad retains 32 distinct input states in arrival order from the serial link and macro
+player. It retries a refused 0x30 after 45 ms and removes it when Bluedroid accepts the report.
+The UART acknowledges admission to this queue. A full queue returns -2 for a new live state.
+After a stall, queued changes stay visible for 20–40 ms each. STOP discards the backlog and
+requests neutral. An unchanged controller sends a heartbeat every 100 ms. Opening the link keeps
+the 1 s setup delay. Entering sniff mode holds input reports for the stock 250 ms quiet period.
+A tap that starts and ends during that period stays in the queue. A subcommand reply resets the
+idle heartbeat timer. The receiver and the game have their own sampling clocks.
 
 The Switch's handshake, in order: 0x02, 0x08, 0x10 at 0x6000 and 0x6050, 0x03 (0x30), 0x04, 0x10 at
 0x6080, 0x6098, 0x8010, 0x603D, 0x6020, 0x40, 0x30 (0), 0x48, 0x21, 0x30 (player 1).
 
-A bonded board reconnects to its Switch at boot. Flashing the merged image overwrites the NVS
-partition and with it the bond: pair again from Change Grip/Order.
+GPIO2 on the external classic ESP32 blinks slowly while waiting for a receiver, quickly during
+the HID handshake, and stays lit after receiving the player-light command, as in 1.3.0. A previously paired
+pad retries a failed connection after 3 s. Press BOOT briefly during normal operation to retry
+the remembered receiver immediately. The pad can restore a single existing Classic bond on
+upgrade, and remembers the last receiver to complete the handshake if there are several bonds.
+The HID virtual-cable host is paged at boot. A host restored only from a GAP bond gets 8 s for
+inbound discovery first. While the ACL is up the board lets the receiver finish opening HID.
+A slow handshake or delayed send callback leaves the connection open. If a handshake is stuck
+or the stack has not returned a send callback for 2 s, hold BOOT for 2 s and release to reopen it.
+On a board already using the stock
+4 MB partition table, flashing only the application at `0x10000` preserves its pairing keys.
 
 `pro_report.c` maps the shared report onto the Pro Controller's bytes (dekuNukem
 `bluetooth_hid_notes.md`): sticks 0x800 at rest, 0x700 either way, matching the factory calibration
