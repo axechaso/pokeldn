@@ -127,22 +127,27 @@ reads, 0x03 report mode, 0x04 trigger times, 0x21 MCU configuration, a plain ACK
 (player lights) marks the controller as taken. A reply goes out ahead of any 0x30.
 
 The classic pad retains 32 distinct input states in arrival order from the serial link and macro
-player. It retries a refused 0x30 after 15 ms and removes it when Bluedroid accepts the report.
+player. It retries a refused 0x30 after 45 ms and removes it when Bluedroid accepts the report.
 The UART acknowledges admission to this queue. A full queue returns -2 for a new live state.
 After a stall, queued changes stay visible for 20–40 ms each. STOP discards the backlog and
 requests neutral. An unchanged controller sends a heartbeat every 100 ms. Opening the link keeps
-the 1 s setup delay. Entering sniff mode defers idle heartbeats for 250 ms while allowing changed
-input to go out. The receiver and the game have their own sampling clocks.
+the 1 s setup delay. Entering sniff mode holds input reports for the stock 250 ms quiet period.
+A tap that starts and ends during that period stays in the queue. A subcommand reply resets the
+idle heartbeat timer. The receiver and the game have their own sampling clocks.
 
 The Switch's handshake, in order: 0x02, 0x08, 0x10 at 0x6000 and 0x6050, 0x03 (0x30), 0x04, 0x10 at
 0x6080, 0x6098, 0x8010, 0x603D, 0x6020, 0x40, 0x30 (0), 0x48, 0x21, 0x30 (player 1).
 
 GPIO2 on the external classic ESP32 blinks slowly while waiting for a receiver, quickly during
-the HID handshake, and stays lit after the player-light reply is accepted. A previously paired
+the HID handshake, and stays lit after receiving the player-light command, as in 1.3.0. A previously paired
 pad retries a failed connection after 3 s. Press BOOT briefly during normal operation to retry
 the remembered receiver immediately. The pad can restore a single existing Classic bond on
 upgrade, and remembers the last receiver to complete the handshake if there are several bonds.
-If the handshake stalls for 12 s it reopens the connection. On a board already using the stock
+The HID virtual-cable host is paged at boot. A host restored only from a GAP bond gets 8 s for
+inbound discovery first. While the ACL is up the board lets the receiver finish opening HID.
+A slow handshake or delayed send callback leaves the connection open. If a handshake is stuck
+or the stack has not returned a send callback for 2 s, hold BOOT for 2 s and release to reopen it.
+On a board already using the stock
 4 MB partition table, flashing only the application at `0x10000` preserves its pairing keys.
 
 `pro_report.c` maps the shared report onto the Pro Controller's bytes (dekuNukem

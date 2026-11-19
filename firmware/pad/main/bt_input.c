@@ -89,13 +89,21 @@ void bt_input_sniff(void)
     taskEXIT_CRITICAL(&lock);
 }
 
+void bt_input_replied(void)
+{
+    taskENTER_CRITICAL(&lock);
+    last_packet = xTaskGetTickCount();
+    taskEXIT_CRITICAL(&lock);
+}
+
 static bool prepare(uint8_t *out, TickType_t now)
 {
     if (!online || in_flight || now - pause_start < pause_ticks)
         return false;
     pause_ticks = 0;
-    if (now - sniff_start >= sniff_ticks)
-        sniff_ticks = 0;
+    if (now - sniff_start < sniff_ticks)
+        return false;
+    sniff_ticks = 0;
     if (count) {
         const struct change *c = &changes[head % CAPACITY];
         if (delivered) {
@@ -111,7 +119,7 @@ static bool prepare(uint8_t *out, TickType_t now)
         }
         memcpy(out, c->report, REPORT_LEN);
     } else {
-        if (sniff_ticks || now - last_packet < pdMS_TO_TICKS(100))
+        if (now - last_packet < pdMS_TO_TICKS(100))
             return false;
         memcpy(out, latest, REPORT_LEN);
     }
@@ -146,7 +154,7 @@ void bt_input_complete(bool accepted)
             }
         } else {
             pause_start = now;
-            pause_ticks = pdMS_TO_TICKS(15);  // retry the same head, including releases
+            pause_ticks = pdMS_TO_TICKS(45);  // retain the refused head through the stock backoff
         }
     }
     taskEXIT_CRITICAL(&lock);

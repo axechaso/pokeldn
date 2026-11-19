@@ -1,5 +1,6 @@
 // The controller state and the macro player (docs/hardware_pad.md, The Bluetooth side).
 #include <string.h>
+#include <stdatomic.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -18,7 +19,7 @@ static uint32_t writes;
 static uint8_t program[MAX_ENTRIES][ENTRY_LEN];
 static uint16_t program_count, loop_start;
 static uint32_t loops;
-static volatile bool playing;
+static atomic_bool playing;
 static volatile uint32_t loops_done;
 static volatile uint16_t play_index;
 static QueueHandle_t commands, stopped;
@@ -136,6 +137,12 @@ static void player_task(void *arg)
 
 static void stop_playing(void)
 {
+    // Connecting EasyCon sends STOP even on an idle board. The UART can release and
+    // acknowledge it immediately. Only a running player has a hold to cancel.
+    if (!playing) {
+        release_report();
+        return;
+    }
     uint8_t command = PLAYER_STOP;
     xQueueSend(commands, &command, portMAX_DELAY);
     xQueueReceive(stopped, &command, portMAX_DELAY);

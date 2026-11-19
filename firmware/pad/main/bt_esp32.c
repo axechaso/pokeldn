@@ -68,7 +68,8 @@ struct completion {
 static portMUX_TYPE peer_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint8_t peer[6];
 static bool registered, known_peer, forget_pending;
-static TickType_t last_attempt, retry_delay, opened_at;
+static unsigned active_acls;
+static TickType_t last_attempt, retry_delay;
 
 static void reply(uint8_t ack, uint8_t sub, const uint8_t *data, size_t len)
 {
@@ -121,6 +122,15 @@ static void subcommand(const uint8_t *d, uint16_t len)
         reply(0xA0, sub, m, sizeof(m));
         break;
     }
+    case 0x30: // the stock controller marks itself ready when the receiver sets the player lights
+        taskENTER_CRITICAL(&peer_lock);
+        if (open_) {
+            paired = true;
+            pad_stage(7);
+        }
+        taskEXIT_CRITICAL(&peer_lock);
+        reply(0x80, sub, NULL, 0);
+        break;
     default: // shipment state, IMU, vibration, HOME light, MCU state and the rest: a plain ACK
         reply(0x80, sub, NULL, 0);
     }
@@ -171,27 +181,32 @@ static void remember_peer(const uint8_t *address)
 }
 
 // Keep a discovery window between pages. BOOT retries the remembered host without erasing its key.
-static void maintain_link(void)
+static void maintain_link(bool stalled_report)
 {
     static bool button_down;
+    static TickType_t pressed_at;
+    static unsigned pressed_link;
     static int last_led = -1;
     bool pressed = gpio_get_level(BOOT_GPIO) == 0;
-    bool manual = pressed && !button_down;
-    button_down = pressed;
     uint8_t address[6];
     bool connect = false, disconnect = false;
     taskENTER_CRITICAL(&peer_lock);
     TickType_t now = xTaskGetTickCount();
+    bool manual = pressed && !button_down;
+    if (manual) {
+        pressed_at = now;
+        pressed_link = session;
+    }
+    bool recover_requested = !pressed && button_down && pressed_link == session &&
+                             now - pressed_at >= pdMS_TO_TICKS(2000);
+    button_down = pressed;
     bool up = open_, ready = paired && !recovering;
     bool forget = forget_pending;
     forget_pending = false;
-    if (up && ((!ready && now - opened_at >= pdMS_TO_TICKS(12000)) || recovering)) {
-        if (!recovering || now - last_attempt >= pdMS_TO_TICKS(3000)) {
-            recovering = true;
-            last_attempt = now;
-            disconnect = true;
-        }
-    } else if (!up && registered && known_peer && (manual || now - last_attempt >= retry_delay)) {
+    if (up && recover_requested && (!ready || stalled_report)) {
+        recovering = true;
+        disconnect = true;
+    } else if (!up && !active_acls && registered && known_peer && (manual || now - last_attempt >= retry_delay)) {
         memcpy(address, peer, sizeof(peer));
         last_attempt = now;
         retry_delay = pdMS_TO_TICKS(15000);  // allow the stack to finish an outstanding page
@@ -205,8 +220,8 @@ static void maintain_link(void)
         gpio_set_level(LED_GPIO, led);
         last_led = led;
     }
-    if (disconnect)
-        esp_bt_hid_device_disconnect();
+    if (disconnect && esp_bt_hid_device_disconnect() != ESP_OK)
+        recovering = false;
     if (connect && esp_bt_hid_device_connect(address) != ESP_OK) {
         taskENTER_CRITICAL(&peer_lock);
         retry_delay = pdMS_TO_TICKS(3000);
@@ -223,13 +238,15 @@ static bool send_packet(uint8_t id, uint8_t *p, unsigned link)
     if (link != session || !open_ || recovering ||
         esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, id, PAYLOAD, p) != ESP_OK)
         return false;
-    if (xQueueReceive(completions, &result, pdMS_TO_TICKS(2000)) != pdTRUE) {
-        // Reopen the session before issuing another report whose callback could be ambiguous.
-        if (link == session && open_)
-            recovering = true;
-        return false;
+    TickType_t start = xTaskGetTickCount();
+    while (link == session && open_) {
+        if (xQueueReceive(completions, &result, pdMS_TO_TICKS(25)) == pdTRUE)
+            return link == session && result.id == id && result.ok;
+        // A late local completion cannot identify a dead radio link. Keep its single
+        // outstanding slot, even across long delays. Actual CLOSE or a BOOT retry wakes it.
+        maintain_link(xTaskGetTickCount() - start >= pdMS_TO_TICKS(2000));
     }
-    return link == session && result.id == id && result.ok;
+    return false;
 }
 
 static void sender_task(void *arg)
@@ -237,8 +254,9 @@ static void sender_task(void *arg)
     uint8_t p[PAYLOAD], r[REPORT_LEN];
     struct reply_frame response;
     bool retry_reply = false;
+    unsigned remembered_link = 0;
     for (;;) {
-        maintain_link();
+        maintain_link(false);
         if (retry_reply && response.link != session)
             retry_reply = false;
         if (!open_ || recovering) {
@@ -251,17 +269,19 @@ static void sender_task(void *arg)
             pad_get_report(r);
             pro_state(r, timer++, response.payload);
             retry_reply = !send_packet(0x21, response.payload, response.link);
-            if (retry_reply)
-                vTaskDelay(pdMS_TO_TICKS(15));
-            else if (response.payload[13] == 0x30) {
+            if (retry_reply) {
+                vTaskDelay(pdMS_TO_TICKS(45));
+                continue;
+            }
+            bt_input_replied();
+            if (response.payload[13] == 0x30 && remembered_link != response.link) {
                 esp_bd_addr_t address;
                 bool first = false;
                 taskENTER_CRITICAL(&peer_lock);
-                if (response.link == session && open_ && !paired) {
-                    paired = true;
+                if (response.link == session && open_ && paired) {
+                    remembered_link = response.link;
                     first = true;
                     memcpy(address, peer, sizeof(peer));
-                    pad_stage(7);
                 }
                 taskEXIT_CRITICAL(&peer_lock);
                 if (first)
@@ -348,17 +368,20 @@ static void hidd_cb(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param)
             memcpy(address, param->register_app.bd_addr, sizeof(address));
         else
             have_address = restore_peer(&address);
+        esp_bt_cod_t cod = {.service = 1, .major = 5, .minor = 2}; // 0x002508, a gamepad
+        esp_bt_gap_set_cod(cod, ESP_BT_SET_COD_ALL);
+        discoverable(true);
         taskENTER_CRITICAL(&peer_lock);
         registered = true;
         known_peer = have_address;
         if (known_peer)
             memcpy(peer, address, sizeof(peer));
-        retry_delay = 0;
+        // Only the HID virtual-cable host was paged at boot by 1.3.0. A migrated GAP
+        // bond gets a discovery window first so our page cannot race the receiver's.
+        last_attempt = xTaskGetTickCount();
+        retry_delay = param->register_app.in_use ? 0 : pdMS_TO_TICKS(8000);
         taskEXIT_CRITICAL(&peer_lock);
         pad_stage(5);
-        esp_bt_cod_t cod = {.service = 1, .major = 5, .minor = 2}; // 0x002508, a gamepad
-        esp_bt_gap_set_cod(cod, ESP_BT_SET_COD_ALL);
-        discoverable(true);
         break;
     }
     case ESP_HIDD_OPEN_EVT:
@@ -368,7 +391,6 @@ static void hidd_cb(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param)
             taskENTER_CRITICAL(&peer_lock);
             known_peer = true;
             memcpy(peer, param->open.bd_addr, sizeof(peer));
-            opened_at = xTaskGetTickCount();
             session++;
             recovering = paired = false;
             open_ = true;
@@ -384,9 +406,10 @@ static void hidd_cb(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param)
         break;
     case ESP_HIDD_CLOSE_EVT:
         ESP_LOGI(TAG, "close status %d conn %d", param->close.status, param->close.conn_status);
-        if ((param->close.status == ESP_HIDD_SUCCESS || param->close.status == ESP_HIDD_NO_CONNECTION) &&
-            param->close.conn_status == ESP_HIDD_CONN_STATE_DISCONNECTED)
+        if (param->close.conn_status == ESP_HIDD_CONN_STATE_DISCONNECTED && (open_ || recovering))
             close_link(false);
+        else if (param->close.status != ESP_HIDD_SUCCESS)
+            recovering = false;
         break;
     case ESP_HIDD_VC_UNPLUG_EVT:
         if (param->vc_unplug.status == ESP_HIDD_SUCCESS)
@@ -409,10 +432,23 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
         break;
     case ESP_BT_GAP_ACL_CONN_CMPL_STAT_EVT:
         ESP_LOGI(TAG, "acl up status %d", param->acl_conn_cmpl_stat.stat);
+        if (param->acl_conn_cmpl_stat.stat == ESP_BT_STATUS_SUCCESS) {
+            taskENTER_CRITICAL(&peer_lock);
+            active_acls++;
+            taskEXIT_CRITICAL(&peer_lock);
+        }
         break;
-    case ESP_BT_GAP_ACL_DISCONN_CMPL_STAT_EVT:
+    case ESP_BT_GAP_ACL_DISCONN_CMPL_STAT_EVT: {
         ESP_LOGI(TAG, "acl down reason 0x%02x", param->acl_disconn_cmpl_stat.reason);
+        taskENTER_CRITICAL(&peer_lock);
+        if (active_acls)
+            active_acls--;
+        bool lost_hid = open_ && memcmp(peer, param->acl_disconn_cmpl_stat.bda, sizeof(peer)) == 0;
+        taskEXIT_CRITICAL(&peer_lock);
+        if (lost_hid)
+            close_link(false);  // a physical disconnect also releases a sender awaiting its callback
         break;
+    }
     case ESP_BT_GAP_MODE_CHG_EVT:
         ESP_LOGI(TAG, "mode %d", param->mode_chg.mode);
         if (param->mode_chg.mode != ESP_BT_PM_MD_ACTIVE)

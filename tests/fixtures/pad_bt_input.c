@@ -33,14 +33,19 @@ int main(void)
     start();
     now += 100;
     bt_input_sniff();
-    assert(!bt_input_next(out));  // the idle heartbeat waits in sniff
+    assert(!bt_input_next(out));
     assert(bt_input_write(right));
+    assert(!bt_input_next(out));
+    now += 50;
+    assert(bt_input_write(pad_neutral));  // a whole tap falls inside the stock sniff window
+    now += 199;
+    assert(!bt_input_next(out));
+    now++;
     expect(right);
     bt_input_complete(false);
-    now += 3;
+    now += 44;
     assert(!bt_input_next(out));
-    now += 47;
-    assert(bt_input_write(pad_neutral));  // the whole press happens while the link is busy
+    now++;
     expect(right);
     bt_input_complete(true);
     now += 39;
@@ -48,7 +53,14 @@ int main(void)
     now++;
     expect(pad_neutral);
     bt_input_complete(false);
-    now += 15;
+    now += 45;
+    expect(pad_neutral);
+    bt_input_complete(true);
+    now += 99;
+    bt_input_replied();
+    now += 99;
+    assert(!bt_input_next(out));
+    now++;
     expect(pad_neutral);
     bt_input_complete(true);
 
